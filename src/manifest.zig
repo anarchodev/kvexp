@@ -76,7 +76,13 @@ pub const ManifestSlot = extern struct {
     sequence: u64 align(1) = 0,
     manifest_root: u64 align(1) = 0,
     freelist_root: u64 align(1) = 0,
-    _reserved: [page.PAGE_SIZE - 36]u8 align(1) = @splat(0),
+    /// Cluster-wide "last applied raft index" watermark. Set by the
+    /// integration on snapshot tick; read at open so the raft layer
+    /// can skip already-applied log entries. Stored here (not in the
+    /// manifest tree) because it's tiny, frequently-updated, and
+    /// would otherwise force a tree CoW on every advance.
+    last_applied_raft_idx: u64 align(1) = 0,
+    _reserved: [page.PAGE_SIZE - 44]u8 align(1) = @splat(0),
     checksum: u32 align(1) = 0,
 
     pub const MAGIC: u32 = 0x6B764D31; // "kvM1"
@@ -188,6 +194,10 @@ pub const Manifest = struct {
     active_slot: u32,
     /// Sequence of the active slot. Highest durable seq.
     active_seq: u64,
+    /// Cluster-wide last-applied raft index, mirrored from the
+    /// active slot's `last_applied_raft_idx`. Updated via
+    /// `setLastAppliedRaftIdx`; written to disk by `durabilize`.
+    last_applied_raft_idx: u64,
     /// Sequence of the other slot. Valid only if `inactive_valid`.
     /// A page tagged `freed_at_seq = inactive_seq + 1` is unsafe to
     /// reuse — its referencing manifest is still durable in this slot.
@@ -298,6 +308,7 @@ pub const Manifest = struct {
         var inactive_valid = false;
         var manifest_root: u64 = 0;
         var freelist_root: u64 = 0;
+        var last_applied_raft_idx: u64 = 0;
         if (va and vb) {
             if (slot_a.sequence >= slot_b.sequence) {
                 active_slot = 0;
@@ -305,12 +316,14 @@ pub const Manifest = struct {
                 inactive_seq = slot_b.sequence;
                 manifest_root = slot_a.manifest_root;
                 freelist_root = slot_a.freelist_root;
+                last_applied_raft_idx = slot_a.last_applied_raft_idx;
             } else {
                 active_slot = 1;
                 active_seq = slot_b.sequence;
                 inactive_seq = slot_a.sequence;
                 manifest_root = slot_b.manifest_root;
                 freelist_root = slot_b.freelist_root;
+                last_applied_raft_idx = slot_b.last_applied_raft_idx;
             }
             inactive_valid = true;
         } else if (va) {
@@ -318,17 +331,20 @@ pub const Manifest = struct {
             active_seq = slot_a.sequence;
             manifest_root = slot_a.manifest_root;
             freelist_root = slot_a.freelist_root;
+            last_applied_raft_idx = slot_a.last_applied_raft_idx;
         } else if (vb) {
             active_slot = 1;
             active_seq = slot_b.sequence;
             manifest_root = slot_b.manifest_root;
             freelist_root = slot_b.freelist_root;
+            last_applied_raft_idx = slot_b.last_applied_raft_idx;
         }
         self.active_slot = active_slot;
         self.active_seq = active_seq;
         self.inactive_seq = inactive_seq;
         self.inactive_valid = inactive_valid;
         self.sequence = active_seq;
+        self.last_applied_raft_idx = last_applied_raft_idx;
 
         const page_alloc = self.pageAllocator();
         self.tree = try Tree.init(allocator, cache, file, page_alloc);
@@ -363,6 +379,21 @@ pub const Manifest = struct {
     /// Highest durable seq.
     pub fn durableSeq(self: *const Manifest) u64 {
         return self.active_seq;
+    }
+
+    /// Cluster-wide last-applied raft index watermark. Read at open
+    /// from the active slot. Set via `setLastAppliedRaftIdx`; written
+    /// to disk by the next `durabilize` call.
+    pub fn lastAppliedRaftIdx(self: *Manifest) u64 {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        return self.last_applied_raft_idx;
+    }
+
+    pub fn setLastAppliedRaftIdx(self: *Manifest, idx: u64) void {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        self.last_applied_raft_idx = idx;
     }
 
     pub fn deinit(self: *Manifest) void {
@@ -687,6 +718,7 @@ pub const Manifest = struct {
             .sequence = K,
             .manifest_root = manifest_root,
             .freelist_root = freelist_root,
+            .last_applied_raft_idx = self.last_applied_raft_idx,
         };
         slot.computeChecksum();
         try self.file.writePage(slot_page, &slot_buf);
@@ -1316,6 +1348,26 @@ fn corruptSlotInFile(path: []const u8, slot_page: u64, content: []const u8) !voi
     defer pf.close();
     try pf.writePage(slot_page, content);
     try pf.fsync();
+}
+
+test "Manifest: lastAppliedRaftIdx round-trips across durabilize + reopen" {
+    var h = try Harness.init(32);
+    defer h.deinit();
+    try testing.expectEqual(@as(u64, 0), h.manifest.lastAppliedRaftIdx());
+
+    h.manifest.setLastAppliedRaftIdx(42);
+    try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
+
+    // Not durable yet.
+    try h.manifest.durabilize();
+    try h.cycle();
+    try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
+
+    // Advance + durabilize + reopen again.
+    h.manifest.setLastAppliedRaftIdx(1000);
+    try h.manifest.durabilize();
+    try h.cycle();
+    try testing.expectEqual(@as(u64, 1000), h.manifest.lastAppliedRaftIdx());
 }
 
 test "Phase 8: verify reports correct counts on a small forest" {
