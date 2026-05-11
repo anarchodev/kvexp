@@ -578,6 +578,32 @@ pub const Tree = struct {
     }
 };
 
+/// Walk every page reachable from `root` (including `root` itself)
+/// and append its page_no into `out`. Recursive descent; bounded by
+/// MAX_DEPTH. Used by `Manifest.verify`.
+pub fn collectTreePages(
+    cache: *PageCache,
+    root: u64,
+    out: *std.AutoHashMapUnmanaged(u64, void),
+    allocator: std.mem.Allocator,
+) Error!void {
+    if (root == 0) return;
+    try out.put(allocator, root, {});
+    const ref = try cache.pin(root);
+    defer ref.release();
+    switch (page.pageKind(ref.buf())) {
+        .leaf => {},
+        .internal => {
+            const node = Internal.view(ref.buf());
+            var i: usize = 0;
+            while (i < node.nEntries()) : (i += 1) {
+                try collectTreePages(cache, node.childAt(i), out, allocator);
+            }
+            try collectTreePages(cache, node.rightmostChild(), out, allocator);
+        },
+    }
+}
+
 /// Look up `key` in the B-tree rooted at `root`. Reads are pure cache
 /// pins, no writer state is touched, so this can be called with a
 /// snapshot's captured root without holding any tree-level lock.

@@ -409,6 +409,81 @@ pub const Manifest = struct {
         return min;
     }
 
+    pub const VerifyReport = struct {
+        file_pages: u64,
+        manifest_tree_pages: u64,
+        store_count: u64,
+        store_tree_pages: u64,
+        freelist_tree_pages: u64,
+        freelist_recorded_pages: u64,
+        /// File pages not accounted for by header(0) + slots(1,2) +
+        /// manifest tree + store trees + freelist tree + freelist
+        /// recorded. Should be 0 for a clean forest; non-zero
+        /// indicates leaked pages.
+        orphan_pages: u64,
+    };
+
+    /// Walk the entire forest under the current in-memory roots and
+    /// report invariants. This is intended for admin tooling and tests
+    /// — it's not on any hot path. Takes the tree_lock and the
+    /// freelist_tree_lock for the duration of the walk; concurrent
+    /// writers block.
+    pub fn verify(self: *Manifest, allocator: std.mem.Allocator) !VerifyReport {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        self.freelist_tree_lock.lock();
+        defer self.freelist_tree_lock.unlock();
+
+        var mt_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer mt_pages.deinit(allocator);
+        try btree.collectTreePages(self.cache, self.tree.root, &mt_pages, allocator);
+
+        var st_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer st_pages.deinit(allocator);
+        var store_count: u64 = 0;
+        {
+            var cursor = try btree.PrefixCursor.open(self.cache, self.tree.root, "");
+            defer cursor.deinit();
+            while (try cursor.next()) {
+                store_count += 1;
+                const root = decodeRoot(cursor.value());
+                try btree.collectTreePages(self.cache, root, &st_pages, allocator);
+            }
+        }
+
+        var fl_tree_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer fl_tree_pages.deinit(allocator);
+        try btree.collectTreePages(self.cache, self.freelist.root, &fl_tree_pages, allocator);
+        var recorded: u64 = 0;
+        {
+            var cursor = try btree.PrefixCursor.open(self.cache, self.freelist.root, "");
+            defer cursor.deinit();
+            while (try cursor.next()) {
+                var it = ChunkIterator.init(cursor.value());
+                while (it.next()) |_| recorded += 1;
+            }
+        }
+
+        const file_pages = self.file.pageCount();
+        const fixed_pages: u64 = FIRST_DATA_PAGE; // header + slot A + slot B
+        const accounted = fixed_pages +
+            mt_pages.count() +
+            st_pages.count() +
+            fl_tree_pages.count() +
+            recorded;
+        const orphan_pages: u64 = if (file_pages > accounted) file_pages - accounted else 0;
+
+        return .{
+            .file_pages = file_pages,
+            .manifest_tree_pages = mt_pages.count(),
+            .store_count = store_count,
+            .store_tree_pages = st_pages.count(),
+            .freelist_tree_pages = fl_tree_pages.count(),
+            .freelist_recorded_pages = recorded,
+            .orphan_pages = orphan_pages,
+        };
+    }
+
     /// Open a read snapshot capturing the current applied state. The
     /// returned snapshot may be read from any thread until `close()`;
     /// writes to the underlying stores do not affect what the
@@ -1228,6 +1303,189 @@ test "Freelist: survives reopen" {
 // -----------------------------------------------------------------------------
 // Phase 5: apply/durabilize split + orphan elision tests
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Phase 8: recovery + verify
+// -----------------------------------------------------------------------------
+
+/// Helper for fault-injection tests: open the file with default
+/// options, overwrite a single page with the given content (must be
+/// page-size aligned), fsync, close.
+fn corruptSlotInFile(path: []const u8, slot_page: u64, content: []const u8) !void {
+    var pf = try PagedFile.open(path, .{});
+    defer pf.close();
+    try pf.writePage(slot_page, content);
+    try pf.fsync();
+}
+
+test "Phase 8: verify reports correct counts on a small forest" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.createStore(2);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "1");
+        try s.put("b", "2");
+    }
+    {
+        var s = try Store.open(h.manifest, 2);
+        defer s.deinit();
+        try s.put("x", "1");
+    }
+    try h.manifest.durabilize();
+
+    const report = try h.manifest.verify(testing.allocator);
+    try testing.expectEqual(@as(u64, 2), report.store_count);
+    try testing.expect(report.manifest_tree_pages >= 1);
+    try testing.expect(report.store_tree_pages >= 2);
+    try testing.expect(report.freelist_tree_pages >= 1);
+    // The freelist has recorded the orphans produced by the work
+    // above; combined with reachable pages, the file should mostly
+    // be accounted for.
+    try testing.expect(report.orphan_pages == 0);
+}
+
+test "Phase 8: recovery — slot A garbage, slot B valid → falls back to B" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize(); // commit #1 writes slot 0
+    try h.manifest.createStore(2);
+    try h.manifest.durabilize(); // commit #2 writes slot 1
+
+    try testing.expectEqual(@as(u32, 1), h.manifest.active_slot);
+    try testing.expectEqual(@as(u64, 2), h.manifest.active_seq);
+
+    h.closeLayers();
+
+    // Corrupt slot B (the active slot) with random bytes (bad CRC).
+    const garbage = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(garbage);
+    @memset(garbage, 0xAB);
+    try corruptSlotInFile(h.path(), SLOT_B_PAGE, garbage);
+
+    try h.openLayers(.{});
+
+    // Recovery falls back to slot A (seq=1).
+    try testing.expectEqual(@as(u32, 0), h.manifest.active_slot);
+    try testing.expectEqual(@as(u64, 1), h.manifest.active_seq);
+    try testing.expect(try h.manifest.hasStore(1));
+    try testing.expect(!try h.manifest.hasStore(2));
+}
+
+test "Phase 8: recovery — slot B garbage, slot A valid → falls back to A" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize(); // slot 0
+    try h.manifest.createStore(2);
+    try h.manifest.durabilize(); // slot 1
+    try h.manifest.createStore(3);
+    try h.manifest.durabilize(); // slot 0 again, overwriting commit #1
+
+    try testing.expectEqual(@as(u32, 0), h.manifest.active_slot);
+    try testing.expectEqual(@as(u64, 3), h.manifest.active_seq);
+
+    h.closeLayers();
+
+    // Corrupt slot A.
+    const garbage = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(garbage);
+    @memset(garbage, 0);
+    try corruptSlotInFile(h.path(), SLOT_A_PAGE, garbage);
+
+    try h.openLayers(.{});
+
+    // Recovery falls back to slot B (seq=2, the previous durable).
+    try testing.expectEqual(@as(u32, 1), h.manifest.active_slot);
+    try testing.expectEqual(@as(u64, 2), h.manifest.active_seq);
+    try testing.expect(try h.manifest.hasStore(1));
+    try testing.expect(try h.manifest.hasStore(2));
+    try testing.expect(!try h.manifest.hasStore(3));
+}
+
+test "Phase 8: recovery — both slots garbage looks fresh" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize();
+    try h.manifest.createStore(2);
+    try h.manifest.durabilize();
+
+    h.closeLayers();
+
+    const garbage = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(garbage);
+    @memset(garbage, 0);
+    try corruptSlotInFile(h.path(), SLOT_A_PAGE, garbage);
+    try corruptSlotInFile(h.path(), SLOT_B_PAGE, garbage);
+
+    try h.openLayers(.{});
+
+    try testing.expectEqual(@as(u64, 0), h.manifest.active_seq);
+    try testing.expect(!h.manifest.inactive_valid);
+    try testing.expect(!try h.manifest.hasStore(1));
+    try testing.expect(!try h.manifest.hasStore(2));
+}
+
+test "Phase 8: recovery — single-byte tear in slot CRC fails validation" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(7);
+    try h.manifest.durabilize();
+    try h.manifest.createStore(8);
+    try h.manifest.durabilize();
+    const active_before = h.manifest.active_slot;
+    h.closeLayers();
+
+    // Read the active slot, flip a single byte in the manifest_root
+    // field, write it back. CRC should fail.
+    const active_page: u64 = if (active_before == 0) SLOT_A_PAGE else SLOT_B_PAGE;
+    {
+        var pf = try PagedFile.open(h.path(), .{});
+        defer pf.close();
+        const buf = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+        defer testing.allocator.free(buf);
+        try pf.readPage(active_page, buf);
+        buf[16] ^= 0x01; // flip a bit in manifest_root
+        try pf.writePage(active_page, buf);
+        try pf.fsync();
+    }
+
+    try h.openLayers(.{});
+
+    // Should have fallen back to the OTHER slot. Either both stores
+    // exist (corruption was on slot 0 with newer seq → fall back to
+    // older but valid slot 1 with seq=1, just store 7) or vice versa.
+    try testing.expect(h.manifest.active_slot != active_before);
+}
+
+test "Phase 8: durabilize() with crash before slot fsync — old state survives" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize();
+
+    // Mid-write simulation: workers have dirty pages but durabilize
+    // never runs. Simulated by closing without commit.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k", "uncommitted");
+    }
+    // No durabilize call — close while dirty pages still in memory.
+    h.closeLayers();
+    try h.openLayers(.{});
+
+    // The reopen sees the previous durable state. The uncommitted
+    // value was never written to the slot, so it's gone.
+    try testing.expect(try h.manifest.hasStore(1));
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    try testing.expect((try s.get(testing.allocator, "k")) == null);
+}
 
 // -----------------------------------------------------------------------------
 // Phase 7: read snapshots

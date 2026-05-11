@@ -154,8 +154,22 @@ What snapshots ARE for: infrastructure callers that need a coherent view *while 
 
 The `PrefixCursor` was refactored to hold `(cache, root)` directly rather than `*Tree`, so snapshots can produce cursors against their captured root without aliasing a live Tree. (This refactor is independently useful regardless of the snapshot machinery.)
 
-### Phase 8 — Recovery
-Header validation, manifest slot picking, free-list rebuild (or trust + verify), `durable_index` exposure. Demo: `kill -9` across the durabilize sequence, verify recovery to last durable manifest.
+### Phase 8 — Recovery ✅
+Recovery on `Manifest.init`:
+1. Grow the file to ≥ FIRST_DATA_PAGE if it's smaller (fresh file).
+2. Read both slot pages.
+3. Validate each: magic match + CRC32 over the slot's bytes excluding the checksum field.
+4. Pick the slot with the higher valid `sequence`. If only one is valid, use it; if both invalid, the manifest is fresh.
+5. `tree.seq = active_seq + 1` so the next apply tags with the right seq.
+6. `refillReusable()` immediately, so workers have pages ready to allocate.
+
+Crash safety relies entirely on the two-slot atomic swap + CRC32. `durabilize` writes only to the inactive slot, then promotes it via in-memory state update. A torn or partial write to the slot fails CRC on the next open; the other slot — untouched — wins.
+
+`Manifest.verify()` walks the forest under `tree_lock + freelist_tree_lock` and reports counts: file_pages / manifest_tree_pages / store_count / store_tree_pages / freelist_tree_pages / freelist_recorded_pages / orphan_pages. For admin tooling and tests; not on any hot path.
+
+Fault-injection tests cover: slot A garbage → fall back to B, slot B garbage → fall back to A, both garbage → looks fresh, single-byte tear → CRC catches it and falls back, dirty pages without `durabilize` → uncommitted state vanishes on reopen.
+
+`Manifest.durableSeq()` exposes the highest durable seq for raft log replay starting point.
 
 ### Phase 9 — Raft adapter (rove glue)
 Decode rove writeset envelopes → kvexp apply call → produce dirty-page set tagged with raft index → durabilize on raft commit → expose `min(raft_committed, durable_index)` for response release. Slot `kvexp` under `rove-kv`'s existing tests for one tenant; all rove tests pass.
