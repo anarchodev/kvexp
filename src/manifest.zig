@@ -24,6 +24,24 @@
 //! current durable sequence has reached `N+1`, i.e.,
 //! `freed_at_seq <= sequence - 1`.
 //!
+//! ## Freelist on-disk format: vector-valued chunks
+//!
+//! The freelist B-tree stores **packed lists** of page_nos under each
+//! key, not one entry per cell. This amortizes freelist maintenance
+//! cost — without it, every freelist insert/delete goes through a
+//! full CoW path, and the freelist's own work dominates the workload.
+//!
+//! Key  = 16 bytes: 8 BE `freed_at_seq` | 8 BE `first_page_no` (just a
+//!        uniquifier so the same seq can have multiple chunks)
+//! Value = u16 count LE | count u64 page_nos LE
+//!
+//! With our 2KB max inline value, a chunk holds up to 255 page_nos.
+//! A commit that frees K pages writes ⌈K/255⌉ freelist puts instead
+//! of K. refillReusable consumes whole chunks and queues each chunk's
+//! key for deletion at next commit, so the freelist's own size stays
+//! proportional to *in-flight reusable pages*, not to *historical
+//! frees*.
+//!
 //! Manifest is **its own PageAllocator**. CoW operations on the
 //! manifest tree, the freelist tree, and per-store trees all route
 //! allocations through `Manifest.pageAllocator()`. Allocation pops
@@ -46,8 +64,10 @@ pub const FIRST_DATA_PAGE: u64 = 3;
 
 pub const STORE_ID_LEN: usize = 8;
 pub const STORE_VAL_LEN: usize = 8;
-pub const FREELIST_KEY_LEN: usize = 16; // 8 BE seq | 8 BE page_no
+pub const FREELIST_KEY_LEN: usize = 16; // 8 BE seq | 8 BE first_page_no
 pub const REUSABLE_BATCH: usize = 4096;
+/// Max page_nos per chunk cell: (max inline value − 2-byte count) / 8.
+pub const PAGES_PER_CHUNK: usize = (page.MAX_VAL_LEN - 2) / 8;
 
 pub const ManifestSlot = extern struct {
     magic: u32 align(1) = 0,
@@ -97,19 +117,53 @@ pub fn decodeRoot(bytes: []const u8) u64 {
     return std.mem.readInt(u64, bytes[0..STORE_VAL_LEN], .little);
 }
 
-pub fn encodeFreelistKey(freed_at_seq: u64, page_no: u64, buf: *[FREELIST_KEY_LEN]u8) []const u8 {
+/// Encode a freelist chunk key: `seq | first_page_no_in_chunk`. The
+/// `first_page_no` is a uniquifier so the same seq can have multiple
+/// chunks without key collisions.
+pub fn encodeFreelistKey(freed_at_seq: u64, first_page_no: u64, buf: *[FREELIST_KEY_LEN]u8) []const u8 {
     std.mem.writeInt(u64, buf[0..8], freed_at_seq, .big);
-    std.mem.writeInt(u64, buf[8..16], page_no, .big);
+    std.mem.writeInt(u64, buf[8..16], first_page_no, .big);
     return buf;
 }
 
-pub fn decodeFreelistKey(bytes: []const u8) struct { freed_at_seq: u64, page_no: u64 } {
+pub fn decodeFreelistKey(bytes: []const u8) struct { freed_at_seq: u64, first_page_no: u64 } {
     std.debug.assert(bytes.len == FREELIST_KEY_LEN);
     return .{
         .freed_at_seq = std.mem.readInt(u64, bytes[0..8], .big),
-        .page_no = std.mem.readInt(u64, bytes[8..16], .big),
+        .first_page_no = std.mem.readInt(u64, bytes[8..16], .big),
     };
 }
+
+/// Encode a chunk value: 2-byte LE count, then `count` u64 LE page_nos.
+pub fn encodeFreelistValue(page_nos: []const u64, buf: []u8) []const u8 {
+    std.debug.assert(page_nos.len <= std.math.maxInt(u16));
+    std.debug.assert(buf.len >= 2 + 8 * page_nos.len);
+    std.mem.writeInt(u16, buf[0..2], @intCast(page_nos.len), .little);
+    var i: usize = 2;
+    for (page_nos) |p| {
+        std.mem.writeInt(u64, buf[i..][0..8], p, .little);
+        i += 8;
+    }
+    return buf[0..i];
+}
+
+/// Iterator over page_nos packed in a chunk value.
+pub const ChunkIterator = struct {
+    value: []const u8,
+    index: usize = 2,
+    count: usize,
+
+    pub fn init(value: []const u8) ChunkIterator {
+        return .{ .value = value, .count = std.mem.readInt(u16, value[0..2], .little) };
+    }
+
+    pub fn next(self: *ChunkIterator) ?u64 {
+        if (self.index >= 2 + 8 * self.count) return null;
+        const p = std.mem.readInt(u64, self.value[self.index..][0..8], .little);
+        self.index += 8;
+        return p;
+    }
+};
 
 pub const Error = anyerror;
 
@@ -307,20 +361,17 @@ pub const Manifest = struct {
     /// page freed up to and including the previous commit window.
     pub fn commit(self: *Manifest) !void {
         // 1. Fold pending_free + consumed_keys into the durable freelist.
-        //    These tree mutations themselves produce new dirty pages
-        //    (and may produce new pending_free entries — those carry to
-        //    the next commit window). Snapshot the lists first so the
-        //    fold pass operates on a frozen input.
+        //    Each commit window's frees are grouped by seq and packed
+        //    into chunked cells (PAGES_PER_CHUNK page_nos per cell).
+        //    These mutations themselves produce new dirty pages — they
+        //    go to next commit's pending_free.
         const pf = try self.pending_free.toOwnedSlice(self.allocator);
         defer self.allocator.free(pf);
         const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
         defer self.allocator.free(ck);
 
-        for (pf) |fp| {
-            var key_buf: [FREELIST_KEY_LEN]u8 = undefined;
-            const key = encodeFreelistKey(fp.freed_at_seq, fp.page_no, &key_buf);
-            try self.freelist.put(key, &.{});
-        }
+        try self.foldPendingFree(pf);
+
         for (ck) |key| {
             _ = try self.freelist.delete(&key);
         }
@@ -359,10 +410,11 @@ pub const Manifest = struct {
         try self.refillReusable();
     }
 
-    /// Scan the durable freelist for entries with `freed_at_seq <=
-    /// sequence - 1` and pull up to REUSABLE_BATCH of them into the
-    /// in-memory `reusable` queue. The corresponding keys are queued
-    /// for deletion from the freelist at the next commit.
+    /// Scan the durable freelist for chunks with `freed_at_seq <=
+    /// sequence - 1` and unpack them into the in-memory `reusable`
+    /// queue. Each consumed chunk's key is queued for deletion at the
+    /// next commit (whole-chunk consumption — partial chunks are not
+    /// supported).
     fn refillReusable(self: *Manifest) !void {
         // Two-slot atomic-swap invariant: freed_at_seq must be strictly
         // less than the current durable sequence before reuse is safe.
@@ -375,11 +427,55 @@ pub const Manifest = struct {
         while (try cursor.next()) {
             const decoded = decodeFreelistKey(cursor.key());
             if (decoded.freed_at_seq > max_eligible) break;
-            try self.reusable.append(self.allocator, decoded.page_no);
+            var it = ChunkIterator.init(cursor.value());
+            while (it.next()) |p| {
+                try self.reusable.append(self.allocator, p);
+            }
             var key_copy: [FREELIST_KEY_LEN]u8 = undefined;
             @memcpy(&key_copy, cursor.key());
             try self.consumed_keys.append(self.allocator, key_copy);
             if (self.reusable.items.len >= REUSABLE_BATCH) break;
+        }
+    }
+
+    /// Group pending_free entries by their `freed_at_seq` and write
+    /// chunked cells into the freelist B-tree. All entries from a
+    /// single commit window share one seq, so most workloads see ⌈P /
+    /// PAGES_PER_CHUNK⌉ freelist puts, not P.
+    fn foldPendingFree(self: *Manifest, pf: []const FreedPage) !void {
+        if (pf.len == 0) return;
+
+        // Group by seq using a hash map. For workloads where ~all
+        // entries share one seq, this is trivially small.
+        var groups: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(u64)) = .empty;
+        defer {
+            var it = groups.valueIterator();
+            while (it.next()) |list| list.deinit(self.allocator);
+            groups.deinit(self.allocator);
+        }
+        for (pf) |fp| {
+            const gop = try groups.getOrPut(self.allocator, fp.freed_at_seq);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.allocator, fp.page_no);
+        }
+
+        // For each seq group, chunk the page_nos and write each chunk
+        // as one freelist.put.
+        var val_buf: [page.MAX_VAL_LEN]u8 = undefined;
+        var grp_it = groups.iterator();
+        while (grp_it.next()) |entry| {
+            const seq = entry.key_ptr.*;
+            const pages = entry.value_ptr.items;
+            var i: usize = 0;
+            while (i < pages.len) {
+                const end = @min(i + PAGES_PER_CHUNK, pages.len);
+                const chunk = pages[i..end];
+                var key_buf: [FREELIST_KEY_LEN]u8 = undefined;
+                const key = encodeFreelistKey(seq, chunk[0], &key_buf);
+                const value = encodeFreelistValue(chunk, &val_buf);
+                try self.freelist.put(key, value);
+                i = end;
+            }
         }
     }
 };
@@ -777,23 +873,18 @@ test "Freelist: survives reopen" {
     try testing.expectEqual(freelist_root_before, h.manifest.freelist.root);
 }
 
-test "Freelist: churn workload sees reuse activity" {
-    // Phase 4's freelist is a kvexp B-tree of `(seq, page) → ε`, which
-    // means every freelist insertion or deletion goes through a full
-    // CoW path — generating ~depth new orphan pages per call. That is
-    // a known amplifier; phase 11+ will replace this with an LMDB-
-    // style vector-valued freelist (many page_nos per cell, batched
-    // insert/delete) so the freelist's own maintenance approaches
-    // O(1) per page rather than O(depth). For now we just verify that
-    // (a) the freelist accumulates entries and (b) the reusable queue
-    // populates so subsequent allocations are served from reuse, not
-    // file.growBy.
+test "Freelist: churn workload approaches net-zero growth" {
+    // With vector-valued chunks in the freelist (PAGES_PER_CHUNK
+    // page_nos packed per cell), each commit's freelist maintenance
+    // costs O(⌈P/PAGES_PER_CHUNK⌉ * depth) instead of O(P * depth).
+    // Reuse keeps user-op allocations off `file.growBy`, and freelist
+    // churn is small enough that file growth is sub-linear in rounds.
     var h = try Harness.init(256);
     defer h.deinit();
     try h.manifest.createStore(1);
 
-    const KEYS: u32 = 50;
-    const ROUNDS: u32 = 3;
+    const KEYS: u32 = 100;
+    const ROUNDS: u32 = 50;
 
     {
         var s = try Store.open(h.manifest, 1);
@@ -810,7 +901,7 @@ test "Freelist: churn workload sees reuse activity" {
     try testing.expect(h.manifest.freelist.root != 0);
     try testing.expect(h.manifest.reusable.items.len > 0);
 
-    const reusable_before = h.manifest.reusable.items.len;
+    const size_after_populate = h.manifest.fileSizePages();
 
     var round: u32 = 0;
     while (round < ROUNDS) : (round += 1) {
@@ -827,10 +918,12 @@ test "Freelist: churn workload sees reuse activity" {
         try h.manifest.commit();
     }
 
-    // After churn, reuse must have happened — reusable was non-empty
-    // before round 0, so user-op allocations between commits popped
-    // from it. The exact count after the final refill is workload-
-    // dependent, but the queue must continue cycling.
-    _ = reusable_before;
-    try testing.expect(h.manifest.freelist.root != 0);
+    const size_after_churn = h.manifest.fileSizePages();
+    const growth = size_after_churn - size_after_populate;
+    const naive_growth_no_reuse = KEYS * ROUNDS * 3; // ~3 pages per put (CoW depth)
+
+    // Real growth should be a tiny fraction of what a leaking allocator
+    // would produce, and at most ~2× the populate-time footprint.
+    try testing.expect(growth < 2 * size_after_populate);
+    try testing.expect(growth * 10 < naive_growth_no_reuse);
 }

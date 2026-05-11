@@ -269,6 +269,61 @@ pub const Tree = struct {
         hit: SearchHit,
         new_total: usize,
     ) Error!CoWResult {
+        _ = new_total;
+
+        // Materialize the logical cell sequence into a temporary list,
+        // then find a midpoint where both halves fit in a page.
+        // Variable-size cells make the simple "threshold" heuristic
+        // wrong — a small/small/big/big sequence will route both bigs
+        // to the right half, overflowing it. So we compute prefix sums
+        // and pick the mid that minimizes imbalance subject to the
+        // hard page-fit constraint.
+        const Entry = struct { key: []const u8, value: []const u8 };
+        const cap = src.nEntries() + 1;
+        var entries = try std.ArrayListUnmanaged(Entry).initCapacity(self.allocator, cap);
+        defer entries.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < src.nEntries()) : (i += 1) {
+            if (i == hit.idx) {
+                entries.appendAssumeCapacity(.{ .key = key, .value = value });
+                if (hit.found) continue;
+            }
+            entries.appendAssumeCapacity(.{ .key = src.keyAt(i), .value = src.valueAt(i) });
+        }
+        if (!hit.found and hit.idx == src.nEntries()) {
+            entries.appendAssumeCapacity(.{ .key = key, .value = value });
+        }
+        std.debug.assert(entries.items.len >= 2);
+
+        // Cumulative cell-byte sum (each element = size including slot).
+        var total_bytes: usize = 0;
+        var cumulative = try std.ArrayListUnmanaged(usize).initCapacity(self.allocator, entries.items.len + 1);
+        defer cumulative.deinit(self.allocator);
+        cumulative.appendAssumeCapacity(0);
+        for (entries.items) |e| {
+            total_bytes += page.leafCellSize(e.key.len, e.value.len) + SLOT_SIZE;
+            cumulative.appendAssumeCapacity(total_bytes);
+        }
+
+        // Find best valid mid: cells [0..mid-1] go left, [mid..n-1] go right.
+        var best_mid: usize = 0;
+        var best_imbalance: usize = std.math.maxInt(usize);
+        var mid: usize = 1;
+        while (mid < entries.items.len) : (mid += 1) {
+            const left_size = HEADER_SIZE + cumulative.items[mid];
+            const right_size = HEADER_SIZE + (total_bytes - cumulative.items[mid]);
+            if (left_size > PAGE_SIZE) break; // left full; later mids also overflow
+            if (right_size > PAGE_SIZE) continue; // right doesn't fit; try later mid
+            const imbalance = if (left_size > right_size) left_size - right_size else right_size - left_size;
+            if (imbalance < best_imbalance) {
+                best_mid = mid;
+                best_imbalance = imbalance;
+            }
+        }
+        std.debug.assert(best_mid >= 1);
+        std.debug.assert(best_mid < entries.items.len);
+
         const left_no = try self.page_allocator.alloc();
         const right_no = try self.page_allocator.alloc();
         const left_ref = try self.cache.pinNew(left_no);
@@ -278,59 +333,24 @@ pub const Tree = struct {
         const left = Leaf.init(left_ref.buf());
         const right = Leaf.init(right_ref.buf());
 
-        const half = new_total / 2;
-        var used: usize = HEADER_SIZE;
-        var on_left = true;
-        var sep_set = false;
+        var j: usize = 0;
+        while (j < best_mid) : (j += 1) {
+            std.debug.assert(left.appendCell(entries.items[j].key, entries.items[j].value));
+        }
+        while (j < entries.items.len) : (j += 1) {
+            std.debug.assert(right.appendCell(entries.items[j].key, entries.items[j].value));
+        }
+
+        left_ref.markDirty(self.seq);
+        right_ref.markDirty(self.seq);
+
         var split = Split{
             .left = left_no,
             .right = right_no,
             .sep_buf = undefined,
             .sep_len = 0,
         };
-
-        const Emit = struct {
-            fn call(
-                s: *Split,
-                u: *usize,
-                ol: *bool,
-                ss: *bool,
-                l: Leaf,
-                r: Leaf,
-                k: []const u8,
-                v: []const u8,
-                threshold: usize,
-            ) void {
-                const cell_total = page.leafCellSize(k.len, v.len) + SLOT_SIZE;
-                if (ol.* and u.* + cell_total > threshold and l.nEntries() >= 1) {
-                    s.setSep(k);
-                    ss.* = true;
-                    ol.* = false;
-                }
-                const dst = if (ol.*) l else r;
-                std.debug.assert(dst.appendCell(k, v));
-                u.* += cell_total;
-            }
-        };
-
-        var i: usize = 0;
-        while (i < src.nEntries()) : (i += 1) {
-            if (i == hit.idx) {
-                Emit.call(&split, &used, &on_left, &sep_set, left, right, key, value, half);
-                if (hit.found) continue;
-            }
-            Emit.call(&split, &used, &on_left, &sep_set, left, right, src.keyAt(i), src.valueAt(i), half);
-        }
-        if (!hit.found and hit.idx == src.nEntries()) {
-            Emit.call(&split, &used, &on_left, &sep_set, left, right, key, value, half);
-        }
-
-        std.debug.assert(sep_set);
-        std.debug.assert(left.nEntries() >= 1);
-        std.debug.assert(right.nEntries() >= 1);
-
-        left_ref.markDirty(self.seq);
-        right_ref.markDirty(self.seq);
+        split.setSep(entries.items[best_mid].key);
         return .{ .split = split };
     }
 
