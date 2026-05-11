@@ -1,0 +1,7 @@
+.{
+    .name = .kvexp,
+    .version = "0.0.0",
+    .fingerprint = 0x9f6bc50844f918d6,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
