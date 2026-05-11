@@ -102,8 +102,21 @@ pub const PageCache = struct {
 
     /// Pin a newly-allocated page. Buffer is zero-initialized; caller
     /// is expected to write content and `markDirty()` before release.
+    ///
+    /// If `page_no` is already in cache (from a previous life — the
+    /// page was freed and the allocator just handed it back for reuse),
+    /// the stale entry is dropped *without* write-back. The freelist
+    /// invariant guarantees that no durable manifest references the
+    /// page's old content, so skipping the write is safe and avoids
+    /// wasting I/O on data that no one will ever read.
     pub fn pinNew(self: *PageCache, page_no: u64) PinError!PageRef {
-        std.debug.assert(self.index.get(page_no) == null);
+        if (self.index.get(page_no)) |existing_idx| {
+            const slot = &self.slots[existing_idx];
+            std.debug.assert(slot.pin_count == 0);
+            @memset(self.pool.buf(existing_idx), 0);
+            self.installSlot(existing_idx, page_no);
+            return .{ .cache = self, .page_no = page_no, .buffer_idx = existing_idx };
+        }
         const buffer_idx = try self.assignBuffer();
         @memset(self.pool.buf(buffer_idx), 0);
         self.installSlot(buffer_idx, page_no);

@@ -120,6 +120,8 @@ Manifest as B-tree keyed by `store_id`. Two-slot manifest header with atomic swa
 ### Phase 4 — Durable free-page allocator
 Free list as B-tree keyed by `(freed_at_sequence, page_no)`. Per-transaction "pending free" lists. Reclamation tied to minimum-live-reader sequence. Demo: net-zero workload, verify file size and free-list balance. Stress with churn, fault-inject across allocator state to verify no leaks.
 
+**Phase 4 known limitation (carried to phase 11):** The B-tree-of-`(seq,page)→ε` shape means every freelist insert and delete goes through a full CoW path, generating `depth` new orphan pages per call. Each commit therefore produces more `pending_free` entries than it processed — the freelist machinery has its own write amplification on top of the user workload. Reuse still works (allocations are satisfied from the in-memory `reusable` queue) but the on-disk freelist grows. Phase 11 will replace this with an LMDB-style **vector-valued cell** format: one cell stores many `page_no`s per `(seq)` key, so a batch of frees costs `~depth` allocations total, not `K*depth`. With that, the system can approach true net-zero file growth.
+
 ### Phase 5 — Apply / durabilize split + group commit + orphan elision
 Apply produces in-memory manifest version + tagged dirty pages, zero I/O. `Durabilize(K)` collapses intermediate manifests, subtracts orphans, pwrites + fsyncs. Watermark API. Demo: write-hot-key benchmark — count pwrites vs proposes under varying raft cadence, target <1:1.
 

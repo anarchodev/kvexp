@@ -11,13 +11,21 @@
 //! layer arrives in phase 3, the root pointer will live there and this
 //! field becomes a per-operation in/out value.
 //!
-//! Page allocation in phase 2 is just `file.growBy(1)` — pages leak on
-//! free. The durable free-list lands in phase 4.
+//! Page allocation is delegated to a `PageAllocator` (see
+//! `page_allocator.zig`). CoW operations call `alloc()` for each fresh
+//! page and `free(old_no, self.seq)` for each superseded page. Phase 4
+//! plugs in the manifest's durable free-list as the allocator; before
+//! that, callers can use `GrowOnlyAllocator` (no reclamation; pages
+//! leak — fine for unit tests).
 
 const std = @import("std");
 const page = @import("page.zig");
 const PagedFile = @import("paged_file.zig").PagedFile;
 const PageCache = @import("page_cache.zig").PageCache;
+const page_allocator_mod = @import("page_allocator.zig");
+
+pub const PageAllocator = page_allocator_mod.PageAllocator;
+pub const GrowOnlyAllocator = page_allocator_mod.GrowOnlyAllocator;
 
 const Leaf = page.Leaf;
 const Internal = page.Internal;
@@ -25,19 +33,20 @@ const PAGE_SIZE = page.PAGE_SIZE;
 const HEADER_SIZE = page.HEADER_SIZE;
 const SLOT_SIZE = page.SLOT_SIZE;
 
-pub const Error = error{
+/// Tree operations call into a PageAllocator that may do arbitrary
+/// further B-tree operations (e.g. inserting into the durable
+/// free-list), so the concrete error set is open. Use `anyerror` and
+/// let callers `try` through; specific errors callers care about
+/// (KeyTooLong, ValueTooLong, TreeTooDeep, StoreNotFound, …) are still
+/// returned, just not enumerated in a named set.
+pub const Error = anyerror;
+
+pub const SpecificError = error{
     KeyTooLong,
     ValueTooLong,
     TreeTooDeep,
     Corruption,
-    AccessDenied,
-    PermissionDenied,
-    InputOutput,
-    FileTooBig,
-    FileBusy,
-    NonResizable,
-    Unexpected,
-} || PageCache.PinError || std.mem.Allocator.Error;
+};
 
 pub const MAX_DEPTH: usize = 32;
 
@@ -78,6 +87,7 @@ pub const Tree = struct {
     cache: *PageCache,
     file: *PagedFile,
     allocator: std.mem.Allocator,
+    page_allocator: PageAllocator,
     root: u64,
     seq: u64,
 
@@ -85,7 +95,12 @@ pub const Tree = struct {
     /// 2 just keeps the slot off-limits). The tree treats `root == 0`
     /// as the empty-tree sentinel, so we must guarantee no leaf is ever
     /// allocated to page 0.
-    pub fn init(allocator: std.mem.Allocator, cache: *PageCache, file: *PagedFile) !Tree {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cache: *PageCache,
+        file: *PagedFile,
+        page_alloc: PageAllocator,
+    ) !Tree {
         if (file.pageCount() == 0) {
             _ = try file.growBy(1);
         }
@@ -93,6 +108,7 @@ pub const Tree = struct {
             .cache = cache,
             .file = file,
             .allocator = allocator,
+            .page_allocator = page_alloc,
             .root = 0,
             .seq = 1,
         };
@@ -143,7 +159,7 @@ pub const Tree = struct {
         if (value.len > page.MAX_VAL_LEN) return error.ValueTooLong;
 
         if (self.root == 0) {
-            const leaf_no = try self.file.growBy(1);
+            const leaf_no = try self.page_allocator.alloc();
             const ref = try self.cache.pinNew(leaf_no);
             defer ref.release();
             const leaf = Leaf.init(ref.buf());
@@ -190,7 +206,7 @@ pub const Tree = struct {
         switch (result) {
             .single => |p| self.root = p,
             .split => |s| {
-                const new_root_no = try self.file.growBy(1);
+                const new_root_no = try self.page_allocator.alloc();
                 const ref = try self.cache.pinNew(new_root_no);
                 defer ref.release();
                 const node = Internal.init(ref.buf(), s.right);
@@ -219,7 +235,7 @@ pub const Tree = struct {
             @as(usize, src.header().total_cell_bytes) + added_cell - removed_cell;
 
         if (new_total <= PAGE_SIZE) {
-            const new_no = try self.file.growBy(1);
+            const new_no = try self.page_allocator.alloc();
             const new_ref = try self.cache.pinNew(new_no);
             defer new_ref.release();
             const dst = Leaf.init(new_ref.buf());
@@ -236,10 +252,13 @@ pub const Tree = struct {
                 std.debug.assert(dst.appendCell(key, value));
             }
             new_ref.markDirty(self.seq);
+            try self.page_allocator.free(src_page, self.seq);
             return .{ .single = new_no };
         }
 
-        return try self.splitLeafInsert(src, key, value, hit, new_total);
+        const result = try self.splitLeafInsert(src, key, value, hit, new_total);
+        try self.page_allocator.free(src_page, self.seq);
+        return result;
     }
 
     fn splitLeafInsert(
@@ -250,8 +269,8 @@ pub const Tree = struct {
         hit: SearchHit,
         new_total: usize,
     ) Error!CoWResult {
-        const left_no = try self.file.growBy(1);
-        const right_no = try self.file.growBy(1);
+        const left_no = try self.page_allocator.alloc();
+        const right_no = try self.page_allocator.alloc();
         const left_ref = try self.cache.pinNew(left_no);
         defer left_ref.release();
         const right_ref = try self.cache.pinNew(right_no);
@@ -328,7 +347,7 @@ pub const Tree = struct {
         switch (child_result.*) {
             .single => |new_child_no| {
                 // Same size; rewrite densely with one child pointer changed.
-                const new_no = try self.file.growBy(1);
+                const new_no = try self.page_allocator.alloc();
                 const new_ref = try self.cache.pinNew(new_no);
                 defer new_ref.release();
                 const rightmost: u64 = blk: {
@@ -343,6 +362,7 @@ pub const Tree = struct {
                     std.debug.assert(dst.appendCell(k, c));
                 }
                 new_ref.markDirty(self.seq);
+                try self.page_allocator.free(src_page, self.seq);
                 return .{ .single = new_no };
             },
             .split => |s| {
@@ -350,10 +370,12 @@ pub const Tree = struct {
                     (@as(usize, src.nEntries()) + 1) * SLOT_SIZE +
                     @as(usize, src.header().total_cell_bytes) +
                     page.internalCellSize(s.sep_len);
-                if (new_total <= PAGE_SIZE) {
-                    return try self.cowInternalInsertSingle(src, child_slot, &s);
-                }
-                return try self.splitInternalInsert(src, child_slot, &s, new_total);
+                const result = if (new_total <= PAGE_SIZE)
+                    try self.cowInternalInsertSingle(src, child_slot, &s)
+                else
+                    try self.splitInternalInsert(src, child_slot, &s, new_total);
+                try self.page_allocator.free(src_page, self.seq);
+                return result;
             },
         }
     }
@@ -364,7 +386,7 @@ pub const Tree = struct {
         child_slot: u32,
         s: *const Split,
     ) Error!CoWResult {
-        const new_no = try self.file.growBy(1);
+        const new_no = try self.page_allocator.alloc();
         const new_ref = try self.cache.pinNew(new_no);
         defer new_ref.release();
 
@@ -441,8 +463,8 @@ pub const Tree = struct {
         // mid is the index of the promoted entry; cells [0..mid-1] go left,
         // cells [mid+1..N-1] go right, cells[mid].child becomes left's rightmost.
 
-        const left_no = try self.file.growBy(1);
-        const right_no = try self.file.growBy(1);
+        const left_no = try self.page_allocator.alloc();
+        const right_no = try self.page_allocator.alloc();
         const left_ref = try self.cache.pinNew(left_no);
         defer left_ref.release();
         const right_ref = try self.cache.pinNew(right_no);
@@ -554,7 +576,7 @@ pub const Tree = struct {
         const hit = src.search(key);
         if (!hit.found) return .{ .existed = false, .new_page = src_page };
 
-        const new_no = try self.file.growBy(1);
+        const new_no = try self.page_allocator.alloc();
         const new_ref = try self.cache.pinNew(new_no);
         defer new_ref.release();
         const dst = Leaf.init(new_ref.buf());
@@ -564,6 +586,7 @@ pub const Tree = struct {
             std.debug.assert(dst.appendCell(src.keyAt(i), src.valueAt(i)));
         }
         new_ref.markDirty(self.seq);
+        try self.page_allocator.free(src_page, self.seq);
         return .{ .existed = true, .new_page = new_no };
     }
 };
@@ -718,6 +741,7 @@ const Harness = struct {
     file: *PagedFile,
     pool: *BufferPool,
     cache: *PageCache,
+    grow: *GrowOnlyAllocator,
     tree: Tree,
 
     fn init(pool_capacity: u32) !Harness {
@@ -743,8 +767,19 @@ const Harness = struct {
         errdefer testing.allocator.destroy(cache);
         cache.* = try PageCache.init(testing.allocator, file, pool);
 
-        const tree = try Tree.init(testing.allocator, cache, file);
-        return .{ .tmp = tmp, .file = file, .pool = pool, .cache = cache, .tree = tree };
+        const grow = try testing.allocator.create(GrowOnlyAllocator);
+        errdefer testing.allocator.destroy(grow);
+        grow.* = .{ .file = file };
+
+        const tree = try Tree.init(testing.allocator, cache, file, grow.pageAllocator());
+        return .{
+            .tmp = tmp,
+            .file = file,
+            .pool = pool,
+            .cache = cache,
+            .grow = grow,
+            .tree = tree,
+        };
     }
 
     fn deinit(self: *Harness) void {
@@ -752,6 +787,7 @@ const Harness = struct {
         testing.allocator.destroy(self.cache);
         self.pool.deinit(testing.allocator);
         testing.allocator.destroy(self.pool);
+        testing.allocator.destroy(self.grow);
         self.file.close();
         testing.allocator.destroy(self.file);
         self.tmp.cleanup();
