@@ -11,6 +11,9 @@ pub const page_cache = @import("page_cache.zig");
 pub const page = @import("page.zig");
 pub const btree = @import("btree.zig");
 pub const Tree = btree.Tree;
+pub const manifest = @import("manifest.zig");
+pub const Manifest = manifest.Manifest;
+pub const Store = manifest.Store;
 
 pub const Header = header.Header;
 pub const PagedFile = paged_file.PagedFile;

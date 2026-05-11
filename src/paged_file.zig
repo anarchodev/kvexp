@@ -19,12 +19,13 @@ pub const PagedFile = struct {
     ring: linux.IoUring,
     page_size: u32,
     page_count: u64,
+    ring_entries: u16,
 
     pub const OpenOptions = struct {
         create: bool = false,
         truncate: bool = false,
         page_size: u32 = 4096,
-        ring_entries: u16 = 32,
+        ring_entries: u16 = 64,
     };
 
     pub const OpenError = std.posix.OpenError || std.posix.FStatError || error{
@@ -56,6 +57,7 @@ pub const PagedFile = struct {
             .ring = ring,
             .page_size = options.page_size,
             .page_count = page_count,
+            .ring_entries = options.ring_entries,
         };
     }
 
@@ -112,11 +114,23 @@ pub const PagedFile = struct {
 
     pub const PageWrite = struct { page_no: u64, buf: []const u8 };
 
-    /// Batched writes — submit all SQEs together, wait for all CQEs.
-    /// Used by the page cache's flush path; this is the seam group
-    /// commit will exploit in phase 5.
+    /// Batched writes — submit in chunks sized to fit the ring, waiting
+    /// for each chunk's completions before submitting the next. This is
+    /// the seam group commit will exploit in phase 5.
     pub fn writePages(self: *PagedFile, writes: []const PageWrite) IoError!void {
         if (writes.len == 0) return;
+        // Leave headroom so concurrent fsync/other SQEs (later phases)
+        // never collide with our writes.
+        const chunk: usize = @max(@as(usize, self.ring_entries) / 2, 1);
+        var i: usize = 0;
+        while (i < writes.len) {
+            const end = @min(i + chunk, writes.len);
+            try self.submitWriteChunk(writes[i..end]);
+            i = end;
+        }
+    }
+
+    fn submitWriteChunk(self: *PagedFile, writes: []const PageWrite) IoError!void {
         for (writes, 0..) |w, i| {
             try self.checkBufConst(w.page_no, w.buf);
             const offset = w.page_no * self.page_size;
