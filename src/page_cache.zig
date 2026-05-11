@@ -7,7 +7,12 @@
 //! never writes back on its own — `O_DIRECT` plus our explicit pwrite
 //! is the only path to disk.
 //!
-//! Phase 0/1 is single-threaded. Concurrency comes in phase 6.
+//! Phase 6: a single cache-wide mutex guards the index, slot states,
+//! and the clock hand. Critical sections are short (each pin/release/
+//! markDirty is a handful of struct-field accesses). Eviction runs
+//! under the lock — that can write back a dirty page synchronously,
+//! which is a longer section we accept for now (phase 11+ may move
+//! eviction off the hot path or shard the cache).
 
 const std = @import("std");
 const PagedFile = @import("paged_file.zig").PagedFile;
@@ -29,11 +34,15 @@ pub const PageRef = struct {
     /// (a CoW B-tree shouldn't dirty the same page_no twice, but the
     /// max-merge is the safe semantics).
     pub fn markDirty(self: PageRef, seq: u64) void {
+        self.cache.lock.lock();
+        defer self.cache.lock.unlock();
         const slot = &self.cache.slots[self.buffer_idx];
         slot.dirty_seq = if (slot.dirty_seq) |existing| @max(existing, seq) else seq;
     }
 
     pub fn release(self: PageRef) void {
+        self.cache.lock.lock();
+        defer self.cache.lock.unlock();
         const slot = &self.cache.slots[self.buffer_idx];
         std.debug.assert(slot.pin_count > 0);
         slot.pin_count -= 1;
@@ -56,6 +65,11 @@ pub const PageCache = struct {
     index: std.AutoHashMapUnmanaged(u64, BufferIndex),
     slots: []Slot,
     clock_hand: u32,
+    /// Single cache-wide mutex. Held during pin/pinNew/release/
+    /// markDirty/flushUpToSkipping. Recursive lock acquisition is NOT
+    /// supported — callers must not hold the lock when calling another
+    /// locked cache method.
+    lock: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, file: *PagedFile, pool: *BufferPool) !PageCache {
         const slots = try allocator.alloc(Slot, pool.capacity);
@@ -87,6 +101,8 @@ pub const PageCache = struct {
     /// Pin a page in cache. On miss, reads from disk first. Caller must
     /// `.release()` the returned ref when done.
     pub fn pin(self: *PageCache, page_no: u64) PinError!PageRef {
+        self.lock.lock();
+        defer self.lock.unlock();
         if (self.index.get(page_no)) |buffer_idx| {
             const slot = &self.slots[buffer_idx];
             slot.pin_count += 1;
@@ -110,6 +126,8 @@ pub const PageCache = struct {
     /// page's old content, so skipping the write is safe and avoids
     /// wasting I/O on data that no one will ever read.
     pub fn pinNew(self: *PageCache, page_no: u64) PinError!PageRef {
+        self.lock.lock();
+        defer self.lock.unlock();
         if (self.index.get(page_no)) |existing_idx| {
             const slot = &self.slots[existing_idx];
             std.debug.assert(slot.pin_count == 0);
@@ -140,6 +158,8 @@ pub const PageCache = struct {
         seq: u64,
         skip: ?*const std.AutoHashMapUnmanaged(u64, void),
     ) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
         var writes: std.ArrayListUnmanaged(PagedFile.PageWrite) = .empty;
         defer writes.deinit(self.allocator);
         var clean_only: std.ArrayListUnmanaged(BufferIndex) = .empty;
@@ -176,7 +196,9 @@ pub const PageCache = struct {
         pinned: u32,
     };
 
-    pub fn stats(self: *const PageCache) Stats {
+    pub fn stats(self: *PageCache) Stats {
+        self.lock.lock();
+        defer self.lock.unlock();
         var s: Stats = .{ .capacity = @intCast(self.slots.len), .occupied = 0, .dirty = 0, .pinned = 0 };
         for (self.slots) |slot| {
             if (slot.state != .occupied) continue;

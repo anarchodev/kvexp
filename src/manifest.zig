@@ -206,6 +206,27 @@ pub const Manifest = struct {
     /// into the durable freelist at the next durabilize.
     pending_free: std.ArrayListUnmanaged(FreedPage),
 
+    /// Lock ordering (no thread holds an earlier lock while acquiring
+    /// a later one):
+    ///   store_lock(id)     — held by one writer to that store at a
+    ///                        time; uncontended across distinct stores
+    ///   tree_lock          — manifest tree mutations + reads
+    ///   freelist_tree_lock — freelist tree mutations + reads (only
+    ///                        held during durabilize)
+    ///   alloc_lock         — reusable/pending_free/consumed_keys/
+    ///                        file.growBy
+    /// `cache.lock` (interior, owned by PageCache) is acquired
+    /// briefly *inside* allocImpl/freeImpl-free regions.
+    tree_lock: std.Thread.Mutex = .{},
+    freelist_tree_lock: std.Thread.Mutex = .{},
+    alloc_lock: std.Thread.Mutex = .{},
+
+    /// Per-store write locks, keyed by store_id. Allocated lazily on
+    /// first Store.put for that id; not freed (small overhead per
+    /// active store).
+    store_locks: std.AutoHashMapUnmanaged(u64, *std.Thread.Mutex),
+    store_locks_lock: std.Thread.Mutex = .{},
+
     pub fn pageAllocator(self: *Manifest) PageAllocator {
         return .{ .ctx = self, .vtable = &alloc_vtable };
     }
@@ -217,12 +238,16 @@ pub const Manifest = struct {
 
     fn allocImpl(ctx: *anyopaque) anyerror!u64 {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
+        self.alloc_lock.lock();
+        defer self.alloc_lock.unlock();
         if (self.reusable.pop()) |p| return p;
         return try self.file.growBy(1);
     }
 
     fn freeImpl(ctx: *anyopaque, page_no: u64, freed_at_seq: u64) anyerror!void {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
+        self.alloc_lock.lock();
+        defer self.alloc_lock.unlock();
         try self.pending_free.append(self.allocator, .{
             .page_no = page_no,
             .freed_at_seq = freed_at_seq,
@@ -238,6 +263,11 @@ pub const Manifest = struct {
         self.reusable = .empty;
         self.consumed_keys = .empty;
         self.pending_free = .empty;
+        self.store_locks = .empty;
+        self.tree_lock = .{};
+        self.freelist_tree_lock = .{};
+        self.alloc_lock = .{};
+        self.store_locks_lock = .{};
 
         while (file.pageCount() < FIRST_DATA_PAGE) {
             _ = try file.growBy(1);
@@ -306,13 +336,17 @@ pub const Manifest = struct {
     /// calls accumulate in-memory state tagged with distinct seqs;
     /// orphan elision skips intermediate page versions at durabilize.
     pub fn nextApply(self: *Manifest) u64 {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
         self.tree.seq += 1;
         self.freelist.seq = self.tree.seq;
         return self.tree.seq;
     }
 
     /// Current apply seq (the seq mutations are currently tagging).
-    pub fn applySeq(self: *const Manifest) u64 {
+    pub fn applySeq(self: *Manifest) u64 {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
         return self.tree.seq;
     }
 
@@ -325,7 +359,25 @@ pub const Manifest = struct {
         self.reusable.deinit(self.allocator);
         self.consumed_keys.deinit(self.allocator);
         self.pending_free.deinit(self.allocator);
+        var it = self.store_locks.valueIterator();
+        while (it.next()) |m| self.allocator.destroy(m.*);
+        self.store_locks.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Obtain (or lazily create) the per-store write mutex for `id`.
+    /// Returned mutex is unlocked; caller must `.lock()` and
+    /// `.unlock()` around the per-store write critical section.
+    pub fn storeLock(self: *Manifest, id: u64) !*std.Thread.Mutex {
+        self.store_locks_lock.lock();
+        defer self.store_locks_lock.unlock();
+        const gop = try self.store_locks.getOrPut(self.allocator, id);
+        if (!gop.found_existing) {
+            const m = try self.allocator.create(std.Thread.Mutex);
+            m.* = .{};
+            gop.value_ptr.* = m;
+        }
+        return gop.value_ptr.*;
     }
 
     pub fn pendingSeq(self: *const Manifest) u64 {
@@ -333,6 +385,12 @@ pub const Manifest = struct {
     }
 
     pub fn hasStore(self: *Manifest, id: u64) !bool {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        return try self.hasStoreLocked(id);
+    }
+
+    fn hasStoreLocked(self: *Manifest, id: u64) !bool {
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         const v = try self.tree.get(self.allocator, k);
@@ -344,6 +402,12 @@ pub const Manifest = struct {
     }
 
     pub fn storeRoot(self: *Manifest, id: u64) !?u64 {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        return try self.storeRootLocked(id);
+    }
+
+    fn storeRootLocked(self: *Manifest, id: u64) !?u64 {
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         const v = try self.tree.get(self.allocator, k);
@@ -355,17 +419,27 @@ pub const Manifest = struct {
     }
 
     pub fn createStore(self: *Manifest, id: u64) !void {
-        if (try self.hasStore(id)) return error.StoreAlreadyExists;
-        try self.setStoreRoot(id, 0);
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        if (try self.hasStoreLocked(id)) return error.StoreAlreadyExists;
+        try self.setStoreRootLocked(id, 0);
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         return try self.tree.delete(k);
     }
 
     pub fn setStoreRoot(self: *Manifest, id: u64, root: u64) !void {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        try self.setStoreRootLocked(id, root);
+    }
+
+    fn setStoreRootLocked(self: *Manifest, id: u64, root: u64) !void {
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         var val_buf: [STORE_VAL_LEN]u8 = undefined;
@@ -374,6 +448,8 @@ pub const Manifest = struct {
     }
 
     pub fn listStores(self: *Manifest, allocator: std.mem.Allocator) ![]u64 {
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
         var list: std.ArrayListUnmanaged(u64) = .empty;
         errdefer list.deinit(allocator);
         var cursor = try self.tree.scanPrefix("");
@@ -399,19 +475,31 @@ pub const Manifest = struct {
     /// `tree.seq` (the latest apply seq) is durable in one of the two
     /// slots. Pages superseded by later applies (orphans) are NOT
     /// written to disk — only the latest reachable state hits storage.
+    ///
+    /// Phase 6: lock acquisition is laid out so that worker threads can
+    /// continue calling Store.put against the manifest tree during
+    /// most of durabilize. Specifically: the freelist mutations run
+    /// under `freelist_tree_lock`, leaving `tree_lock` free for worker
+    /// reads/writes against the manifest tree. The slot write is
+    /// likewise free of `tree_lock`. `alloc_lock` is taken in short
+    /// bursts only.
     pub fn durabilize(self: *Manifest) !void {
+        // Capture K under tree_lock so a concurrent nextApply doesn't
+        // race the read.
+        self.tree_lock.lock();
         const K = self.tree.seq;
-        if (K <= self.active_seq) return; // nothing new
+        self.tree_lock.unlock();
+        if (K <= self.active_seq) return;
 
-        // 1. Snapshot pending_free + consumed_keys.
+        // 1. Snapshot pending_free + consumed_keys (brief).
+        self.alloc_lock.lock();
         const pf = try self.pending_free.toOwnedSlice(self.allocator);
-        defer self.allocator.free(pf);
         const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
+        self.alloc_lock.unlock();
+        defer self.allocator.free(pf);
         defer self.allocator.free(ck);
 
-        // 2. Build initial orphan set from pf. Pages superseded by a
-        //    later apply within this durabilize window don't need to
-        //    hit disk — no manifest at seq >= K references them.
+        // 2. Build initial orphan set from pf.
         var orphans: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer orphans.deinit(self.allocator);
         for (pf) |fp| {
@@ -421,54 +509,71 @@ pub const Manifest = struct {
         }
 
         // 3. Fold pf into the durable freelist + delete consumed_keys.
-        //    These mutations produce more pending_free entries — the
-        //    intermediate freelist-tree pages that got CoW'd within
-        //    the fold/delete loops. Those are unreferenced too: they
-        //    were created during this durabilize and immediately
-        //    superseded by the next freelist CoW. Their content is
-        //    junk and never needs to hit disk.
+        //    freelist_tree_lock guards the freelist tree from concurrent
+        //    refillReusable scans. The freelist tree.put/delete calls
+        //    internally take alloc_lock (via allocImpl/freeImpl).
+        self.freelist_tree_lock.lock();
         try self.foldPendingFree(pf);
         for (ck) |key| _ = try self.freelist.delete(&key);
+        self.freelist_tree_lock.unlock();
+
+        // 4. Extend orphan set with pages freed during fold/delete.
+        self.alloc_lock.lock();
         for (self.pending_free.items) |fp| {
             if (fp.freed_at_seq <= K) {
                 try orphans.put(self.allocator, fp.page_no, {});
             }
         }
+        self.alloc_lock.unlock();
 
-        // 4. Flush dirty pages tagged seq <= K, skipping orphans
-        //    (both the pre-fold and the fold-generated ones).
+        // 5. Flush dirty pages tagged seq <= K, skipping orphans.
         try self.cache.flushUpToSkipping(K, &orphans);
         try self.file.fsync();
 
-        // 5. Write the inactive slot.
+        // 6. Write the inactive slot.
         const next_slot: u32 = 1 - self.active_slot;
         const slot_page: u64 = if (next_slot == 0) SLOT_A_PAGE else SLOT_B_PAGE;
         var slot_buf: [page.PAGE_SIZE]u8 align(4096) = undefined;
         @memset(&slot_buf, 0);
         const slot: *ManifestSlot = @ptrCast(@alignCast(&slot_buf));
+        // Reading tree.root and freelist.root under their respective
+        // locks guards against an in-flight worker mutation. Workers
+        // may proceed; we capture a consistent snapshot.
+        self.tree_lock.lock();
+        const manifest_root = self.tree.root;
+        self.tree_lock.unlock();
+        self.freelist_tree_lock.lock();
+        const freelist_root = self.freelist.root;
+        self.freelist_tree_lock.unlock();
         slot.* = .{
             .magic = ManifestSlot.MAGIC,
             .slot_id = @intCast(next_slot),
             .sequence = K,
-            .manifest_root = self.tree.root,
-            .freelist_root = self.freelist.root,
+            .manifest_root = manifest_root,
+            .freelist_root = freelist_root,
         };
         slot.computeChecksum();
         try self.file.writePage(slot_page, &slot_buf);
         try self.file.fsync();
 
-        // 6. Promote the new slot. Old active becomes new inactive.
+        // 7. Promote the new slot. Old active becomes new inactive.
         self.inactive_seq = self.active_seq;
         self.inactive_valid = self.active_seq > 0;
         self.active_slot = next_slot;
         self.active_seq = K;
         self.sequence = K;
 
-        // 7. Bump tree.seq for the next apply.
+        // 8. Bump tree.seq for the next apply. Workers' subsequent
+        //    storeRoot reads use the new seq for their dirty-page
+        //    tagging.
+        self.tree_lock.lock();
         self.tree.seq = K + 1;
+        self.tree_lock.unlock();
+        self.freelist_tree_lock.lock();
         self.freelist.seq = K + 1;
+        self.freelist_tree_lock.unlock();
 
-        // 8. Refill reusable from the durable freelist.
+        // 9. Refill reusable from the durable freelist.
         try self.refillReusable();
     }
 
@@ -490,6 +595,14 @@ pub const Manifest = struct {
     /// generalizes phase-4's "max_eligible = sequence - 1."
     fn refillReusable(self: *Manifest) !void {
         if (self.active_seq < 1) return;
+
+        // freelist_tree_lock serializes against any other freelist tree
+        // mutation (only durabilize mutates it, but defensive). The
+        // alloc_lock guards the reusable + consumed_keys lists.
+        self.freelist_tree_lock.lock();
+        defer self.freelist_tree_lock.unlock();
+        self.alloc_lock.lock();
+        defer self.alloc_lock.unlock();
 
         if (self.reusable.items.len >= REUSABLE_BATCH) return;
         var cursor = try self.freelist.scanPrefix("");
@@ -562,10 +675,14 @@ pub const Store = struct {
     tree: Tree,
 
     pub fn open(manifest: *Manifest, id: u64) !Store {
-        const root = (try manifest.storeRoot(id)) orelse return error.StoreNotFound;
+        manifest.tree_lock.lock();
+        const root_opt = try manifest.storeRootLocked(id);
+        const seq = manifest.tree.seq;
+        manifest.tree_lock.unlock();
+        const root = root_opt orelse return error.StoreNotFound;
         var tree = try Tree.init(manifest.allocator, manifest.cache, manifest.file, manifest.pageAllocator());
         tree.root = root;
-        tree.seq = manifest.tree.seq;
+        tree.seq = seq;
         return .{ .manifest = manifest, .id = id, .tree = tree };
     }
 
@@ -574,30 +691,67 @@ pub const Store = struct {
     }
 
     pub fn get(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        const root = (try self.manifest.storeRoot(self.id)) orelse return error.StoreNotFound;
+        self.manifest.tree_lock.lock();
+        const root_opt = try self.manifest.storeRootLocked(self.id);
+        self.manifest.tree_lock.unlock();
+        const root = root_opt orelse return error.StoreNotFound;
         self.tree.root = root;
+        // tree.get runs without any manifest lock; it uses cache_lock
+        // internally for pin/release. A concurrent setStoreRoot may
+        // change the durable root while we read, but our local
+        // self.tree.root snapshot stays valid for this get.
         return try self.tree.get(allocator, key);
     }
 
     pub fn put(self: *Store, key: []const u8, value: []const u8) !void {
-        const root = (try self.manifest.storeRoot(self.id)) orelse return error.StoreNotFound;
+        // Per-store write lock: serializes writers on the same store
+        // without blocking writers on different stores.
+        const sl = try self.manifest.storeLock(self.id);
+        sl.lock();
+        defer sl.unlock();
+
+        // Phase 1: read storeRoot + capture current apply seq.
+        self.manifest.tree_lock.lock();
+        const root_opt = try self.manifest.storeRootLocked(self.id);
+        const seq = self.manifest.tree.seq;
+        self.manifest.tree_lock.unlock();
+        const root = root_opt orelse return error.StoreNotFound;
+
+        // Phase 2: store-tree CoW without manifest locks. allocImpl /
+        // freeImpl take alloc_lock briefly; cache takes cache_lock
+        // briefly. Writers on different stores can run this part
+        // concurrently.
         self.tree.root = root;
-        self.tree.seq = self.manifest.tree.seq;
+        self.tree.seq = seq;
         try self.tree.put(key, value);
+
+        // Phase 3: publish the new store root via the manifest tree.
         try self.manifest.setStoreRoot(self.id, self.tree.root);
     }
 
     pub fn delete(self: *Store, key: []const u8) !bool {
-        const root = (try self.manifest.storeRoot(self.id)) orelse return error.StoreNotFound;
+        const sl = try self.manifest.storeLock(self.id);
+        sl.lock();
+        defer sl.unlock();
+
+        self.manifest.tree_lock.lock();
+        const root_opt = try self.manifest.storeRootLocked(self.id);
+        const seq = self.manifest.tree.seq;
+        self.manifest.tree_lock.unlock();
+        const root = root_opt orelse return error.StoreNotFound;
+
         self.tree.root = root;
-        self.tree.seq = self.manifest.tree.seq;
+        self.tree.seq = seq;
         const existed = try self.tree.delete(key);
         if (existed) try self.manifest.setStoreRoot(self.id, self.tree.root);
         return existed;
     }
 
     pub fn scanPrefix(self: *Store, prefix: []const u8) !btree.PrefixCursor {
-        const root = (try self.manifest.storeRoot(self.id)) orelse return error.StoreNotFound;
+        self.manifest.tree_lock.lock();
+        const root_opt = try self.manifest.storeRootLocked(self.id);
+        self.manifest.tree_lock.unlock();
+        const root = root_opt orelse return error.StoreNotFound;
         self.tree.root = root;
         return try self.tree.scanPrefix(prefix);
     }
@@ -1081,6 +1235,127 @@ test "Phase 5: group commit reuse rule skips inactive_seq + 1" {
     // new dangerous seq is inactive_seq + 1 = 3, but most freelist
     // entries are tagged 2).
     try testing.expect(h.manifest.reusable.items.len > reusable_after_d2);
+}
+
+test "Phase 6: N concurrent writers, distinct stores, all data persists" {
+    var h = try Harness.init(512);
+    defer h.deinit();
+
+    const NUM_THREADS: u32 = 4;
+    const KEYS_PER_THREAD: u32 = 200;
+
+    // Create one store per thread up front.
+    var id: u32 = 0;
+    while (id < NUM_THREADS) : (id += 1) {
+        try h.manifest.createStore(id);
+    }
+    try h.manifest.durabilize();
+
+    const Worker = struct {
+        manifest: *Manifest,
+        id: u32,
+        n_keys: u32,
+
+        fn run(self: @This()) !void {
+            var s = try Store.open(self.manifest, self.id);
+            defer s.deinit();
+            var i: u32 = 0;
+            while (i < self.n_keys) : (i += 1) {
+                var key_buf: [16]u8 = undefined;
+                const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+                var val_buf: [24]u8 = undefined;
+                const v = try std.fmt.bufPrint(&val_buf, "store{d}-{d}", .{ self.id, i });
+                try s.put(k, v);
+            }
+        }
+    };
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    var t: u32 = 0;
+    while (t < NUM_THREADS) : (t += 1) {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{Worker{
+            .manifest = h.manifest,
+            .id = t,
+            .n_keys = KEYS_PER_THREAD,
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    // After all writers join, durabilize from main thread.
+    try h.manifest.durabilize();
+
+    // Reopen and verify every key persisted with the right value.
+    try h.cycle();
+
+    id = 0;
+    while (id < NUM_THREADS) : (id += 1) {
+        var s = try Store.open(h.manifest, id);
+        defer s.deinit();
+        var i: u32 = 0;
+        while (i < KEYS_PER_THREAD) : (i += 1) {
+            var key_buf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+            var val_buf: [24]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&val_buf, "store{d}-{d}", .{ id, i });
+            const got = (try s.get(testing.allocator, k)) orelse {
+                std.debug.print("missing: store {d} key {s}\n", .{ id, k });
+                return error.MissingKey;
+            };
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(expected, got);
+        }
+    }
+}
+
+test "Phase 6: two writers racing on the SAME store serialize correctly" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize();
+
+    const N: u32 = 100;
+    const Worker = struct {
+        manifest: *Manifest,
+        tag: u8,
+        n: u32,
+
+        fn run(self: @This()) !void {
+            var s = try Store.open(self.manifest, 1);
+            defer s.deinit();
+            var i: u32 = 0;
+            while (i < self.n) : (i += 1) {
+                var key_buf: [16]u8 = undefined;
+                const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}_{c}", .{ i, self.tag });
+                var val_buf: [16]u8 = undefined;
+                const v = try std.fmt.bufPrint(&val_buf, "{c}{d}", .{ self.tag, i });
+                try s.put(k, v);
+            }
+        }
+    };
+
+    var t_a = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .manifest = h.manifest, .tag = 'A', .n = N }});
+    var t_b = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .manifest = h.manifest, .tag = 'B', .n = N }});
+    t_a.join();
+    t_b.join();
+
+    try h.manifest.durabilize();
+    try h.cycle();
+
+    // All 2N keys (N each from A and B) must be readable.
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        for ([_]u8{ 'A', 'B' }) |tag| {
+            var key_buf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}_{c}", .{ i, tag });
+            var val_buf: [16]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&val_buf, "{c}{d}", .{ tag, i });
+            const got = (try s.get(testing.allocator, k)).?;
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(expected, got);
+        }
+    }
 }
 
 test "Freelist: churn workload approaches net-zero growth" {

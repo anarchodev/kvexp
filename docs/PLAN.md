@@ -129,8 +129,17 @@ Apply produces in-memory manifest version + tagged dirty pages, zero I/O. `durab
 
 The two-slot reuse rule generalizes to "skip freelist entries with `freed_at_seq == inactive_seq + 1`" (only the older durable manifest's referenced pages are unsafe; large group commits expose many safe entries at once).
 
-### Phase 6 — Per-store concurrent writers
-Per-store write lock, concurrent free-page allocator, serialized manifest assembly. Demo: N workers writing different stores, scale near-linear up to the manifest-assembly serial point.
+### Phase 6 — Per-store concurrent writers ✅
+Per-store write lock, concurrent free-page allocator, serialized manifest tree access. Demo: 4 threads × 200 keys on 4 distinct stores all persist correctly across reopen; 2 threads racing the SAME store serialize cleanly via the per-store mutex.
+
+Lock layout:
+- `Manifest.store_locks` — `AutoHashMap(u64, *Mutex)`, allocated lazily per store_id on first `Store.put`. Caller-managed in spirit but exposed for testing.
+- `Manifest.tree_lock` — short critical sections around manifest tree reads/writes (`storeRoot`, `setStoreRoot`, `nextApply`, capturing snapshot in `durabilize`).
+- `Manifest.freelist_tree_lock` — only held during durabilize's fold + delete and during `refillReusable`.
+- `Manifest.alloc_lock` — short critical sections around `reusable` / `pending_free` / `consumed_keys` / `file.growBy`. Acquired inside `allocImpl`/`freeImpl` so worker threads' store-tree CoW operations contend only briefly.
+- `PageCache.lock` — one cache-wide mutex; short critical sections around `pin`/`pinNew`/`release`/`markDirty`/`flushUpToSkipping`.
+
+Per-store CoW happens with **no manifest lock held** — workers contend only briefly on alloc_lock and cache_lock. The phase-1 cache lock is the coarsest serialization point and a future optimization target.
 
 ### Phase 7 — Read snapshots
 Read transactions pin a manifest version and walk from it. Free-list reclamation respects min-live-reader. Demo: long-running prefix scan during heavy writes, verify point-in-time consistency.
