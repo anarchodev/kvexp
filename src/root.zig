@@ -58,7 +58,7 @@ test "e2e: header + data pages survive close/reopen" {
         defer file.close();
         var pool = try BufferPool.init(allocator, PAGE_SIZE_DEFAULT, 8);
         defer pool.deinit(allocator);
-        var cache = try PageCache.init(allocator, &file, &pool);
+        var cache = try PageCache.init(allocator, &file, &pool, .{});
         defer cache.deinit();
 
         _ = try file.growBy(4); // page 0 + 3 data pages
@@ -89,7 +89,7 @@ test "e2e: header + data pages survive close/reopen" {
         defer file.close();
         var pool = try BufferPool.init(allocator, PAGE_SIZE_DEFAULT, 8);
         defer pool.deinit(allocator);
-        var cache = try PageCache.init(allocator, &file, &pool);
+        var cache = try PageCache.init(allocator, &file, &pool, .{});
         defer cache.deinit();
 
         try testing.expectEqual(@as(u64, 4), file.pageCount());

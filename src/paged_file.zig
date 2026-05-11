@@ -23,6 +23,12 @@ pub const PagedFile = struct {
     /// Total pages written by writePage/writePages. Exposed for tests
     /// (orphan-elision benchmark counts pwrites under group commit).
     pages_written: u64 = 0,
+    /// io_uring is not safe for concurrent SQ/CQ access from multiple
+    /// threads on the same ring. Phase 6 introduces multi-threaded
+    /// callers (worker threads doing concurrent evictions); we
+    /// serialize all I/O on this single ring through this mutex.
+    /// Future optimization: per-thread rings.
+    io_lock: std.Thread.Mutex = .{},
 
     pub const OpenOptions = struct {
         create: bool = false,
@@ -96,6 +102,8 @@ pub const PagedFile = struct {
     pub fn readPage(self: *PagedFile, page_no: u64, buf: []u8) IoError!void {
         try self.checkBuf(page_no, buf);
         const offset = page_no * self.page_size;
+        self.io_lock.lock();
+        defer self.io_lock.unlock();
         _ = self.ring.read(0, self.fd, .{ .buffer = buf[0..self.page_size] }, offset) catch
             return error.SubmitFailed;
         _ = self.ring.submit_and_wait(1) catch return error.SubmitFailed;
@@ -107,6 +115,8 @@ pub const PagedFile = struct {
     pub fn writePage(self: *PagedFile, page_no: u64, buf: []const u8) IoError!void {
         try self.checkBufConst(page_no, buf);
         const offset = page_no * self.page_size;
+        self.io_lock.lock();
+        defer self.io_lock.unlock();
         _ = self.ring.write(0, self.fd, buf[0..self.page_size], offset) catch
             return error.SubmitFailed;
         _ = self.ring.submit_and_wait(1) catch return error.SubmitFailed;
@@ -123,6 +133,8 @@ pub const PagedFile = struct {
     /// the seam group commit will exploit in phase 5.
     pub fn writePages(self: *PagedFile, writes: []const PageWrite) IoError!void {
         if (writes.len == 0) return;
+        self.io_lock.lock();
+        defer self.io_lock.unlock();
         // Leave headroom so concurrent fsync/other SQEs (later phases)
         // never collide with our writes.
         const chunk: usize = @max(@as(usize, self.ring_entries) / 2, 1);
@@ -153,6 +165,8 @@ pub const PagedFile = struct {
     }
 
     pub fn fsync(self: *PagedFile) IoError!void {
+        self.io_lock.lock();
+        defer self.io_lock.unlock();
         _ = self.ring.fsync(0, self.fd, 0) catch return error.SubmitFailed;
         _ = self.ring.submit_and_wait(1) catch return error.SubmitFailed;
         const cqe = self.ring.copy_cqe() catch return error.SubmitFailed;

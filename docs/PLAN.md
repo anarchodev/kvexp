@@ -137,9 +137,11 @@ Lock layout:
 - `Manifest.tree_lock` — short critical sections around manifest tree reads/writes (`storeRoot`, `setStoreRoot`, `nextApply`, capturing snapshot in `durabilize`).
 - `Manifest.freelist_tree_lock` — only held during durabilize's fold + delete and during `refillReusable`.
 - `Manifest.alloc_lock` — short critical sections around `reusable` / `pending_free` / `consumed_keys` / `file.growBy`. Acquired inside `allocImpl`/`freeImpl` so worker threads' store-tree CoW operations contend only briefly.
-- `PageCache.lock` — one cache-wide mutex; short critical sections around `pin`/`pinNew`/`release`/`markDirty`/`flushUpToSkipping`.
+- `PageCache` — **sharded**, one mutex per shard. `page_no % shard_count` picks the shard; auto-shard count = `clamp(pool.capacity / 4, 1, 16)`. Workers on disjoint page_nos contend on different mutexes.
+- `PageCache.evictForReuse` releases its shard lock during the writeback `pwrite`. A new `.evicting` slot state pins the buffer for the calling thread; other threads on the same shard can proceed. The long sync I/O happens **off the lock**.
+- `PagedFile.io_lock` — the io_uring instance isn't safe for concurrent SQ/CQ access from multiple threads, so we serialize all read/write/fsync through this mutex. A future optimization would be per-thread rings.
 
-Per-store CoW happens with **no manifest lock held** — workers contend only briefly on alloc_lock and cache_lock. The phase-1 cache lock is the coarsest serialization point and a future optimization target.
+Per-store CoW happens with **no manifest lock held** — workers contend only briefly on alloc_lock and per-shard cache locks.
 
 ### Phase 7 — Read snapshots
 Read transactions pin a manifest version and walk from it. Free-list reclamation respects min-live-reader. Demo: long-running prefix scan during heavy writes, verify point-in-time consistency.

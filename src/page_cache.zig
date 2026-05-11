@@ -7,12 +7,29 @@
 //! never writes back on its own — `O_DIRECT` plus our explicit pwrite
 //! is the only path to disk.
 //!
-//! Phase 6: a single cache-wide mutex guards the index, slot states,
-//! and the clock hand. Critical sections are short (each pin/release/
-//! markDirty is a handful of struct-field accesses). Eviction runs
-//! under the lock — that can write back a dirty page synchronously,
-//! which is a longer section we accept for now (phase 11+ may move
-//! eviction off the hot path or shard the cache).
+//! ## Sharding
+//!
+//! The cache is split into N shards, each with its own mutex, hash
+//! index, slot array, free-buffer list, and clock hand. A page_no
+//! always lives in the same shard (`page_no % shard_count`). Workers
+//! on disjoint page_nos contend on different mutexes — the cache no
+//! longer has a global lock.
+//!
+//! Buffer ownership is fixed at init: each shard claims a contiguous
+//! range of buffer indices from the global pool. Buffers never migrate
+//! between shards.
+//!
+//! ## Lock-free eviction writeback
+//!
+//! When a worker needs a free buffer and the cache is full, the clock
+//! walk finds a victim. If the victim is dirty, the slot transitions
+//! to `.evicting`, the index entry is dropped, `dirty_seq` is cleared,
+//! and the shard lock is **released**. `writePage` then runs without
+//! holding the lock — other threads on the same shard can proceed.
+//! The buffer's content stays valid during the write (no one can
+//! reuse a slot that's `.evicting`). When the write completes, the
+//! shard lock is re-acquired briefly to transition `.evicting → .empty`
+//! and return the buffer to the caller.
 
 const std = @import("std");
 const PagedFile = @import("paged_file.zig").PagedFile;
@@ -29,116 +46,263 @@ pub const PageRef = struct {
         return self.cache.pool.buf(self.buffer_idx);
     }
 
-    /// Mark the page dirty at the given producing sequence. If the page
-    /// was already dirty at an earlier seq, the tag is bumped to `seq`
-    /// (a CoW B-tree shouldn't dirty the same page_no twice, but the
-    /// max-merge is the safe semantics).
     pub fn markDirty(self: PageRef, seq: u64) void {
-        self.cache.lock.lock();
-        defer self.cache.lock.unlock();
-        const slot = &self.cache.slots[self.buffer_idx];
+        const shard = self.cache.shardFor(self.page_no);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        const slot = shard.slotForBuffer(self.buffer_idx);
         slot.dirty_seq = if (slot.dirty_seq) |existing| @max(existing, seq) else seq;
     }
 
     pub fn release(self: PageRef) void {
-        self.cache.lock.lock();
-        defer self.cache.lock.unlock();
-        const slot = &self.cache.slots[self.buffer_idx];
+        const shard = self.cache.shardFor(self.page_no);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        const slot = shard.slotForBuffer(self.buffer_idx);
         std.debug.assert(slot.pin_count > 0);
         slot.pin_count -= 1;
     }
 };
 
+const SlotState = enum {
+    /// No page cached here; buffer is in `free_globals`.
+    empty,
+    /// Page is cached. Buffer content valid.
+    occupied,
+    /// Dirty page is being written back; buffer content valid but
+    /// the slot is reserved for the evicting thread. Pin/eviction
+    /// skip this state.
+    evicting,
+};
+
 const Slot = struct {
-    state: enum { empty, occupied },
+    state: SlotState,
     page_no: u64,
     pin_count: u32,
     dirty_seq: ?u64,
     clock_referenced: bool,
 };
 
+const Shard = struct {
+    lock: std.Thread.Mutex,
+    slots: []Slot,
+    capacity: u32,
+    global_offset: BufferIndex,
+    /// Pre-populated at init with this shard's global buffer indices.
+    /// LIFO.
+    free_globals: std.ArrayListUnmanaged(BufferIndex),
+    index: std.AutoHashMapUnmanaged(u64, BufferIndex),
+    clock_hand: u32,
+
+    fn slotForBuffer(self: *Shard, global_idx: BufferIndex) *Slot {
+        std.debug.assert(global_idx >= self.global_offset);
+        std.debug.assert(global_idx < self.global_offset + self.capacity);
+        return &self.slots[global_idx - self.global_offset];
+    }
+};
+
 pub const PageCache = struct {
     allocator: std.mem.Allocator,
     file: *PagedFile,
     pool: *BufferPool,
-    /// page_no → buffer_idx (which is also the index into `slots`).
-    index: std.AutoHashMapUnmanaged(u64, BufferIndex),
-    slots: []Slot,
-    clock_hand: u32,
-    /// Single cache-wide mutex. Held during pin/pinNew/release/
-    /// markDirty/flushUpToSkipping. Recursive lock acquisition is NOT
-    /// supported — callers must not hold the lock when calling another
-    /// locked cache method.
-    lock: std.Thread.Mutex = .{},
+    shards: []Shard,
 
-    pub fn init(allocator: std.mem.Allocator, file: *PagedFile, pool: *BufferPool) !PageCache {
-        const slots = try allocator.alloc(Slot, pool.capacity);
-        for (slots) |*s| s.* = .{
-            .state = .empty,
-            .page_no = 0,
-            .pin_count = 0,
-            .dirty_seq = null,
-            .clock_referenced = false,
-        };
+    pub const Options = struct {
+        /// Number of shards. 0 = auto: `clamp(pool.capacity / 4, 1, 16)`.
+        /// Each shard owns at least 1 buffer.
+        shard_count: u32 = 0,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        file: *PagedFile,
+        pool: *BufferPool,
+        options: Options,
+    ) !PageCache {
+        const requested = if (options.shard_count == 0)
+            std.math.clamp(pool.capacity / 4, 1, 16)
+        else
+            options.shard_count;
+        const sc: u32 = @min(requested, pool.capacity);
+
+        const shards = try allocator.alloc(Shard, sc);
+        errdefer allocator.free(shards);
+
+        const per_shard = pool.capacity / sc;
+        var built: u32 = 0;
+        errdefer for (shards[0..built]) |*sh| destroyShard(allocator, sh);
+
+        var i: u32 = 0;
+        while (i < sc) : (i += 1) {
+            const start: BufferIndex = @intCast(i * per_shard);
+            const cap: u32 = if (i == sc - 1) pool.capacity - start else per_shard;
+            const slots = try allocator.alloc(Slot, cap);
+            errdefer allocator.free(slots);
+            for (slots) |*s| s.* = .{
+                .state = .empty,
+                .page_no = 0,
+                .pin_count = 0,
+                .dirty_seq = null,
+                .clock_referenced = false,
+            };
+            var free_list: std.ArrayListUnmanaged(BufferIndex) = .empty;
+            errdefer free_list.deinit(allocator);
+            try free_list.ensureTotalCapacity(allocator, cap);
+            var b: BufferIndex = start + cap;
+            while (b > start) {
+                b -= 1;
+                free_list.appendAssumeCapacity(b);
+            }
+            shards[i] = .{
+                .lock = .{},
+                .slots = slots,
+                .capacity = cap,
+                .global_offset = start,
+                .free_globals = free_list,
+                .index = .empty,
+                .clock_hand = 0,
+            };
+            built += 1;
+        }
+
         return .{
             .allocator = allocator,
             .file = file,
             .pool = pool,
-            .index = .empty,
-            .slots = slots,
-            .clock_hand = 0,
+            .shards = shards,
         };
     }
 
+    fn destroyShard(allocator: std.mem.Allocator, shard: *Shard) void {
+        shard.index.deinit(allocator);
+        shard.free_globals.deinit(allocator);
+        allocator.free(shard.slots);
+    }
+
     pub fn deinit(self: *PageCache) void {
-        self.index.deinit(self.allocator);
-        self.allocator.free(self.slots);
+        for (self.shards) |*sh| destroyShard(self.allocator, sh);
+        self.allocator.free(self.shards);
         self.* = undefined;
+    }
+
+    pub fn shardCount(self: *const PageCache) u32 {
+        return @intCast(self.shards.len);
+    }
+
+    fn shardFor(self: *PageCache, page_no: u64) *Shard {
+        return &self.shards[page_no % self.shards.len];
     }
 
     pub const PinError = error{ AllPagesPinned, OutOfMemory } || PagedFile.IoError;
 
-    /// Pin a page in cache. On miss, reads from disk first. Caller must
-    /// `.release()` the returned ref when done.
+    /// Pin a page in cache. On miss, reads from disk first. Caller
+    /// must `.release()` the returned ref when done.
     pub fn pin(self: *PageCache, page_no: u64) PinError!PageRef {
-        self.lock.lock();
-        defer self.lock.unlock();
-        if (self.index.get(page_no)) |buffer_idx| {
-            const slot = &self.slots[buffer_idx];
+        const shard = self.shardFor(page_no);
+
+        // Fast path: hit.
+        {
+            shard.lock.lock();
+            if (shard.index.get(page_no)) |buffer_idx| {
+                const slot = shard.slotForBuffer(buffer_idx);
+                slot.pin_count += 1;
+                slot.clock_referenced = true;
+                shard.lock.unlock();
+                return .{ .cache = self, .page_no = page_no, .buffer_idx = buffer_idx };
+            }
+            shard.lock.unlock();
+        }
+
+        // Miss path: assign a buffer (may evict, releasing lock during
+        // dirty writeback), read content, install.
+        const buffer_idx = try self.assignBuffer(shard);
+        try self.file.readPage(page_no, self.pool.buf(buffer_idx));
+
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        // Concurrent thread might have pinned the same page in the
+        // window between our miss check and now. If so, return their
+        // buffer; ours is wasted I/O but the index stays coherent.
+        if (shard.index.get(page_no)) |existing_idx| {
+            shard.free_globals.append(self.allocator, buffer_idx) catch
+                @panic("free_globals append failed (no capacity? — bug)");
+            const slot = shard.slotForBuffer(existing_idx);
             slot.pin_count += 1;
             slot.clock_referenced = true;
-            return .{ .cache = self, .page_no = page_no, .buffer_idx = buffer_idx };
+            return .{ .cache = self, .page_no = page_no, .buffer_idx = existing_idx };
         }
-        const buffer_idx = try self.assignBuffer();
-        try self.file.readPage(page_no, self.pool.buf(buffer_idx));
-        self.installSlot(buffer_idx, page_no);
-        try self.index.put(self.allocator, page_no, buffer_idx);
+        const slot = shard.slotForBuffer(buffer_idx);
+        slot.* = .{
+            .state = .occupied,
+            .page_no = page_no,
+            .pin_count = 1,
+            .dirty_seq = null,
+            .clock_referenced = true,
+        };
+        try shard.index.put(self.allocator, page_no, buffer_idx);
         return .{ .cache = self, .page_no = page_no, .buffer_idx = buffer_idx };
     }
 
     /// Pin a newly-allocated page. Buffer is zero-initialized; caller
     /// is expected to write content and `markDirty()` before release.
     ///
-    /// If `page_no` is already in cache (from a previous life — the
-    /// page was freed and the allocator just handed it back for reuse),
-    /// the stale entry is dropped *without* write-back. The freelist
-    /// invariant guarantees that no durable manifest references the
-    /// page's old content, so skipping the write is safe and avoids
-    /// wasting I/O on data that no one will ever read.
+    /// If `page_no` is already in cache (stale entry from a previous
+    /// life — the page was freed and the allocator just handed it back
+    /// for reuse), the stale entry is dropped *without* write-back.
     pub fn pinNew(self: *PageCache, page_no: u64) PinError!PageRef {
-        self.lock.lock();
-        defer self.lock.unlock();
-        if (self.index.get(page_no)) |existing_idx| {
-            const slot = &self.slots[existing_idx];
-            std.debug.assert(slot.pin_count == 0);
-            @memset(self.pool.buf(existing_idx), 0);
-            self.installSlot(existing_idx, page_no);
-            return .{ .cache = self, .page_no = page_no, .buffer_idx = existing_idx };
+        const shard = self.shardFor(page_no);
+
+        // First, try the no-eviction fast path under lock.
+        {
+            shard.lock.lock();
+            if (shard.index.get(page_no)) |existing_idx| {
+                const slot = shard.slotForBuffer(existing_idx);
+                std.debug.assert(slot.pin_count == 0);
+                std.debug.assert(slot.state == .occupied);
+                @memset(self.pool.buf(existing_idx), 0);
+                slot.* = .{
+                    .state = .occupied,
+                    .page_no = page_no,
+                    .pin_count = 1,
+                    .dirty_seq = null,
+                    .clock_referenced = true,
+                };
+                shard.lock.unlock();
+                return .{ .cache = self, .page_no = page_no, .buffer_idx = existing_idx };
+            }
+            if (shard.free_globals.pop()) |idx| {
+                @memset(self.pool.buf(idx), 0);
+                const slot = shard.slotForBuffer(idx);
+                slot.* = .{
+                    .state = .occupied,
+                    .page_no = page_no,
+                    .pin_count = 1,
+                    .dirty_seq = null,
+                    .clock_referenced = true,
+                };
+                try shard.index.put(self.allocator, page_no, idx);
+                shard.lock.unlock();
+                return .{ .cache = self, .page_no = page_no, .buffer_idx = idx };
+            }
+            shard.lock.unlock();
         }
-        const buffer_idx = try self.assignBuffer();
+
+        // Slow path: eviction may need to release the lock for a
+        // sync writePage.
+        const buffer_idx = try self.evictForReuse(shard);
+
+        shard.lock.lock();
+        defer shard.lock.unlock();
         @memset(self.pool.buf(buffer_idx), 0);
-        self.installSlot(buffer_idx, page_no);
-        try self.index.put(self.allocator, page_no, buffer_idx);
+        const slot = shard.slotForBuffer(buffer_idx);
+        slot.* = .{
+            .state = .occupied,
+            .page_no = page_no,
+            .pin_count = 1,
+            .dirty_seq = null,
+            .clock_referenced = true,
+        };
+        try shard.index.put(self.allocator, page_no, buffer_idx);
         return .{ .cache = self, .page_no = page_no, .buffer_idx = buffer_idx };
     }
 
@@ -149,44 +313,56 @@ pub const PageCache = struct {
     }
 
     /// Like `flushUpTo`, but if a page's `page_no` is in `skip`, the
-    /// dirty tag is cleared *without* writing the page to disk. Used
-    /// by phase-5 group commit to elide orphaned pages — those that
-    /// were superseded by a later apply and are no longer reachable
-    /// from the manifest being durabilized.
+    /// dirty tag is cleared *without* writing the page to disk.
     pub fn flushUpToSkipping(
         self: *PageCache,
         seq: u64,
         skip: ?*const std.AutoHashMapUnmanaged(u64, void),
     ) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        for (self.shards) |*shard| {
+            try self.flushShard(shard, seq, skip);
+        }
+    }
+
+    fn flushShard(
+        self: *PageCache,
+        shard: *Shard,
+        seq: u64,
+        skip: ?*const std.AutoHashMapUnmanaged(u64, void),
+    ) !void {
+        shard.lock.lock();
+        defer shard.lock.unlock();
+
         var writes: std.ArrayListUnmanaged(PagedFile.PageWrite) = .empty;
         defer writes.deinit(self.allocator);
-        var clean_only: std.ArrayListUnmanaged(BufferIndex) = .empty;
-        defer clean_only.deinit(self.allocator);
         var to_clean: std.ArrayListUnmanaged(BufferIndex) = .empty;
         defer to_clean.deinit(self.allocator);
+        var clean_only: std.ArrayListUnmanaged(BufferIndex) = .empty;
+        defer clean_only.deinit(self.allocator);
 
-        for (self.slots, 0..) |*s, idx| {
+        var local: usize = 0;
+        while (local < shard.slots.len) : (local += 1) {
+            const s = &shard.slots[local];
             if (s.state != .occupied) continue;
             const ds = s.dirty_seq orelse continue;
             if (ds > seq) continue;
+            const global_idx: BufferIndex = @intCast(shard.global_offset + local);
             if (skip) |sk| {
                 if (sk.contains(s.page_no)) {
-                    try clean_only.append(self.allocator, @intCast(idx));
+                    try clean_only.append(self.allocator, global_idx);
                     continue;
                 }
             }
             try writes.append(self.allocator, .{
                 .page_no = s.page_no,
-                .buf = self.pool.buf(@intCast(idx)),
+                .buf = self.pool.buf(global_idx),
             });
-            try to_clean.append(self.allocator, @intCast(idx));
+            try to_clean.append(self.allocator, global_idx);
         }
 
         if (writes.items.len != 0) try self.file.writePages(writes.items);
-        for (to_clean.items) |idx| self.slots[idx].dirty_seq = null;
-        for (clean_only.items) |idx| self.slots[idx].dirty_seq = null;
+        for (to_clean.items) |g| shard.slotForBuffer(g).dirty_seq = null;
+        for (clean_only.items) |g| shard.slotForBuffer(g).dirty_seq = null;
     }
 
     pub const Stats = struct {
@@ -194,65 +370,86 @@ pub const PageCache = struct {
         occupied: u32,
         dirty: u32,
         pinned: u32,
+        shard_count: u32,
     };
 
     pub fn stats(self: *PageCache) Stats {
-        self.lock.lock();
-        defer self.lock.unlock();
-        var s: Stats = .{ .capacity = @intCast(self.slots.len), .occupied = 0, .dirty = 0, .pinned = 0 };
-        for (self.slots) |slot| {
-            if (slot.state != .occupied) continue;
-            s.occupied += 1;
-            if (slot.dirty_seq != null) s.dirty += 1;
-            if (slot.pin_count > 0) s.pinned += 1;
+        var s: Stats = .{ .capacity = 0, .occupied = 0, .dirty = 0, .pinned = 0, .shard_count = @intCast(self.shards.len) };
+        for (self.shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            s.capacity += shard.capacity;
+            for (shard.slots) |slot| {
+                if (slot.state != .occupied) continue;
+                s.occupied += 1;
+                if (slot.dirty_seq != null) s.dirty += 1;
+                if (slot.pin_count > 0) s.pinned += 1;
+            }
         }
         return s;
     }
 
-    fn installSlot(self: *PageCache, buffer_idx: BufferIndex, page_no: u64) void {
-        self.slots[buffer_idx] = .{
-            .state = .occupied,
-            .page_no = page_no,
-            .pin_count = 1,
-            .dirty_seq = null,
-            .clock_referenced = true,
-        };
+    fn assignBuffer(self: *PageCache, shard: *Shard) !BufferIndex {
+        {
+            shard.lock.lock();
+            if (shard.free_globals.pop()) |idx| {
+                shard.lock.unlock();
+                return idx;
+            }
+            shard.lock.unlock();
+        }
+        return try self.evictForReuse(shard);
     }
 
-    fn assignBuffer(self: *PageCache) !BufferIndex {
-        if (self.pool.acquire()) |idx| {
-            std.debug.assert(self.slots[idx].state == .empty);
-            return idx;
-        }
-        return try self.evictOne();
-    }
+    /// Find a victim and produce a free buffer index. If the victim is
+    /// dirty, the writeback runs **without holding the shard lock** —
+    /// the slot's `.evicting` state pins the buffer for our use and
+    /// blocks other threads from reassigning it during the write.
+    fn evictForReuse(self: *PageCache, shard: *Shard) !BufferIndex {
+        const WriteBack = struct { page_no: u64, buffer_idx: BufferIndex };
+        var pending_wb: ?WriteBack = null;
 
-    fn evictOne(self: *PageCache) !BufferIndex {
-        const n: u32 = @intCast(self.slots.len);
-        if (n == 0) return error.AllPagesPinned;
-        // At most two full sweeps: first clears reference bits, second
-        // finds an unreferenced victim. Anything more means everything
-        // is pinned.
-        var rounds: u32 = 0;
-        while (rounds < n * 2) : (rounds += 1) {
-            const i = self.clock_hand;
-            self.clock_hand = (self.clock_hand + 1) % n;
-            const slot = &self.slots[i];
-            if (slot.state != .occupied) continue;
-            if (slot.pin_count > 0) continue;
-            if (slot.clock_referenced) {
-                slot.clock_referenced = false;
-                continue;
+        {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            const n: u32 = @intCast(shard.slots.len);
+            if (n == 0) return error.AllPagesPinned;
+            // Two full sweeps: first clears reference bits, second
+            // finds an unreferenced victim.
+            var rounds: u32 = 0;
+            while (rounds < n * 2) : (rounds += 1) {
+                const i = shard.clock_hand;
+                shard.clock_hand = (shard.clock_hand + 1) % n;
+                const slot = &shard.slots[i];
+                if (slot.state != .occupied) continue;
+                if (slot.pin_count > 0) continue;
+                if (slot.clock_referenced) {
+                    slot.clock_referenced = false;
+                    continue;
+                }
+                const global_idx: BufferIndex = @intCast(shard.global_offset + i);
+                _ = shard.index.remove(slot.page_no);
+                if (slot.dirty_seq) |_| {
+                    pending_wb = .{ .page_no = slot.page_no, .buffer_idx = global_idx };
+                    slot.state = .evicting;
+                    slot.dirty_seq = null;
+                    break; // exit clock loop; write outside the lock
+                }
+                slot.state = .empty;
+                return global_idx;
             }
-            if (slot.dirty_seq) |_| {
-                try self.file.writePage(slot.page_no, self.pool.buf(@intCast(i)));
-                slot.dirty_seq = null;
-            }
-            _ = self.index.remove(slot.page_no);
-            slot.state = .empty;
-            return @intCast(i);
+            if (pending_wb == null) return error.AllPagesPinned;
         }
-        return error.AllPagesPinned;
+
+        const wb = pending_wb.?;
+        try self.file.writePage(wb.page_no, self.pool.buf(wb.buffer_idx));
+
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        const slot = shard.slotForBuffer(wb.buffer_idx);
+        std.debug.assert(slot.state == .evicting);
+        slot.state = .empty;
+        return wb.buffer_idx;
     }
 };
 
@@ -262,8 +459,6 @@ pub const PageCache = struct {
 
 const testing = std.testing;
 
-/// Wires a tmp file + buffer pool + page cache together for tests. The
-/// underlying file is pre-grown so tests can directly write to page_no.
 const Harness = struct {
     tmp: std.testing.TmpDir,
     file: *PagedFile,
@@ -271,6 +466,10 @@ const Harness = struct {
     cache: PageCache,
 
     fn init(pool_capacity: u32, file_pages: u64) !Harness {
+        return initWithShards(pool_capacity, file_pages, 0);
+    }
+
+    fn initWithShards(pool_capacity: u32, file_pages: u64, shard_count: u32) !Harness {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
 
@@ -290,7 +489,7 @@ const Harness = struct {
         pool_ptr.* = try BufferPool.init(testing.allocator, 4096, pool_capacity);
         errdefer pool_ptr.deinit(testing.allocator);
 
-        const cache = try PageCache.init(testing.allocator, file_ptr, pool_ptr);
+        const cache = try PageCache.init(testing.allocator, file_ptr, pool_ptr, .{ .shard_count = shard_count });
 
         return .{
             .tmp = tmp,
@@ -317,7 +516,6 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
     {
         const ref = try h.cache.pinNew(3);
         defer ref.release();
-        // Zeroed.
         for (ref.buf()) |b| try testing.expectEqual(@as(u8, 0), b);
         @memset(ref.buf(), 0x77);
         ref.markDirty(10);
@@ -326,7 +524,6 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
     try h.cache.flushUpTo(10);
     try h.file.fsync();
 
-    // Force eviction by pinning enough other pages, then re-pin 3.
     {
         const a = try h.cache.pinNew(4);
         a.markDirty(11);
@@ -343,8 +540,6 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
     }
     try h.cache.flushUpTo(11);
 
-    // Now page 3 should be evicted (capacity is 4, four other pages pinned
-    // through). Re-pin must hit the disk.
     const reread = try h.cache.pin(3);
     defer reread.release();
     for (reread.buf()) |b| try testing.expectEqual(@as(u8, 0x77), b);
@@ -360,33 +555,27 @@ test "PageCache: hit returns same buffer; release allows eviction" {
     const first_ptr = a1.buf().ptr;
     a1.release();
 
-    // Same page_no should hit; buffer pointer unchanged.
     const a2 = try h.cache.pin(0);
     defer a2.release();
     try testing.expectEqual(first_ptr, a2.buf().ptr);
 }
 
 test "PageCache: pinned page cannot be evicted" {
-    var h = try Harness.init(2, 8);
+    var h = try Harness.initWithShards(2, 8, 1);
     defer h.deinit();
 
     const a = try h.cache.pinNew(0);
     @memset(a.buf(), 0x11);
     a.markDirty(1);
-    // Keep `a` pinned.
-
     const b = try h.cache.pinNew(1);
     @memset(b.buf(), 0x22);
     b.markDirty(1);
-    // Keep `b` pinned too. Capacity is exhausted with both pinned.
 
-    // Asking for a third page must fail (all pinned).
     try testing.expectError(error.AllPagesPinned, h.cache.pin(2));
 
     a.release();
     b.release();
 
-    // Now eviction can proceed.
     const c = try h.cache.pinNew(2);
     defer c.release();
     @memset(c.buf(), 0x33);
@@ -394,7 +583,6 @@ test "PageCache: pinned page cannot be evicted" {
 
     try h.cache.flushUpTo(1);
 
-    // Verify a and b were written back during eviction.
     const a_check = try h.cache.pin(0);
     defer a_check.release();
     for (a_check.buf()) |byte| try testing.expectEqual(@as(u8, 0x11), byte);
@@ -416,7 +604,6 @@ test "PageCache: flushUpTo is selective by seq" {
         b.markDirty(10);
     }
 
-    // Flush only seq ≤ 5: page 0 should hit disk, page 1 should not.
     try h.cache.flushUpTo(5);
 
     var stats = h.cache.stats();
@@ -438,7 +625,6 @@ test "PageCache: markDirty bumps to higher seq" {
     ref.markDirty(3);
     ref.markDirty(7);
 
-    // flushUpTo(5) should NOT flush this (its dirty_seq is 7).
     try h.cache.flushUpTo(5);
     try testing.expectEqual(@as(u32, 1), h.cache.stats().dirty);
 
@@ -457,14 +643,51 @@ test "PageCache: dirty page is written back on eviction" {
         a.release();
     }
 
-    // Capacity is 1; pinning page 1 forces eviction of page 0 (dirty).
     {
         const b = try h.cache.pinNew(1);
         b.release();
     }
 
-    // Re-pin page 0; content must come back from disk (written during evict).
     const re = try h.cache.pin(0);
     defer re.release();
     for (re.buf()) |byte| try testing.expectEqual(@as(u8, 0xCC), byte);
+}
+
+test "PageCache: auto-shard count scales with pool capacity" {
+    var h64 = try Harness.init(64, 4);
+    defer h64.deinit();
+    try testing.expectEqual(@as(u32, 16), h64.cache.shardCount());
+
+    var h32 = try Harness.init(32, 4);
+    defer h32.deinit();
+    try testing.expectEqual(@as(u32, 8), h32.cache.shardCount());
+
+    var h4 = try Harness.init(4, 4);
+    defer h4.deinit();
+    try testing.expectEqual(@as(u32, 1), h4.cache.shardCount());
+}
+
+test "PageCache: page_no maps consistently to same shard" {
+    // Pages 0 and 16 must land in the same shard under mod-16; pages
+    // 0 and 1 must land in different shards.
+    var h = try Harness.initWithShards(32, 32, 16);
+    defer h.deinit();
+
+    const a = try h.cache.pinNew(0);
+    defer a.release();
+    const b = try h.cache.pinNew(16);
+    defer b.release();
+    const c = try h.cache.pinNew(1);
+    defer c.release();
+
+    // Hash maps page_no % 16, so 0 and 16 share shard 0; 1 lives in
+    // shard 1. The buffer indices reflect shard ownership.
+    const sh0 = &h.cache.shards[0];
+    const sh1 = &h.cache.shards[1];
+    try testing.expect(a.buffer_idx >= sh0.global_offset);
+    try testing.expect(a.buffer_idx < sh0.global_offset + sh0.capacity);
+    try testing.expect(b.buffer_idx >= sh0.global_offset);
+    try testing.expect(b.buffer_idx < sh0.global_offset + sh0.capacity);
+    try testing.expect(c.buffer_idx >= sh1.global_offset);
+    try testing.expect(c.buffer_idx < sh1.global_offset + sh1.capacity);
 }

@@ -821,7 +821,7 @@ const Harness = struct {
 
         self.cache = try testing.allocator.create(PageCache);
         errdefer testing.allocator.destroy(self.cache);
-        self.cache.* = try PageCache.init(testing.allocator, self.file, self.pool);
+        self.cache.* = try PageCache.init(testing.allocator, self.file, self.pool, .{});
 
         self.manifest = try testing.allocator.create(Manifest);
         errdefer testing.allocator.destroy(self.manifest);

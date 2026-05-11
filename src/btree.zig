@@ -785,7 +785,7 @@ const Harness = struct {
 
         const cache = try testing.allocator.create(PageCache);
         errdefer testing.allocator.destroy(cache);
-        cache.* = try PageCache.init(testing.allocator, file, pool);
+        cache.* = try PageCache.init(testing.allocator, file, pool, .{});
 
         const grow = try testing.allocator.create(GrowOnlyAllocator);
         errdefer testing.allocator.destroy(grow);
