@@ -666,7 +666,48 @@ pub const PrefixCursor = struct {
             .exhausted = false,
             .before_first = true,
         };
-        try cursor.seek();
+        try cursor.seekTo(prefix);
+        return cursor;
+    }
+
+    /// Like `open`, but skip directly past `after` on the initial
+    /// descent — yields the first key in [max(prefix, after++0x00),
+    /// prefix_upper_bound). Used for paging: pass the last key from
+    /// the previous page as `after` to start the next page in
+    /// O(log N) instead of O(skipped).
+    pub fn openAfter(
+        cache: *PageCache,
+        root: u64,
+        prefix: []const u8,
+        after: []const u8,
+    ) Error!PrefixCursor {
+        var cursor: PrefixCursor = .{
+            .cache = cache,
+            .root = root,
+            .prefix = prefix,
+            .leaf_pin = null,
+            .leaf_slot = 0,
+            .path = undefined,
+            .depth = 0,
+            .exhausted = false,
+            .before_first = true,
+        };
+
+        // Compute the actual descent target. `after` is exclusive —
+        // we want first key > after — and the cursor is also bounded
+        // below by prefix. So descend toward
+        // `max(prefix, after++0x00)`.
+        if (after.len == 0) {
+            try cursor.seekTo(prefix);
+        } else {
+            if (after.len + 1 > page.MAX_KEY_LEN) return error.KeyTooLong;
+            var after_succ_buf: [page.MAX_KEY_LEN + 1]u8 = undefined;
+            @memcpy(after_succ_buf[0..after.len], after);
+            after_succ_buf[after.len] = 0;
+            const after_succ = after_succ_buf[0 .. after.len + 1];
+            const target = if (std.mem.order(u8, after_succ, prefix) == .gt) after_succ else prefix;
+            try cursor.seekTo(target);
+        }
         return cursor;
     }
 
@@ -709,7 +750,10 @@ pub const PrefixCursor = struct {
         }
     }
 
-    fn seek(self: *PrefixCursor) Error!void {
+    /// Descend to the first key >= `target`, recording the descent
+    /// path for later `advanceToNextLeaf` calls. `target` must
+    /// outlive this function call (just used during descent).
+    fn seekTo(self: *PrefixCursor, target: []const u8) Error!void {
         if (self.root == 0) {
             self.exhausted = true;
             return;
@@ -720,14 +764,14 @@ pub const PrefixCursor = struct {
             switch (page.pageKind(ref.buf())) {
                 .leaf => {
                     const leaf = Leaf.view(ref.buf());
-                    const hit = leaf.search(self.prefix);
+                    const hit = leaf.search(target);
                     self.leaf_pin = ref;
                     self.leaf_slot = @intCast(hit.idx);
                     return;
                 },
                 .internal => {
                     const node = Internal.view(ref.buf());
-                    const slot = node.childSlotForKey(self.prefix);
+                    const slot = node.childSlotForKey(target);
                     const child: u64 = if (slot == node.nEntries()) node.rightmostChild() else node.childAt(slot);
                     if (self.depth >= MAX_DEPTH) {
                         ref.release();
@@ -1004,6 +1048,39 @@ test "Tree: prefix scan that crosses leaf boundaries" {
         seen += 1;
     }
     try testing.expectEqual(N, seen);
+}
+
+test "PrefixCursor: openAfter seeks past cursor in O(log N)" {
+    var h = try Harness.init(256);
+    defer h.deinit();
+
+    const N: u32 = 1000;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>8}", .{i});
+        try h.tree.put(key, "v");
+    }
+
+    // Seek past k00000500 → first emitted key should be k00000501.
+    var cursor = try @import("btree.zig").PrefixCursor.openAfter(h.cache, h.tree.root, "k", "k00000500");
+    defer cursor.deinit();
+    try testing.expect(try cursor.next());
+    try testing.expectEqualStrings("k00000501", cursor.key());
+    try testing.expect(try cursor.next());
+    try testing.expectEqualStrings("k00000502", cursor.key());
+}
+
+test "PrefixCursor: openAfter past the last matching key is exhausted" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.tree.put("apple", "1");
+    try h.tree.put("apricot", "2");
+    try h.tree.put("banana", "3");
+
+    var cursor = try @import("btree.zig").PrefixCursor.openAfter(h.cache, h.tree.root, "ap", "apricot");
+    defer cursor.deinit();
+    try testing.expect(!try cursor.next());
 }
 
 test "Tree: prefix scan with empty prefix iterates all keys" {
