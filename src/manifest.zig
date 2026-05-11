@@ -227,6 +227,14 @@ pub const Manifest = struct {
     store_locks: std.AutoHashMapUnmanaged(u64, *std.Thread.Mutex),
     store_locks_lock: std.Thread.Mutex = .{},
 
+    /// Live read snapshots: maps snap_seq → live count. A page tagged
+    /// `freed_at_seq=N` is potentially in a snapshot's view iff some
+    /// live snapshot has `snap_seq >= N`. refillReusable consults
+    /// `minLiveSnapSeq()` to keep such pages out of the reusable
+    /// queue.
+    snapshot_counts: std.AutoHashMapUnmanaged(u64, u32),
+    snapshots_lock: std.Thread.Mutex = .{},
+
     pub fn pageAllocator(self: *Manifest) PageAllocator {
         return .{ .ctx = self, .vtable = &alloc_vtable };
     }
@@ -264,10 +272,12 @@ pub const Manifest = struct {
         self.consumed_keys = .empty;
         self.pending_free = .empty;
         self.store_locks = .empty;
+        self.snapshot_counts = .empty;
         self.tree_lock = .{};
         self.freelist_tree_lock = .{};
         self.alloc_lock = .{};
         self.store_locks_lock = .{};
+        self.snapshots_lock = .{};
 
         while (file.pageCount() < FIRST_DATA_PAGE) {
             _ = try file.growBy(1);
@@ -362,7 +372,58 @@ pub const Manifest = struct {
         var it = self.store_locks.valueIterator();
         while (it.next()) |m| self.allocator.destroy(m.*);
         self.store_locks.deinit(self.allocator);
+        self.snapshot_counts.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    fn registerSnapshot(self: *Manifest, seq: u64) !void {
+        self.snapshots_lock.lock();
+        defer self.snapshots_lock.unlock();
+        const gop = try self.snapshot_counts.getOrPut(self.allocator, seq);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    fn unregisterSnapshot(self: *Manifest, seq: u64) void {
+        self.snapshots_lock.lock();
+        defer self.snapshots_lock.unlock();
+        const entry = self.snapshot_counts.getPtr(seq) orelse return;
+        entry.* -= 1;
+        if (entry.* == 0) _ = self.snapshot_counts.remove(seq);
+    }
+
+    /// Lowest snap_seq across live snapshots, or null when there are
+    /// none. Used by refillReusable to keep snapshot-referenced pages
+    /// out of the reusable queue.
+    pub fn minLiveSnapSeq(self: *Manifest) ?u64 {
+        self.snapshots_lock.lock();
+        defer self.snapshots_lock.unlock();
+        var min: ?u64 = null;
+        var it = self.snapshot_counts.keyIterator();
+        while (it.next()) |k| {
+            if (min == null or k.* < min.?) min = k.*;
+        }
+        return min;
+    }
+
+    /// Open a read snapshot capturing the current applied state. The
+    /// returned snapshot may be read from any thread until `close()`;
+    /// writes to the underlying stores do not affect what the
+    /// snapshot sees.
+    pub fn openSnapshot(self: *Manifest) !Snapshot {
+        self.tree_lock.lock();
+        const snap_seq = self.tree.seq;
+        const manifest_root = self.tree.root;
+        self.tree_lock.unlock();
+        try self.registerSnapshot(snap_seq);
+        return .{
+            .manifest = self,
+            .snap_seq = snap_seq,
+            .manifest_root = manifest_root,
+        };
     }
 
     /// Obtain (or lazily create) the per-store write mutex for `id`.
@@ -595,6 +656,7 @@ pub const Manifest = struct {
     /// generalizes phase-4's "max_eligible = sequence - 1."
     fn refillReusable(self: *Manifest) !void {
         if (self.active_seq < 1) return;
+        const min_snap = self.minLiveSnapSeq();
 
         // freelist_tree_lock serializes against any other freelist tree
         // mutation (only durabilize mutates it, but defensive). The
@@ -609,9 +671,14 @@ pub const Manifest = struct {
         defer cursor.deinit();
         while (try cursor.next()) {
             const decoded = decodeFreelistKey(cursor.key());
+            // Two-slot durability invariant.
             if (self.inactive_valid and decoded.freed_at_seq == self.inactive_seq + 1) continue;
             if (decoded.freed_at_seq == self.active_seq + 1) continue;
-            // Safe to consume.
+            // Snapshot invariant: any live snapshot whose snap_seq is
+            // >= freed_at_seq might have the page in its view.
+            if (min_snap) |m| {
+                if (decoded.freed_at_seq >= m) continue;
+            }
             var it = ChunkIterator.init(cursor.value());
             while (it.next()) |p| {
                 try self.reusable.append(self.allocator, p);
@@ -668,6 +735,54 @@ pub const Manifest = struct {
 // -----------------------------------------------------------------------------
 // Store wrapper
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Read snapshot
+// -----------------------------------------------------------------------------
+
+/// A point-in-time read snapshot of the manifest. Captures the
+/// manifest tree root at the moment of open; subsequent writes
+/// produce new CoW pages that the snapshot does not see. While the
+/// snapshot is alive, the manifest's free-page reclamation refuses
+/// to hand out pages whose `freed_at_seq` is at or after the
+/// snapshot's `snap_seq` — so the OLD pages the snapshot walks stay
+/// intact on disk.
+pub const Snapshot = struct {
+    manifest: *Manifest,
+    snap_seq: u64,
+    manifest_root: u64,
+
+    pub fn close(self: *Snapshot) void {
+        self.manifest.unregisterSnapshot(self.snap_seq);
+        self.* = undefined;
+    }
+
+    pub fn storeRoot(self: *Snapshot, store_id: u64) !?u64 {
+        var id_buf: [STORE_ID_LEN]u8 = undefined;
+        const k = encodeStoreId(store_id, &id_buf);
+        const v = try btree.treeGet(self.manifest.cache, self.manifest_root, self.manifest.allocator, k);
+        if (v) |bytes| {
+            defer self.manifest.allocator.free(bytes);
+            return decodeRoot(bytes);
+        }
+        return null;
+    }
+
+    pub fn get(
+        self: *Snapshot,
+        allocator: std.mem.Allocator,
+        store_id: u64,
+        key: []const u8,
+    ) !?[]u8 {
+        const root = (try self.storeRoot(store_id)) orelse return error.StoreNotFound;
+        return try btree.treeGet(self.manifest.cache, root, allocator, key);
+    }
+
+    pub fn scanPrefix(self: *Snapshot, store_id: u64, prefix: []const u8) !btree.PrefixCursor {
+        const root = (try self.storeRoot(store_id)) orelse return error.StoreNotFound;
+        return try btree.PrefixCursor.open(self.manifest.cache, root, prefix);
+    }
+};
 
 pub const Store = struct {
     manifest: *Manifest,
@@ -1102,6 +1217,189 @@ test "Freelist: survives reopen" {
 // -----------------------------------------------------------------------------
 // Phase 5: apply/durabilize split + orphan elision tests
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Phase 7: read snapshots
+// -----------------------------------------------------------------------------
+
+test "Phase 7: snapshot sees point-in-time value across concurrent writes" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize();
+
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k", "v1");
+    }
+    try h.manifest.durabilize();
+
+    var snap = try h.manifest.openSnapshot();
+    defer snap.close();
+
+    // Concurrent writes after snapshot.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k", "v2");
+        try s.put("k", "v3");
+    }
+    try h.manifest.durabilize();
+
+    // Snapshot still sees v1.
+    const old = (try snap.get(testing.allocator, 1, "k")).?;
+    defer testing.allocator.free(old);
+    try testing.expectEqualStrings("v1", old);
+
+    // Live store sees v3.
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    const cur = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(cur);
+    try testing.expectEqualStrings("v3", cur);
+}
+
+test "Phase 7: live snapshot blocks reuse of pages freed at its seq or later" {
+    var h = try Harness.init(128);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Seed some data and durabilize twice so reusable is populated
+    // through normal phase-4 paths.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        var i: u32 = 0;
+        while (i < 30) : (i += 1) {
+            var key_buf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
+            try s.put(k, "x");
+        }
+    }
+    try h.manifest.durabilize();
+    try h.manifest.durabilize();
+    try testing.expect(h.manifest.reusable.items.len > 0);
+
+    // Open a snapshot at this point. Its snap_seq is the next apply
+    // seq (a low number; everything freed from here forward becomes
+    // ineligible).
+    var snap = try h.manifest.openSnapshot();
+    const snap_seq = snap.snap_seq;
+    try testing.expectEqual(snap_seq, h.manifest.minLiveSnapSeq().?);
+
+    // Drive more writes so the freelist accumulates entries tagged
+    // with snap_seq or later.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        var i: u32 = 0;
+        while (i < 30) : (i += 1) {
+            var key_buf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
+            try s.put(k, "y");
+        }
+    }
+    try h.manifest.durabilize();
+    try h.manifest.durabilize();
+
+    // Inspect the freelist directly: there must be chunks tagged
+    // >= snap_seq (those would be reusable without the snapshot),
+    // and none of those pages should appear in reusable.
+    var any_chunk_blocked = false;
+    {
+        h.manifest.freelist_tree_lock.lock();
+        defer h.manifest.freelist_tree_lock.unlock();
+        var cursor = try h.manifest.freelist.scanPrefix("");
+        defer cursor.deinit();
+        while (try cursor.next()) {
+            const decoded = decodeFreelistKey(cursor.key());
+            if (decoded.freed_at_seq >= snap_seq) {
+                any_chunk_blocked = true;
+                break;
+            }
+        }
+    }
+    try testing.expect(any_chunk_blocked);
+
+    // Close the snapshot. Subsequent refill should pick up the
+    // previously-blocked entries.
+    const reusable_before_close = h.manifest.reusable.items.len;
+    snap.close();
+    try testing.expectEqual(@as(?u64, null), h.manifest.minLiveSnapSeq());
+
+    // Trigger another refill (durabilize calls it). After this the
+    // reusable list should grow as the blocked chunks become eligible.
+    try h.manifest.durabilize();
+    try testing.expect(h.manifest.reusable.items.len > reusable_before_close);
+}
+
+test "Phase 7: long-running prefix scan sees consistent view during heavy writes" {
+    var h = try Harness.init(256);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Populate 100 keys with "v0".
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        var i: u32 = 0;
+        while (i < 100) : (i += 1) {
+            var key_buf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+            try s.put(k, "v0");
+        }
+    }
+    try h.manifest.durabilize();
+
+    var snap = try h.manifest.openSnapshot();
+    defer snap.close();
+
+    const Writer = struct {
+        manifest: *Manifest,
+        n_keys: u32,
+
+        fn run(self: @This()) !void {
+            var s = try Store.open(self.manifest, 1);
+            defer s.deinit();
+            var pass: u32 = 0;
+            while (pass < 3) : (pass += 1) {
+                var i: u32 = 0;
+                while (i < self.n_keys) : (i += 1) {
+                    var key_buf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+                    var val_buf: [16]u8 = undefined;
+                    const v = try std.fmt.bufPrint(&val_buf, "v{d}", .{pass + 1});
+                    try s.put(k, v);
+                }
+            }
+        }
+    };
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{Writer{
+        .manifest = h.manifest,
+        .n_keys = 100,
+    }});
+
+    // Scan the snapshot. Every value must be "v0".
+    var cursor = try snap.scanPrefix(1, "k");
+    defer cursor.deinit();
+    var seen: u32 = 0;
+    while (try cursor.next()) {
+        const v = cursor.value();
+        try testing.expectEqualStrings("v0", v);
+        seen += 1;
+    }
+    try testing.expectEqual(@as(u32, 100), seen);
+
+    writer.join();
+
+    // Live store now reflects the writer's pass 3.
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    const cur = (try s.get(testing.allocator, "k000000")).?;
+    defer testing.allocator.free(cur);
+    try testing.expectEqualStrings("v3", cur);
+}
 
 test "Phase 5: nextApply assigns distinct seqs, durabilize lands once" {
     var h = try Harness.init(64);

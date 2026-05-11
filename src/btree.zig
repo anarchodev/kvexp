@@ -125,29 +125,7 @@ pub const Tree = struct {
     /// Look up a key. Returns null if not found; otherwise returns a
     /// freshly-allocated slice owned by the caller.
     pub fn get(self: *Tree, allocator: std.mem.Allocator, key: []const u8) Error!?[]u8 {
-        if (key.len > page.MAX_KEY_LEN) return error.KeyTooLong;
-        if (self.root == 0) return null;
-
-        var current = self.root;
-        while (true) {
-            const ref = try self.cache.pin(current);
-            defer ref.release();
-            switch (page.pageKind(ref.buf())) {
-                .leaf => {
-                    const leaf = Leaf.view(ref.buf());
-                    const hit = leaf.search(key);
-                    if (!hit.found) return null;
-                    const val = leaf.valueAt(hit.idx);
-                    const owned = try allocator.alloc(u8, val.len);
-                    @memcpy(owned, val);
-                    return owned;
-                },
-                .internal => {
-                    const node = Internal.view(ref.buf());
-                    current = node.childForKey(key);
-                },
-            }
-        }
+        return treeGet(self.cache, self.root, allocator, key);
     }
 
     // -------------------------------------------------------------------------
@@ -575,18 +553,7 @@ pub const Tree = struct {
     /// lifetime. Mutations to the tree invalidate any outstanding
     /// cursor (phase 2 is single-threaded; document and don't do that).
     pub fn scanPrefix(self: *Tree, prefix: []const u8) Error!PrefixCursor {
-        var cursor: PrefixCursor = .{
-            .tree = self,
-            .prefix = prefix,
-            .leaf_pin = null,
-            .leaf_slot = 0,
-            .path = undefined,
-            .depth = 0,
-            .exhausted = false,
-            .before_first = true,
-        };
-        try cursor.seek();
-        return cursor;
+        return PrefixCursor.open(self.cache, self.root, prefix);
     }
 
     fn cowLeafDelete(self: *Tree, src_page: u64, key: []const u8) Error!struct { existed: bool, new_page: u64 } {
@@ -611,8 +578,42 @@ pub const Tree = struct {
     }
 };
 
+/// Look up `key` in the B-tree rooted at `root`. Reads are pure cache
+/// pins, no writer state is touched, so this can be called with a
+/// snapshot's captured root without holding any tree-level lock.
+pub fn treeGet(
+    cache: *PageCache,
+    root: u64,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) Error!?[]u8 {
+    if (key.len > page.MAX_KEY_LEN) return error.KeyTooLong;
+    if (root == 0) return null;
+    var current = root;
+    while (true) {
+        const ref = try cache.pin(current);
+        defer ref.release();
+        switch (page.pageKind(ref.buf())) {
+            .leaf => {
+                const leaf = Leaf.view(ref.buf());
+                const hit = leaf.search(key);
+                if (!hit.found) return null;
+                const val = leaf.valueAt(hit.idx);
+                const owned = try allocator.alloc(u8, val.len);
+                @memcpy(owned, val);
+                return owned;
+            },
+            .internal => {
+                const node = Internal.view(ref.buf());
+                current = node.childForKey(key);
+            },
+        }
+    }
+}
+
 pub const PrefixCursor = struct {
-    tree: *Tree,
+    cache: *PageCache,
+    root: u64,
     prefix: []const u8,
 
     leaf_pin: ?@import("page_cache.zig").PageRef,
@@ -623,6 +624,25 @@ pub const PrefixCursor = struct {
 
     exhausted: bool,
     before_first: bool,
+
+    /// Open a cursor against the B-tree rooted at `root`. The cursor
+    /// does not depend on a Tree; a snapshot can pass its captured
+    /// root directly.
+    pub fn open(cache: *PageCache, root: u64, prefix: []const u8) Error!PrefixCursor {
+        var cursor: PrefixCursor = .{
+            .cache = cache,
+            .root = root,
+            .prefix = prefix,
+            .leaf_pin = null,
+            .leaf_slot = 0,
+            .path = undefined,
+            .depth = 0,
+            .exhausted = false,
+            .before_first = true,
+        };
+        try cursor.seek();
+        return cursor;
+    }
 
     pub fn deinit(self: *PrefixCursor) void {
         if (self.leaf_pin) |ref| ref.release();
@@ -655,24 +675,22 @@ pub const PrefixCursor = struct {
             if (self.leaf_slot < leaf.nEntries()) {
                 const k = leaf.keyAt(self.leaf_slot);
                 if (std.mem.startsWith(u8, k, self.prefix)) return true;
-                // Past the prefix range.
                 self.exhausted = true;
                 return false;
             }
-            // Past end of current leaf — advance.
             try self.advanceToNextLeaf();
             if (self.exhausted) return false;
         }
     }
 
     fn seek(self: *PrefixCursor) Error!void {
-        if (self.tree.root == 0) {
+        if (self.root == 0) {
             self.exhausted = true;
             return;
         }
-        var current = self.tree.root;
+        var current = self.root;
         while (true) {
-            const ref = try self.tree.cache.pin(current);
+            const ref = try self.cache.pin(current);
             switch (page.pageKind(ref.buf())) {
                 .leaf => {
                     const leaf = Leaf.view(ref.buf());
@@ -704,7 +722,7 @@ pub const PrefixCursor = struct {
 
         while (self.depth > 0) {
             const entry = &self.path[self.depth - 1];
-            const ref = try self.tree.cache.pin(entry.page_no);
+            const ref = try self.cache.pin(entry.page_no);
             const node = Internal.view(ref.buf());
             if (entry.child_slot < node.nEntries()) {
                 entry.child_slot += 1;
@@ -725,7 +743,7 @@ pub const PrefixCursor = struct {
     fn descendLeftmost(self: *PrefixCursor, start_page: u64) Error!void {
         var current = start_page;
         while (true) {
-            const ref = try self.tree.cache.pin(current);
+            const ref = try self.cache.pin(current);
             switch (page.pageKind(ref.buf())) {
                 .leaf => {
                     self.leaf_pin = ref;

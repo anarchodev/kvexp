@@ -143,8 +143,14 @@ Lock layout:
 
 Per-store CoW happens with **no manifest lock held** — workers contend only briefly on alloc_lock and per-shard cache locks.
 
-### Phase 7 — Read snapshots
-Read transactions pin a manifest version and walk from it. Free-list reclamation respects min-live-reader. Demo: long-running prefix scan during heavy writes, verify point-in-time consistency.
+### Phase 7 — Read snapshots ✅
+`Manifest.openSnapshot()` captures `(snap_seq, manifest_root)` atomically under `tree_lock`. The returned `Snapshot` provides `get(store_id, key)` and `scanPrefix(store_id, prefix)` that walk the captured manifest tree root + the captured per-store tree root — invariant against concurrent writers' CoW operations.
+
+`refillReusable` consults `minLiveSnapSeq()`: a page tagged `freed_at_seq=N` is potentially in a snapshot's view iff some live snapshot has `snap_seq >= N`, so the page stays out of the reusable queue. When the last referencing snapshot closes, the next `refillReusable` (which `durabilize` calls at the end) picks up the newly-eligible chunks.
+
+The `PrefixCursor` was refactored to hold `(cache, root)` directly rather than `*Tree`, so snapshots can produce cursors against their captured root without aliasing a live Tree.
+
+Reader-side cost: snapshots only read pinned pages through the existing page cache — there's no separate snapshot machinery in the cache or the file. The cost is purely the reuse delay (pages tagged with seqs ≥ any live snapshot's `snap_seq` stay in the freelist until the snapshot closes).
 
 ### Phase 8 — Recovery
 Header validation, manifest slot picking, free-list rebuild (or trust + verify), `durable_index` exposure. Demo: `kill -9` across the durabilize sequence, verify recovery to last durable manifest.
