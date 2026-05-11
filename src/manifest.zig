@@ -740,13 +740,24 @@ pub const Manifest = struct {
 // Read snapshot
 // -----------------------------------------------------------------------------
 
-/// A point-in-time read snapshot of the manifest. Captures the
-/// manifest tree root at the moment of open; subsequent writes
-/// produce new CoW pages that the snapshot does not see. While the
-/// snapshot is alive, the manifest's free-page reclamation refuses
-/// to hand out pages whose `freed_at_seq` is at or after the
-/// snapshot's `snap_seq` — so the OLD pages the snapshot walks stay
-/// intact on disk.
+/// A point-in-time consistent read view of the manifest forest, for
+/// **infrastructure callers** that need to read while writers
+/// continue — not for application requests. The request path
+/// serializes reads and writes inside a per-store batch under
+/// exclusive lock, so it has no use for MVCC. Snapshots exist for:
+///
+///   * Phase-10 raft state transfer (the leader ships the durable
+///     state to a catching-up follower, an operation that runs for
+///     seconds or minutes while writers continue).
+///   * Online backups.
+///   * Admin/debug tooling (`kvexp.fsck`, `kvexp.dump`).
+///
+/// Captures the manifest tree root atomically under `tree_lock` at
+/// open; subsequent writes produce new CoW pages that the snapshot
+/// does not see. While the snapshot is alive, the free-page
+/// allocator refuses to hand out any page whose `freed_at_seq` is
+/// at or after the snapshot's `snap_seq`, so the OLD pages the
+/// snapshot walks stay intact on disk.
 pub const Snapshot = struct {
     manifest: *Manifest,
     snap_seq: u64,

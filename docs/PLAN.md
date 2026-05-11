@@ -143,14 +143,16 @@ Lock layout:
 
 Per-store CoW happens with **no manifest lock held** — workers contend only briefly on alloc_lock and per-shard cache locks.
 
-### Phase 7 — Read snapshots ✅
-`Manifest.openSnapshot()` captures `(snap_seq, manifest_root)` atomically under `tree_lock`. The returned `Snapshot` provides `get(store_id, key)` and `scanPrefix(store_id, prefix)` that walk the captured manifest tree root + the captured per-store tree root — invariant against concurrent writers' CoW operations.
+### Phase 7 — Infrastructure long-reads (snapshots) ✅
+**Not for the request path.** Application requests dispatch through per-store batches: a worker grabs the store's lock, drains its queue under a single in-memory transaction with savepoints between requests, and releases. Reads and writes inside a request are serialized under that lock; the 10ms budget plus the bounded prefix-scan size means a request can never hold a read open across someone else's writes. MVCC isn't load-bearing for that pattern.
+
+What snapshots ARE for: infrastructure callers that need a coherent view *while writers continue*. The motivating case is **phase 10 raft snapshot transfer** — the leader has to walk the durable manifest plus every reachable page to ship state to a catching-up follower, which can run for seconds or minutes; without snapshot pinning, pages freed during the transfer become eligible for reuse two commits later and the export reads garbage. Same machinery serves online backups and debug/admin dumps (`kvexp.fsck`, `kvexp.dump`).
+
+`Manifest.openSnapshot()` captures `(snap_seq, manifest_root)` atomically under `tree_lock`. The returned `Snapshot` provides `get(store_id, key)` and `scanPrefix(store_id, prefix)` that walk the captured manifest tree root and the captured per-store tree root — invariant against concurrent writers' CoW operations.
 
 `refillReusable` consults `minLiveSnapSeq()`: a page tagged `freed_at_seq=N` is potentially in a snapshot's view iff some live snapshot has `snap_seq >= N`, so the page stays out of the reusable queue. When the last referencing snapshot closes, the next `refillReusable` (which `durabilize` calls at the end) picks up the newly-eligible chunks.
 
-The `PrefixCursor` was refactored to hold `(cache, root)` directly rather than `*Tree`, so snapshots can produce cursors against their captured root without aliasing a live Tree.
-
-Reader-side cost: snapshots only read pinned pages through the existing page cache — there's no separate snapshot machinery in the cache or the file. The cost is purely the reuse delay (pages tagged with seqs ≥ any live snapshot's `snap_seq` stay in the freelist until the snapshot closes).
+The `PrefixCursor` was refactored to hold `(cache, root)` directly rather than `*Tree`, so snapshots can produce cursors against their captured root without aliasing a live Tree. (This refactor is independently useful regardless of the snapshot machinery.)
 
 ### Phase 8 — Recovery
 Header validation, manifest slot picking, free-list rebuild (or trust + verify), `durable_index` exposure. Demo: `kill -9` across the durabilize sequence, verify recovery to last durable manifest.
