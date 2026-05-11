@@ -1275,16 +1275,19 @@ test "Freelist: pending_free populated by mutations, drained at commit" {
     var s = try Store.open(h.manifest, 1);
     defer s.deinit();
 
+    // Each put runs in its own apply unit (the production pattern:
+    // every writeset calls nextApply via begin). This forces the
+    // hybrid CoW path to treat each put as touching durable pages,
+    // so orphans actually accumulate.
+    _ = h.manifest.nextApply();
     try s.put("a", "1");
+    _ = h.manifest.nextApply();
     try s.put("b", "2");
+    _ = h.manifest.nextApply();
     try s.put("c", "3");
-    // Each put produces CoW orphans.
     try testing.expect(h.manifest.pending_free.items.len > 0);
 
     try h.manifest.commit();
-    // After commit, pending_free is drained. Some entries may have been
-    // re-populated by the freelist's own CoW operations, but the count
-    // should be much smaller than before.
     try testing.expect(h.manifest.pending_free.items.len < 10);
 }
 
@@ -1295,9 +1298,12 @@ test "Freelist: reuse after two-commit lag" {
     var s = try Store.open(h.manifest, 1);
     defer s.deinit();
 
-    // Drive churn so freelist accumulates entries.
+    // Drive churn so freelist accumulates entries. Advance seq per
+    // put to make each its own apply unit — without this, the hybrid
+    // CoW path mutates leaves in place and produces no orphans.
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
+        _ = h.manifest.nextApply();
         var key_buf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
         try s.put(k, "x");
@@ -1318,6 +1324,7 @@ test "Freelist: survives reopen" {
     defer s.deinit();
     var i: u32 = 0;
     while (i < 30) : (i += 1) {
+        _ = h.manifest.nextApply();
         var key_buf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
         try s.put(k, "x");
@@ -1378,12 +1385,15 @@ test "Phase 8: verify reports correct counts on a small forest" {
     {
         var s = try Store.open(h.manifest, 1);
         defer s.deinit();
+        _ = h.manifest.nextApply();
         try s.put("a", "1");
+        _ = h.manifest.nextApply();
         try s.put("b", "2");
     }
     {
         var s = try Store.open(h.manifest, 2);
         defer s.deinit();
+        _ = h.manifest.nextApply();
         try s.put("x", "1");
     }
     try h.manifest.durabilize();
@@ -1587,12 +1597,14 @@ test "Phase 7: live snapshot blocks reuse of pages freed at its seq or later" {
     try h.manifest.createStore(1);
 
     // Seed some data and durabilize twice so reusable is populated
-    // through normal phase-4 paths.
+    // through normal phase-4 paths. Advance seq per put so the
+    // hybrid CoW actually produces orphans.
     {
         var s = try Store.open(h.manifest, 1);
         defer s.deinit();
         var i: u32 = 0;
         while (i < 30) : (i += 1) {
+            _ = h.manifest.nextApply();
             var key_buf: [16]u8 = undefined;
             const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
             try s.put(k, "x");
@@ -1616,6 +1628,7 @@ test "Phase 7: live snapshot blocks reuse of pages freed at its seq or later" {
         defer s.deinit();
         var i: u32 = 0;
         while (i < 30) : (i += 1) {
+            _ = h.manifest.nextApply();
             var key_buf: [16]u8 = undefined;
             const k = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
             try s.put(k, "y");
@@ -1720,6 +1733,97 @@ test "Phase 7: long-running prefix scan sees consistent view during heavy writes
     const cur = (try s.get(testing.allocator, "k000000")).?;
     defer testing.allocator.free(cur);
     try testing.expectEqualStrings("v3", cur);
+}
+
+test "Hybrid CoW: same-seq puts to one leaf reuse the shadow page" {
+    // The hybrid CoW path mutates a page in place when it was already
+    // dirtied in the current apply unit. This test verifies the
+    // observable side effect: a batch of same-seq puts produces far
+    // fewer orphans (and grows the file less) than the same batch
+    // with seq advances between each put.
+    var h_same = try Harness.init(128);
+    defer h_same.deinit();
+    try h_same.manifest.createStore(1);
+    var size_before_same: u64 = 0;
+    {
+        var s = try Store.open(h_same.manifest, 1);
+        defer s.deinit();
+        size_before_same = h_same.manifest.fileSizePages();
+        var i: u32 = 0;
+        while (i < 50) : (i += 1) {
+            var kb: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
+            try s.put(k, "x");
+        }
+    }
+    const orphans_same = h_same.manifest.pending_free.items.len;
+    const grew_same = h_same.manifest.fileSizePages() - size_before_same;
+
+    var h_per_seq = try Harness.init(128);
+    defer h_per_seq.deinit();
+    try h_per_seq.manifest.createStore(1);
+    var size_before_per: u64 = 0;
+    {
+        var s = try Store.open(h_per_seq.manifest, 1);
+        defer s.deinit();
+        size_before_per = h_per_seq.manifest.fileSizePages();
+        var i: u32 = 0;
+        while (i < 50) : (i += 1) {
+            _ = h_per_seq.manifest.nextApply();
+            var kb: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
+            try s.put(k, "x");
+        }
+    }
+    const orphans_per = h_per_seq.manifest.pending_free.items.len;
+    const grew_per = h_per_seq.manifest.fileSizePages() - size_before_per;
+
+    // Hybrid path generates strictly fewer orphans and grows the file
+    // less than the per-seq path on the same workload.
+    try testing.expect(orphans_same < orphans_per);
+    try testing.expect(grew_same <= grew_per);
+
+    // Both runs end up with the same final state observable through
+    // the public API.
+    var s1 = try Store.open(h_same.manifest, 1);
+    defer s1.deinit();
+    var s2 = try Store.open(h_per_seq.manifest, 1);
+    defer s2.deinit();
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
+        const v1 = (try s1.get(testing.allocator, k)) orelse return error.MissingKey;
+        defer testing.allocator.free(v1);
+        const v2 = (try s2.get(testing.allocator, k)) orelse return error.MissingKey;
+        defer testing.allocator.free(v2);
+        try testing.expectEqualStrings("x", v1);
+        try testing.expectEqualStrings("x", v2);
+    }
+}
+
+test "Hybrid CoW: same-seq updates to one key keep the same leaf page_no" {
+    // The same-key-update case is the canonical in-place win: every
+    // update after the first should mutate the same leaf, leaving
+    // the store_root unchanged.
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    try s.put("k", "v0");
+    const root_after_first = (try h.manifest.storeRoot(1)).?;
+    var i: u32 = 1;
+    while (i < 20) : (i += 1) {
+        var vb: [16]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vb, "v{d}", .{i});
+        try s.put("k", v);
+    }
+    const root_after_many = (try h.manifest.storeRoot(1)).?;
+    try testing.expectEqual(root_after_first, root_after_many);
+    const v_final = (try s.get(testing.allocator, "k")) orelse return error.MissingKey;
+    defer testing.allocator.free(v_final);
+    try testing.expectEqualStrings("v19", v_final);
 }
 
 test "Phase 5: nextApply assigns distinct seqs, durabilize lands once" {
@@ -1995,6 +2099,7 @@ test "Freelist: churn workload approaches net-zero growth" {
         defer s.deinit();
         var i: u32 = 0;
         while (i < KEYS) : (i += 1) {
+            _ = h.manifest.nextApply();
             var key_buf: [16]u8 = undefined;
             const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
             try s.put(k, "x");
@@ -2013,6 +2118,7 @@ test "Freelist: churn workload approaches net-zero growth" {
         defer s.deinit();
         var i: u32 = 0;
         while (i < KEYS) : (i += 1) {
+            _ = h.manifest.nextApply();
             var key_buf: [16]u8 = undefined;
             const k = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
             var val_buf: [16]u8 = undefined;

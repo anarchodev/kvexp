@@ -54,6 +54,19 @@ pub const PageRef = struct {
         slot.dirty_seq = if (slot.dirty_seq) |existing| @max(existing, seq) else seq;
     }
 
+    /// Return the slot's current dirty_seq, or null if the page has
+    /// never been marked dirty (or was flushed by the last
+    /// durabilize). Used by the B-tree CoW path to detect pages that
+    /// have already been shadowed by the current txn — those can be
+    /// mutated in place rather than re-CoW'd.
+    pub fn dirtySeq(self: PageRef) ?u64 {
+        const shard = self.cache.shardFor(self.page_no);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        const slot = shard.slotForBuffer(self.buffer_idx);
+        return slot.dirty_seq;
+    }
+
     pub fn release(self: PageRef) void {
         const shard = self.cache.shardFor(self.page_no);
         shard.lock.lock();

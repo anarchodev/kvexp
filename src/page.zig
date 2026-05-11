@@ -183,6 +183,19 @@ pub const Internal = struct {
         return self.header().rightmost_child;
     }
 
+    /// In-place mutator for the rightmost child pointer. Used by the
+    /// hybrid CoW path to retarget the rightmost child without
+    /// reCoW'ing the whole page.
+    pub fn setRightmostChild(self: Internal, child: u64) void {
+        self.header().rightmost_child = child;
+    }
+
+    /// In-place mutator for an indexed child pointer.
+    pub fn setChildAt(self: Internal, i: usize, child: u64) void {
+        const off = self.slotOffset(i);
+        std.mem.writeInt(u64, self.buf[off + 2 ..][0..8], child, .little);
+    }
+
     fn slotPtr(self: Internal, i: usize) *u16 {
         return @ptrCast(@alignCast(self.buf.ptr + HEADER_SIZE + i * SLOT_SIZE));
     }

@@ -212,12 +212,22 @@ pub const Tree = struct {
             (@as(usize, src.nEntries()) + added_slots) * SLOT_SIZE +
             @as(usize, src.header().total_cell_bytes) + added_cell - removed_cell;
 
-        if (new_total <= PAGE_SIZE) {
-            const new_no = try self.page_allocator.alloc();
-            const new_ref = try self.cache.pinNewUninit(new_no);
-            defer new_ref.release();
-            const dst = Leaf.init(new_ref.buf());
+        if (new_total > PAGE_SIZE) {
+            const result = try self.splitLeafInsert(src, key, value, hit, new_total);
+            try self.page_allocator.free(src_page, self.seq);
+            return result;
+        }
 
+        // Hybrid: if this leaf already belongs to the current txn
+        // (it was previously CoW'd at this same seq), the original
+        // durable version lives elsewhere and the new-location buffer
+        // is our scratch — mutate in place instead of re-CoW'ing.
+        // Repacking the leaf reads cells via slices into the same
+        // buffer we're about to overwrite, so stage into a stack
+        // buffer first, then memcpy back.
+        if (src_ref.dirtySeq() == self.seq) {
+            var staging: [PAGE_SIZE]u8 = undefined;
+            const dst = Leaf.init(&staging);
             var i: usize = 0;
             while (i < src.nEntries()) : (i += 1) {
                 if (i == hit.idx) {
@@ -229,14 +239,30 @@ pub const Tree = struct {
             if (!hit.found and hit.idx == src.nEntries()) {
                 std.debug.assert(dst.appendCell(key, value));
             }
-            new_ref.markDirty(self.seq);
-            try self.page_allocator.free(src_page, self.seq);
-            return .{ .single = new_no };
+            @memcpy(src_ref.buf()[0..PAGE_SIZE], &staging);
+            src_ref.markDirty(self.seq);
+            return .{ .single = src_page };
         }
 
-        const result = try self.splitLeafInsert(src, key, value, hit, new_total);
+        const new_no = try self.page_allocator.alloc();
+        const new_ref = try self.cache.pinNewUninit(new_no);
+        defer new_ref.release();
+        const dst = Leaf.init(new_ref.buf());
+
+        var i: usize = 0;
+        while (i < src.nEntries()) : (i += 1) {
+            if (i == hit.idx) {
+                std.debug.assert(dst.appendCell(key, value));
+                if (hit.found) continue;
+            }
+            std.debug.assert(dst.appendCell(src.keyAt(i), src.valueAt(i)));
+        }
+        if (!hit.found and hit.idx == src.nEntries()) {
+            std.debug.assert(dst.appendCell(key, value));
+        }
+        new_ref.markDirty(self.seq);
         try self.page_allocator.free(src_page, self.seq);
-        return result;
+        return .{ .single = new_no };
     }
 
     fn splitLeafInsert(
@@ -344,7 +370,35 @@ pub const Tree = struct {
 
         switch (child_result.*) {
             .single => |new_child_no| {
-                // Same size; rewrite densely with one child pointer changed.
+                const old_child_no: u64 = if (child_slot == src.nEntries())
+                    src.rightmostChild()
+                else
+                    src.childAt(child_slot);
+
+                // Hybrid no-op shortcut: if the child mutated in place
+                // (same page_no), the parent's pointer is already
+                // correct — no need to touch this page or anything
+                // above it. This is the dominant case once a workload's
+                // hot path is warm (all leaves and internals on the
+                // path are shadow).
+                if (old_child_no == new_child_no) {
+                    return .{ .single = src_page };
+                }
+
+                // Hybrid in-place: if this page already belongs to the
+                // current txn, patch the one child pointer rather than
+                // rebuilding the whole page.
+                if (src_ref.dirtySeq() == self.seq) {
+                    if (child_slot == src.nEntries()) {
+                        src.setRightmostChild(new_child_no);
+                    } else {
+                        src.setChildAt(child_slot, new_child_no);
+                    }
+                    src_ref.markDirty(self.seq);
+                    return .{ .single = src_page };
+                }
+
+                // Full CoW: rewrite densely with one child pointer changed.
                 const new_no = try self.page_allocator.alloc();
                 const new_ref = try self.cache.pinNewUninit(new_no);
                 defer new_ref.release();
@@ -562,6 +616,20 @@ pub const Tree = struct {
         const src = Leaf.view(src_ref.buf());
         const hit = src.search(key);
         if (!hit.found) return .{ .existed = false, .new_page = src_page };
+
+        // Hybrid in-place: same logic as cowLeafInsert.
+        if (src_ref.dirtySeq() == self.seq) {
+            var staging: [PAGE_SIZE]u8 = undefined;
+            const dst = Leaf.init(&staging);
+            var i: usize = 0;
+            while (i < src.nEntries()) : (i += 1) {
+                if (i == hit.idx) continue;
+                std.debug.assert(dst.appendCell(src.keyAt(i), src.valueAt(i)));
+            }
+            @memcpy(src_ref.buf()[0..PAGE_SIZE], &staging);
+            src_ref.markDirty(self.seq);
+            return .{ .existed = true, .new_page = src_page };
+        }
 
         const new_no = try self.page_allocator.alloc();
         const new_ref = try self.cache.pinNewUninit(new_no);
