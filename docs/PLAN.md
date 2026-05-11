@@ -123,9 +123,11 @@ Free list as B-tree keyed by `(freed_at_sequence, page_no)`. Per-transaction "pe
 **Freelist format:** vector-valued chunks. Key is `(freed_at_seq, first_page_no_in_chunk)` and the value packs up to `PAGES_PER_CHUNK ≈ 255` page_nos. A commit that frees `P` pages writes `⌈P/255⌉` freelist puts, not `P`, so the freelist's own CoW cost stays a constant factor of the user workload. `refillReusable` reads whole chunks at a time and queues each chunk's key for deletion at the next commit — the on-disk freelist size stays proportional to *in-flight reusable pages*, not to historical freeds.
 
 ### Phase 5 — Apply / durabilize split + group commit + orphan elision ✅
-Apply produces in-memory manifest version + tagged dirty pages, zero I/O. `durabilize()` collapses intermediate manifests, subtracts orphans, pwrites + fsyncs. Watermark API. Demo: hot-key 10-apply burst writes 14 pwrites total vs ~30 naive.
+Apply produces in-memory manifest version + tagged dirty pages, zero I/O. `durabilize()` collapses intermediate manifests, subtracts orphans, pwrites + fsyncs. Watermark API. Demo: hot-key 10-apply burst writes **4 pwrites** total vs ~30 naive.
 
-`Manifest.nextApply()` bumps `tree.seq` so subsequent mutations tag with a fresh seq. `Manifest.durabilize()` snapshots `pending_free`, builds an orphan set of pages tagged `freed_at_seq ≤ K`, folds into the freelist, and calls `cache.flushUpToSkipping(K, &orphans)` — dirty pages in the orphan set are marked clean without hitting disk. The two-slot reuse rule generalizes to "skip freelist entries with `freed_at_seq == inactive_seq + 1`" (only the older durable manifest's referenced pages are unsafe; large group commits expose many safe entries at once).
+`Manifest.nextApply()` bumps `tree.seq` so subsequent mutations tag with a fresh seq. `Manifest.durabilize()` snapshots `pending_free`, builds an orphan set of pages tagged `freed_at_seq ≤ K`, folds into the freelist, then **extends the orphan set with the post-fold pending_free entries** (the intermediate freelist-tree pages that the fold itself just CoW'd away — their content is junk no manifest will ever reference). Finally calls `cache.flushUpToSkipping(K, &orphans)` so dirty pages in the orphan set are marked clean without hitting disk.
+
+The two-slot reuse rule generalizes to "skip freelist entries with `freed_at_seq == inactive_seq + 1`" (only the older durable manifest's referenced pages are unsafe; large group commits expose many safe entries at once).
 
 ### Phase 6 — Per-store concurrent writers
 Per-store write lock, concurrent free-page allocator, serialized manifest assembly. Demo: N workers writing different stores, scale near-linear up to the manifest-assembly serial point.

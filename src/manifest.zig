@@ -409,11 +409,9 @@ pub const Manifest = struct {
         const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
         defer self.allocator.free(ck);
 
-        // 2. Build orphan set BEFORE folding into freelist. Pages in
-        //    `pending_free` with `freed_at_seq <= K` were superseded
-        //    by a later apply within this durabilize window — they
-        //    don't need to hit disk because no manifest at seq >= K
-        //    references them.
+        // 2. Build initial orphan set from pf. Pages superseded by a
+        //    later apply within this durabilize window don't need to
+        //    hit disk — no manifest at seq >= K references them.
         var orphans: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer orphans.deinit(self.allocator);
         for (pf) |fp| {
@@ -422,13 +420,23 @@ pub const Manifest = struct {
             }
         }
 
-        // 3. Fold pf into the durable freelist. (Generates new
-        //    pending_free entries — those carry to the next
-        //    durabilize.)
+        // 3. Fold pf into the durable freelist + delete consumed_keys.
+        //    These mutations produce more pending_free entries — the
+        //    intermediate freelist-tree pages that got CoW'd within
+        //    the fold/delete loops. Those are unreferenced too: they
+        //    were created during this durabilize and immediately
+        //    superseded by the next freelist CoW. Their content is
+        //    junk and never needs to hit disk.
         try self.foldPendingFree(pf);
         for (ck) |key| _ = try self.freelist.delete(&key);
+        for (self.pending_free.items) |fp| {
+            if (fp.freed_at_seq <= K) {
+                try orphans.put(self.allocator, fp.page_no, {});
+            }
+        }
 
-        // 4. Flush dirty pages tagged seq <= K, skipping orphans.
+        // 4. Flush dirty pages tagged seq <= K, skipping orphans
+        //    (both the pre-fold and the fold-generated ones).
         try self.cache.flushUpToSkipping(K, &orphans);
         try self.file.fsync();
 
@@ -1008,11 +1016,11 @@ test "Phase 5: orphan elision — hot key burst writes one final state" {
     try h.manifest.durabilize();
 
     const writes_during_burst = h.file.pages_written - writes_baseline;
-    // 10 applies × ~3 CoW pages = 30 naive pwrites. With orphan
-    // elision, only the final-state pages, the freelist's own commit
-    // pages, and the manifest header slot hit disk — about 14 pwrites
-    // observed in practice; we conservatively assert < 15 (half-naive).
-    try testing.expect(writes_during_burst < 15);
+    // Naive: ~30 pwrites (10 applies × ~3 CoW pages). With orphan
+    // elision capturing both pre-fold and post-fold orphans, only the
+    // final-state pages plus the manifest header slot reach disk —
+    // observed 4 pwrites in practice.
+    try testing.expect(writes_during_burst < 8);
 
     // Correctness: the final state survives.
     try h.cycle();
@@ -1124,8 +1132,6 @@ test "Freelist: churn workload approaches net-zero growth" {
     const growth = size_after_churn - size_after_populate;
     const naive_growth_no_reuse = KEYS * ROUNDS * 3; // ~3 pages per put (CoW depth)
 
-    // Real growth should be a tiny fraction of what a leaking allocator
-    // would produce, and at most ~2× the populate-time footprint.
     try testing.expect(growth < 2 * size_after_populate);
     try testing.expect(growth * 10 < naive_growth_no_reuse);
 }
