@@ -138,7 +138,7 @@ pub const Tree = struct {
 
         if (self.root == 0) {
             const leaf_no = try self.page_allocator.alloc();
-            const ref = try self.cache.pinNew(leaf_no);
+            const ref = try self.cache.pinNewUninit(leaf_no);
             defer ref.release();
             const leaf = Leaf.init(ref.buf());
             _ = leaf.appendCell(key, value);
@@ -185,7 +185,7 @@ pub const Tree = struct {
             .single => |p| self.root = p,
             .split => |s| {
                 const new_root_no = try self.page_allocator.alloc();
-                const ref = try self.cache.pinNew(new_root_no);
+                const ref = try self.cache.pinNewUninit(new_root_no);
                 defer ref.release();
                 const node = Internal.init(ref.buf(), s.right);
                 _ = node.appendCell(s.sep(), s.left);
@@ -214,7 +214,7 @@ pub const Tree = struct {
 
         if (new_total <= PAGE_SIZE) {
             const new_no = try self.page_allocator.alloc();
-            const new_ref = try self.cache.pinNew(new_no);
+            const new_ref = try self.cache.pinNewUninit(new_no);
             defer new_ref.release();
             const dst = Leaf.init(new_ref.buf());
 
@@ -304,9 +304,9 @@ pub const Tree = struct {
 
         const left_no = try self.page_allocator.alloc();
         const right_no = try self.page_allocator.alloc();
-        const left_ref = try self.cache.pinNew(left_no);
+        const left_ref = try self.cache.pinNewUninit(left_no);
         defer left_ref.release();
-        const right_ref = try self.cache.pinNew(right_no);
+        const right_ref = try self.cache.pinNewUninit(right_no);
         defer right_ref.release();
         const left = Leaf.init(left_ref.buf());
         const right = Leaf.init(right_ref.buf());
@@ -346,7 +346,7 @@ pub const Tree = struct {
             .single => |new_child_no| {
                 // Same size; rewrite densely with one child pointer changed.
                 const new_no = try self.page_allocator.alloc();
-                const new_ref = try self.cache.pinNew(new_no);
+                const new_ref = try self.cache.pinNewUninit(new_no);
                 defer new_ref.release();
                 const rightmost: u64 = blk: {
                     if (child_slot == src.nEntries()) break :blk new_child_no;
@@ -385,7 +385,7 @@ pub const Tree = struct {
         s: *const Split,
     ) Error!CoWResult {
         const new_no = try self.page_allocator.alloc();
-        const new_ref = try self.cache.pinNew(new_no);
+        const new_ref = try self.cache.pinNewUninit(new_no);
         defer new_ref.release();
 
         // Determine new rightmost.
@@ -463,9 +463,9 @@ pub const Tree = struct {
 
         const left_no = try self.page_allocator.alloc();
         const right_no = try self.page_allocator.alloc();
-        const left_ref = try self.cache.pinNew(left_no);
+        const left_ref = try self.cache.pinNewUninit(left_no);
         defer left_ref.release();
-        const right_ref = try self.cache.pinNew(right_no);
+        const right_ref = try self.cache.pinNewUninit(right_no);
         defer right_ref.release();
 
         const left = Internal.init(left_ref.buf(), entries.items[mid].child);
@@ -564,7 +564,7 @@ pub const Tree = struct {
         if (!hit.found) return .{ .existed = false, .new_page = src_page };
 
         const new_no = try self.page_allocator.alloc();
-        const new_ref = try self.cache.pinNew(new_no);
+        const new_ref = try self.cache.pinNewUninit(new_no);
         defer new_ref.release();
         const dst = Leaf.init(new_ref.buf());
         var i: usize = 0;
