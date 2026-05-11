@@ -8,6 +8,9 @@ pub const header = @import("header.zig");
 pub const paged_file = @import("paged_file.zig");
 pub const buffer_pool = @import("buffer_pool.zig");
 pub const page_cache = @import("page_cache.zig");
+pub const page = @import("page.zig");
+pub const btree = @import("btree.zig");
+pub const Tree = btree.Tree;
 
 pub const Header = header.Header;
 pub const PagedFile = paged_file.PagedFile;
