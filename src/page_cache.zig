@@ -127,8 +127,23 @@ pub const PageCache = struct {
     /// Write back all dirty pages with `dirty_seq <= seq`, then clear
     /// their dirty tag. Does NOT fsync; caller drives durability.
     pub fn flushUpTo(self: *PageCache, seq: u64) !void {
+        return self.flushUpToSkipping(seq, null);
+    }
+
+    /// Like `flushUpTo`, but if a page's `page_no` is in `skip`, the
+    /// dirty tag is cleared *without* writing the page to disk. Used
+    /// by phase-5 group commit to elide orphaned pages — those that
+    /// were superseded by a later apply and are no longer reachable
+    /// from the manifest being durabilized.
+    pub fn flushUpToSkipping(
+        self: *PageCache,
+        seq: u64,
+        skip: ?*const std.AutoHashMapUnmanaged(u64, void),
+    ) !void {
         var writes: std.ArrayListUnmanaged(PagedFile.PageWrite) = .empty;
         defer writes.deinit(self.allocator);
+        var clean_only: std.ArrayListUnmanaged(BufferIndex) = .empty;
+        defer clean_only.deinit(self.allocator);
         var to_clean: std.ArrayListUnmanaged(BufferIndex) = .empty;
         defer to_clean.deinit(self.allocator);
 
@@ -136,6 +151,12 @@ pub const PageCache = struct {
             if (s.state != .occupied) continue;
             const ds = s.dirty_seq orelse continue;
             if (ds > seq) continue;
+            if (skip) |sk| {
+                if (sk.contains(s.page_no)) {
+                    try clean_only.append(self.allocator, @intCast(idx));
+                    continue;
+                }
+            }
             try writes.append(self.allocator, .{
                 .page_no = s.page_no,
                 .buf = self.pool.buf(@intCast(idx)),
@@ -143,9 +164,9 @@ pub const PageCache = struct {
             try to_clean.append(self.allocator, @intCast(idx));
         }
 
-        if (writes.items.len == 0) return;
-        try self.file.writePages(writes.items);
+        if (writes.items.len != 0) try self.file.writePages(writes.items);
         for (to_clean.items) |idx| self.slots[idx].dirty_seq = null;
+        for (clean_only.items) |idx| self.slots[idx].dirty_seq = null;
     }
 
     pub const Stats = struct {

@@ -20,6 +20,9 @@ pub const PagedFile = struct {
     page_size: u32,
     page_count: u64,
     ring_entries: u16,
+    /// Total pages written by writePage/writePages. Exposed for tests
+    /// (orphan-elision benchmark counts pwrites under group commit).
+    pages_written: u64 = 0,
 
     pub const OpenOptions = struct {
         create: bool = false,
@@ -110,6 +113,7 @@ pub const PagedFile = struct {
         const cqe = self.ring.copy_cqe() catch return error.SubmitFailed;
         if (cqe.res < 0) return error.IoFailed;
         if (@as(u32, @intCast(cqe.res)) != self.page_size) return error.ShortWrite;
+        self.pages_written += 1;
     }
 
     pub const PageWrite = struct { page_no: u64, buf: []const u8 };
@@ -128,6 +132,7 @@ pub const PagedFile = struct {
             try self.submitWriteChunk(writes[i..end]);
             i = end;
         }
+        self.pages_written += writes.len;
     }
 
     fn submitWriteChunk(self: *PagedFile, writes: []const PageWrite) IoError!void {
