@@ -8,7 +8,13 @@
 const std = @import("std");
 
 pub const MAGIC: [8]u8 = .{ 'k', 'v', 'e', 'x', 'p', 0, 0, 1 };
-pub const FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 when per-page CRC32 was added to LeafHeader /
+/// InternalHeader at offset 8. v1 had no checksum field and InternalHeader's
+/// rightmost_child sat at offset 8 instead of 12; opening a v1 file with v2
+/// code would read rightmost_child as zero and treat every internal page
+/// as having an empty rightmost child — catastrophic data loss. Refuse
+/// v1 at open and force a clean wipe.
+pub const FORMAT_VERSION: u32 = 2;
 pub const HEADER_PAGE_NO: u64 = 0;
 
 pub const Header = extern struct {

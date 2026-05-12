@@ -6,6 +6,7 @@
 
 pub const header = @import("header.zig");
 pub const paged_file = @import("paged_file.zig");
+pub const faulty_paged_file = @import("faulty_paged_file.zig");
 pub const buffer_pool = @import("buffer_pool.zig");
 pub const page_cache = @import("page_cache.zig");
 pub const page = @import("page.zig");
@@ -22,6 +23,8 @@ pub const SNAPSHOT_VERSION = manifest.SNAPSHOT_VERSION;
 
 pub const Header = header.Header;
 pub const PagedFile = paged_file.PagedFile;
+pub const FaultyPagedFile = faulty_paged_file.FaultyPagedFile;
+pub const FaultPolicy = faulty_paged_file.FaultPolicy;
 pub const BufferPool = buffer_pool.BufferPool;
 pub const BufferIndex = buffer_pool.BufferIndex;
 pub const PageCache = page_cache.PageCache;
@@ -34,14 +37,18 @@ test {
 }
 
 // -----------------------------------------------------------------------------
-// End-to-end integration test: open → write header + data pages → close
-// → reopen → validate header → read back data pages.
+// End-to-end smoke test for the io_uring + O_DIRECT path: write the file
+// header at page 0 and a handful of opaque data pages directly via
+// PagedFile (no cache, no page-format constraints), close, reopen, and
+// validate. The page cache and B-tree layers are exercised in much
+// more depth by manifest_test.zig, so this only covers the lowest
+// layer.
 // -----------------------------------------------------------------------------
 
 const std = @import("std");
 const testing = std.testing;
 
-test "e2e: header + data pages survive close/reopen" {
+test "e2e: header + raw pages survive close/reopen via PagedFile" {
     const allocator = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -57,34 +64,25 @@ test "e2e: header + data pages survive close/reopen" {
         .{ .page_no = 3, .fill = 0xC3 },
     };
 
+    const buf = try allocator.alignedAlloc(u8, .fromByteUnits(PAGE_SIZE_DEFAULT), PAGE_SIZE_DEFAULT);
+    defer allocator.free(buf);
+
     // Pass 1: write.
     {
         var file = try PagedFile.open(path, .{ .create = true, .truncate = true });
         defer file.close();
-        var pool = try BufferPool.init(allocator, PAGE_SIZE_DEFAULT, 8);
-        defer pool.deinit(allocator);
-        var cache = try PageCache.init(allocator, &file, &pool, .{});
-        defer cache.deinit();
-
         _ = try file.growBy(4); // page 0 + 3 data pages
 
-        // Header at page 0.
-        {
-            const ref = try cache.pinNew(0);
-            defer ref.release();
-            const h = Header.init(PAGE_SIZE_DEFAULT);
-            @memcpy(ref.buf()[0..@sizeOf(Header)], h.toBytes());
-            ref.markDirty(1);
-        }
+        @memset(buf, 0);
+        const h = Header.init(PAGE_SIZE_DEFAULT);
+        @memcpy(buf[0..@sizeOf(Header)], h.toBytes());
+        try file.writePage(0, buf);
 
         for (data_pages) |dp| {
-            const ref = try cache.pinNew(dp.page_no);
-            defer ref.release();
-            @memset(ref.buf(), dp.fill);
-            ref.markDirty(1);
+            @memset(buf, dp.fill);
+            try file.writePage(dp.page_no, buf);
         }
 
-        try cache.flushUpTo(1);
         try file.fsync();
     }
 
@@ -92,24 +90,16 @@ test "e2e: header + data pages survive close/reopen" {
     {
         var file = try PagedFile.open(path, .{});
         defer file.close();
-        var pool = try BufferPool.init(allocator, PAGE_SIZE_DEFAULT, 8);
-        defer pool.deinit(allocator);
-        var cache = try PageCache.init(allocator, &file, &pool, .{});
-        defer cache.deinit();
 
         try testing.expectEqual(@as(u64, 4), file.pageCount());
 
-        {
-            const ref = try cache.pin(0);
-            defer ref.release();
-            const h = Header.fromBytes(ref.buf());
-            try h.validate(PAGE_SIZE_DEFAULT);
-        }
+        try file.readPage(0, buf);
+        const h = Header.fromBytes(buf);
+        try h.validate(PAGE_SIZE_DEFAULT);
 
         for (data_pages) |dp| {
-            const ref = try cache.pin(dp.page_no);
-            defer ref.release();
-            for (ref.buf()) |b| try testing.expectEqual(dp.fill, b);
+            try file.readPage(dp.page_no, buf);
+            for (buf) |b| try testing.expectEqual(dp.fill, b);
         }
     }
 }

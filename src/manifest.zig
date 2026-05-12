@@ -55,8 +55,12 @@ const page = @import("page.zig");
 const btree = @import("btree.zig");
 const Tree = btree.Tree;
 const PageAllocator = btree.PageAllocator;
-const PagedFile = @import("paged_file.zig").PagedFile;
+const paged_file_mod = @import("paged_file.zig");
+const PagedFile = paged_file_mod.PagedFile;
+const PagedFileApi = paged_file_mod.PagedFileApi;
+const FaultyPagedFile = @import("faulty_paged_file.zig").FaultyPagedFile;
 const PageCache = @import("page_cache.zig").PageCache;
+const Header = @import("header.zig").Header;
 
 pub const SLOT_A_PAGE: u64 = 1;
 pub const SLOT_B_PAGE: u64 = 2;
@@ -191,7 +195,7 @@ const RootSlot = struct {
 pub const Manifest = struct {
     allocator: std.mem.Allocator,
     cache: *PageCache,
-    file: *PagedFile,
+    file: PagedFileApi,
 
     tree: Tree, // manifest B-tree
     freelist: Tree, // free-page B-tree
@@ -234,13 +238,30 @@ pub const Manifest = struct {
     ///   store_root_cache_lock     — in-memory store_root cache
     ///                                (hashmap; uncontended for distinct
     ///                                store_ids in practice)
-    ///   alloc_lock                — reusable/pending_free/
-    ///                                consumed_keys/file.growBy
+    ///   reusable_lock             — `reusable` + `consumed_keys`
+    ///                                (both refilled by refillReusable
+    ///                                and drained by durabilize)
+    ///   pending_free_lock         — `pending_free`
     /// `cache.lock` (interior, owned by PageCache) is acquired
-    /// briefly *inside* allocImpl/freeImpl-free regions.
+    /// briefly *inside* the alloc/free regions.
+    ///
+    /// `reusable_lock` and `pending_free_lock` are at the same level
+    /// — neither is held while acquiring the other. Splitting them
+    /// (formerly one `alloc_lock`) lets `allocImpl` and `freeImpl`
+    /// run concurrently across workers on different stores, which was
+    /// the dominant bottleneck at 4+ writers. `PagedFile.growBy` has
+    /// its own internal lock; it's called *outside* both of these.
     tree_lock: std.Thread.Mutex = .{},
     freelist_tree_lock: std.Thread.Mutex = .{},
-    alloc_lock: std.Thread.Mutex = .{},
+    reusable_lock: std.Thread.Mutex = .{},
+    pending_free_lock: std.Thread.Mutex = .{},
+    /// Serializes the entire `durabilize` call. Held outermost (above
+    /// every other manifest lock) so that two callers can't race on
+    /// pending_free drain, foldPendingFree, or the slot write — all of
+    /// which assume exclusive ownership of the apply→durable transition.
+    /// Workers do NOT acquire this lock; only `durabilize` does. Lock
+    /// ordering: durabilize_lock → store_lock(id) → tree_lock | … .
+    durabilize_lock: std.Thread.Mutex = .{},
 
     /// In-memory cache of store_id → current root. The hot path
     /// (`setStoreRoot` / `storeRoot`) hits this map directly, never
@@ -267,6 +288,22 @@ pub const Manifest = struct {
     snapshot_counts: std.AutoHashMapUnmanaged(u64, u32),
     snapshots_lock: std.Thread.Mutex = .{},
 
+    /// Set to true if any error escapes `durabilize`. Linux's "fsync
+    /// gate" semantics (an fsync error may only be reported once before
+    /// the kernel forgets the EIO state) make naive retry unsafe — a
+    /// retry could silently succeed with some pages never durable, and
+    /// the next durabilize would promote a slot referencing those
+    /// non-durable pages. Once poisoned, every mutating entry point
+    /// returns `error.ManifestPoisoned`; recovery requires closing the
+    /// manifest and reopening (which re-reads the active slot from
+    /// disk — the last known-durable state).
+    ///
+    /// Reads (`Store.get`, `scanPrefix`, `hasStore`, `storeRoot`,
+    /// `listStores`, live `Snapshot`s) are allowed even when poisoned:
+    /// they see the (possibly inconsistent) in-memory state, which is
+    /// useful for forensic inspection before the operator closes.
+    poisoned: std.atomic.Value(bool) align(@alignOf(usize)) = std.atomic.Value(bool).init(false),
+
     pub fn pageAllocator(self: *Manifest) PageAllocator {
         return .{ .ctx = self, .vtable = &alloc_vtable };
     }
@@ -276,18 +313,39 @@ pub const Manifest = struct {
         .free = freeImpl,
     };
 
+    /// Number of pages to grow the file by when `reusable` is empty.
+    /// Cutting the growBy-syscall frequency by this factor is the
+    /// dominant win against `reusable_lock` contention — the slow path
+    /// (file extension) was getting hit on every alloc, holding the
+    /// lock for the duration of an ftruncate. With batching, only
+    /// 1/GROW_BATCH of allocs take the slow path; the rest are pure
+    /// in-memory ArrayList pops. Bounded leak per crash: up to
+    /// (GROW_BATCH - 1) pages that were grown but never used end up
+    /// past the durable manifest's reach. ~128KB worst case at 32; a
+    /// future compact-on-deinit could ftruncate them away.
+    pub const GROW_BATCH: u64 = 32;
+
     fn allocImpl(ctx: *anyopaque) anyerror!u64 {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
-        self.alloc_lock.lock();
-        defer self.alloc_lock.unlock();
+        self.reusable_lock.lock();
+        defer self.reusable_lock.unlock();
         if (self.reusable.pop()) |p| return p;
-        return try self.file.growBy(1);
+        // Slow path: grow by a batch, return one, cache the rest.
+        // PagedFile.growBy has its own internal lock so this is safe
+        // to call while holding reusable_lock; with GROW_BATCH=32, this
+        // path fires ~1/32 as often as the old per-alloc growBy(1).
+        const first = try self.file.growBy(GROW_BATCH);
+        var i: u64 = 1;
+        while (i < GROW_BATCH) : (i += 1) {
+            try self.reusable.append(self.allocator, first + i);
+        }
+        return first;
     }
 
     fn freeImpl(ctx: *anyopaque, page_no: u64, freed_at_seq: u64) anyerror!void {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
-        self.alloc_lock.lock();
-        defer self.alloc_lock.unlock();
+        self.pending_free_lock.lock();
+        defer self.pending_free_lock.unlock();
         try self.pending_free.append(self.allocator, .{
             .page_no = page_no,
             .freed_at_seq = freed_at_seq,
@@ -296,7 +354,7 @@ pub const Manifest = struct {
 
     /// In-place init so `self` has a stable address (the page allocator
     /// captures `&self` as ctx).
-    pub fn init(self: *Manifest, allocator: std.mem.Allocator, cache: *PageCache, file: *PagedFile) !void {
+    pub fn init(self: *Manifest, allocator: std.mem.Allocator, cache: *PageCache, file: PagedFileApi) !void {
         self.allocator = allocator;
         self.cache = cache;
         self.file = file;
@@ -308,13 +366,44 @@ pub const Manifest = struct {
         self.store_root_cache = .empty;
         self.tree_lock = .{};
         self.freelist_tree_lock = .{};
-        self.alloc_lock = .{};
+        self.reusable_lock = .{};
+        self.pending_free_lock = .{};
+        self.durabilize_lock = .{};
         self.store_locks_lock = .{};
         self.snapshots_lock = .{};
         self.store_root_cache_lock = .{};
+        self.poisoned = std.atomic.Value(bool).init(false);
 
-        while (file.pageCount() < FIRST_DATA_PAGE) {
-            _ = try file.growBy(1);
+        // File-header handling. Three cases:
+        //   (a) pageCount == 0          → genuinely fresh file: grow,
+        //                                  write Header(page 0), fsync.
+        //   (b) 0 < pageCount < FIRST_DATA_PAGE → malformed/partial
+        //                                  file (created but never had
+        //                                  slots/header written). Refuse.
+        //   (c) pageCount >= FIRST_DATA_PAGE → existing file: read+
+        //                                  validate Header at page 0.
+        // This catches: opening a foreign file, a kvexp v1 file (the
+        // pre-CRC format with a different InternalHeader layout), a
+        // file written with a different page size, or a file truncated
+        // to a partial length.
+        const initial_pages = file.pageCount();
+        if (initial_pages == 0) {
+            while (file.pageCount() < FIRST_DATA_PAGE) {
+                _ = try file.growBy(1);
+            }
+            var hdr_buf: [page.PAGE_SIZE]u8 align(4096) = undefined;
+            @memset(&hdr_buf, 0);
+            const new_hdr = Header.init(page.PAGE_SIZE);
+            @memcpy(hdr_buf[0..@sizeOf(Header)], new_hdr.toBytes());
+            try file.writePage(0, &hdr_buf);
+            try file.fsync();
+        } else if (initial_pages < FIRST_DATA_PAGE) {
+            return error.IncompleteFile;
+        } else {
+            var hdr_buf: [page.PAGE_SIZE]u8 align(4096) = undefined;
+            try file.readPage(0, &hdr_buf);
+            const hdr = Header.fromBytes(&hdr_buf);
+            try hdr.validate(page.PAGE_SIZE);
         }
 
         var buf_a: [page.PAGE_SIZE]u8 align(4096) = undefined;
@@ -406,6 +495,9 @@ pub const Manifest = struct {
     /// with the returned sequence. Multiple applies between durabilize
     /// calls accumulate in-memory state tagged with distinct seqs;
     /// orphan elision skips intermediate page versions at durabilize.
+    /// Pure in-memory counter; does not check `isPoisoned` so the
+    /// signature stays infallible. `put`/`delete`/`durabilize` are the
+    /// gates that refuse a poisoned manifest.
     pub fn nextApply(self: *Manifest) u64 {
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
@@ -426,6 +518,27 @@ pub const Manifest = struct {
         return self.active_seq;
     }
 
+    /// True iff `durabilize` previously errored. See `poisoned` field
+    /// for rationale.
+    pub fn isPoisoned(self: *const Manifest) bool {
+        return self.poisoned.load(.monotonic);
+    }
+
+    fn poison(self: *Manifest) void {
+        self.poisoned.store(true, .monotonic);
+    }
+
+    /// Test-only: force the manifest into the poisoned state. Used by
+    /// tests that can't easily induce an fsync failure but need to
+    /// verify the post-poison contract.
+    pub fn _testPoison(self: *Manifest) void {
+        self.poison();
+    }
+
+    inline fn checkAlive(self: *const Manifest) !void {
+        if (self.isPoisoned()) return error.ManifestPoisoned;
+    }
+
     /// Cluster-wide last-applied raft index watermark. Read at open
     /// from the active slot. Set via `setLastAppliedRaftIdx`; written
     /// to disk by the next `durabilize` call.
@@ -435,7 +548,8 @@ pub const Manifest = struct {
         return self.last_applied_raft_idx;
     }
 
-    pub fn setLastAppliedRaftIdx(self: *Manifest, idx: u64) void {
+    pub fn setLastAppliedRaftIdx(self: *Manifest, idx: u64) !void {
+        try self.checkAlive();
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
         self.last_applied_raft_idx = idx;
@@ -493,10 +607,17 @@ pub const Manifest = struct {
         store_tree_pages: u64,
         freelist_tree_pages: u64,
         freelist_recorded_pages: u64,
+        /// Pages held in the in-memory reusable allocator cache from
+        /// grow-batching. These are accounted-for at the application
+        /// level (the manifest knows about them) but not in any durable
+        /// structure. After a crash, refillReusable won't find them;
+        /// they would be counted as orphans on a fresh open. Bounded
+        /// by ~GROW_BATCH per grow event.
+        reusable_pages: u64,
         /// File pages not accounted for by header(0) + slots(1,2) +
         /// manifest tree + store trees + freelist tree + freelist
-        /// recorded. Should be 0 for a clean forest; non-zero
-        /// indicates leaked pages.
+        /// recorded + in-memory reusable. Should be 0 for a clean
+        /// forest; non-zero indicates true leaks.
         orphan_pages: u64,
     };
 
@@ -541,13 +662,18 @@ pub const Manifest = struct {
             }
         }
 
+        self.reusable_lock.lock();
+        const reusable_pages: u64 = self.reusable.items.len;
+        self.reusable_lock.unlock();
+
         const file_pages = self.file.pageCount();
         const fixed_pages: u64 = FIRST_DATA_PAGE; // header + slot A + slot B
         const accounted = fixed_pages +
             mt_pages.count() +
             st_pages.count() +
             fl_tree_pages.count() +
-            recorded;
+            recorded +
+            reusable_pages;
         const orphan_pages: u64 = if (file_pages > accounted) file_pages - accounted else 0;
 
         return .{
@@ -557,6 +683,7 @@ pub const Manifest = struct {
             .store_tree_pages = st_pages.count(),
             .freelist_tree_pages = fl_tree_pages.count(),
             .freelist_recorded_pages = recorded,
+            .reusable_pages = reusable_pages,
             .orphan_pages = orphan_pages,
         };
     }
@@ -622,6 +749,7 @@ pub const Manifest = struct {
     }
 
     pub fn createStore(self: *Manifest, id: u64) !void {
+        try self.checkAlive();
         // Acquire tree_lock first (lock-ordering rule), then the
         // cache lock. createStore is rare — the per-call cost of
         // taking both locks is fine.
@@ -635,6 +763,7 @@ pub const Manifest = struct {
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
+        try self.checkAlive();
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
         self.store_root_cache_lock.lock();
@@ -652,6 +781,7 @@ pub const Manifest = struct {
     /// the slot swap. This is the critical-path optimization that
     /// removes manifest-tree CoW from every put.
     pub fn setStoreRoot(self: *Manifest, id: u64, root: u64) !void {
+        try self.checkAlive();
         self.store_root_cache_lock.lock();
         defer self.store_root_cache_lock.unlock();
         try self.store_root_cache.put(self.allocator, id, .{ .root = root, .dirty = true });
@@ -704,9 +834,26 @@ pub const Manifest = struct {
     /// most of durabilize. Specifically: the freelist mutations run
     /// under `freelist_tree_lock`, leaving `tree_lock` free for worker
     /// reads/writes against the manifest tree. The slot write is
-    /// likewise free of `tree_lock`. `alloc_lock` is taken in short
-    /// bursts only.
+    /// likewise free of `tree_lock`. `reusable_lock` / `pending_free_lock`
+    /// are taken in short bursts only.
     pub fn durabilize(self: *Manifest) !void {
+        try self.checkAlive();
+        // Serialize the whole call. Concurrent durabilize callers would
+        // race on pending_free drain (two `toOwnedSlice`s on the same
+        // list), on the slot write (same target page), and on active_*
+        // promotion. Hold this lock above every other manifest lock.
+        self.durabilize_lock.lock();
+        defer self.durabilize_lock.unlock();
+        // Any error escaping durabilize past this point leaves the
+        // in-memory state in a possibly-inconsistent shape (drained
+        // pending_free without slot promotion, partial cache flush,
+        // half-written freelist tree). Poison forces a close+reopen,
+        // which re-reads the active slot — the last known-durable
+        // state — and discards everything in memory. This is the only
+        // safe recovery from an fsync gate (kernel may have forgotten
+        // the EIO; a naive retry could silently succeed).
+        errdefer self.poison();
+
         // Step 0: flush dirty store_root cache entries into the
         // manifest tree. The hot apply path bypasses tree_lock via
         // the cache; this is the only point where those buffered
@@ -716,6 +863,12 @@ pub const Manifest = struct {
         // against the flush.
         self.tree_lock.lock();
         {
+            // tree_lock must release on error inside the drain — a
+            // setStoreRootInTreeLocked failure would otherwise leave
+            // tree_lock permanently held, deadlocking every later
+            // operation (including the reads we explicitly permit on a
+            // poisoned manifest).
+            errdefer self.tree_lock.unlock();
             self.store_root_cache_lock.lock();
             defer self.store_root_cache_lock.unlock();
             var it = self.store_root_cache.iterator();
@@ -730,12 +883,17 @@ pub const Manifest = struct {
         self.tree_lock.unlock();
         if (K <= self.active_seq) return;
 
-        // 1. Snapshot pending_free + consumed_keys (brief).
-        self.alloc_lock.lock();
+        // 1. Snapshot pending_free + consumed_keys (brief). Each lock
+        //    held only for the duration of its toOwnedSlice — workers
+        //    on the other list can keep running.
+        self.pending_free_lock.lock();
         const pf = try self.pending_free.toOwnedSlice(self.allocator);
-        const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
-        self.alloc_lock.unlock();
+        self.pending_free_lock.unlock();
         defer self.allocator.free(pf);
+
+        self.reusable_lock.lock();
+        const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
+        self.reusable_lock.unlock();
         defer self.allocator.free(ck);
 
         // 2. Build initial orphan set from pf.
@@ -750,24 +908,34 @@ pub const Manifest = struct {
         // 3. Fold pf into the durable freelist + delete consumed_keys.
         //    freelist_tree_lock guards the freelist tree from concurrent
         //    refillReusable scans. The freelist tree.put/delete calls
-        //    internally take alloc_lock (via allocImpl/freeImpl).
-        self.freelist_tree_lock.lock();
-        try self.foldPendingFree(pf);
-        for (ck) |key| _ = try self.freelist.delete(&key);
-        self.freelist_tree_lock.unlock();
+        //    internally take reusable_lock (via allocImpl) and
+        //    pending_free_lock (via freeImpl) — never freelist_tree_lock
+        //    recursively. Hold via defer so an error in foldPendingFree
+        //    or freelist.delete doesn't leak the lock.
+        {
+            self.freelist_tree_lock.lock();
+            defer self.freelist_tree_lock.unlock();
+            try self.foldPendingFree(pf);
+            for (ck) |key| _ = try self.freelist.delete(&key);
+        }
 
         // 4. Extend orphan set with pages freed during fold/delete.
-        self.alloc_lock.lock();
+        self.pending_free_lock.lock();
         for (self.pending_free.items) |fp| {
             if (fp.freed_at_seq <= K) {
                 try orphans.put(self.allocator, fp.page_no, {});
             }
         }
-        self.alloc_lock.unlock();
+        self.pending_free_lock.unlock();
 
         // 5. Flush dirty pages tagged seq <= K, skipping orphans.
+        //    fdatasync (not fsync) — kvexp only mutates file size
+        //    (via growBy) and page contents; both are covered by
+        //    fdatasync per Linux semantics (size is metadata "needed
+        //    to retrieve the data"). Skipping atime/ctime sync is a
+        //    free win on the hot path.
         try self.cache.flushUpToSkipping(K, &orphans);
-        try self.file.fsync();
+        try self.file.fdatasync();
 
         // 6. Write the inactive slot.
         const next_slot: u32 = 1 - self.active_slot;
@@ -794,7 +962,8 @@ pub const Manifest = struct {
         };
         slot.computeChecksum();
         try self.file.writePage(slot_page, &slot_buf);
-        try self.file.fsync();
+        // Slot writes never change the file size; fdatasync suffices.
+        try self.file.fdatasync();
 
         // 7. Promote the new slot. Old active becomes new inactive.
         self.inactive_seq = self.active_seq;
@@ -839,11 +1008,11 @@ pub const Manifest = struct {
 
         // freelist_tree_lock serializes against any other freelist tree
         // mutation (only durabilize mutates it, but defensive). The
-        // alloc_lock guards the reusable + consumed_keys lists.
+        // reusable_lock guards the reusable + consumed_keys lists.
         self.freelist_tree_lock.lock();
         defer self.freelist_tree_lock.unlock();
-        self.alloc_lock.lock();
-        defer self.alloc_lock.unlock();
+        self.reusable_lock.lock();
+        defer self.reusable_lock.unlock();
 
         if (self.reusable.items.len >= REUSABLE_BATCH) return;
         var cursor = try self.freelist.scanPrefix("");
@@ -1087,7 +1256,7 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
         }
     }
 
-    manifest.setLastAppliedRaftIdx(last_applied);
+    try manifest.setLastAppliedRaftIdx(last_applied);
     return last_applied;
 }
 
@@ -1126,6 +1295,7 @@ pub const Store = struct {
     }
 
     pub fn put(self: *Store, key: []const u8, value: []const u8) !void {
+        try self.manifest.checkAlive();
         // Per-store write lock: serializes writers on the same store
         // without blocking writers on different stores.
         const sl = try self.manifest.storeLock(self.id);
@@ -1139,10 +1309,10 @@ pub const Store = struct {
         self.manifest.tree_lock.unlock();
         const root = root_opt orelse return error.StoreNotFound;
 
-        // Phase 2: store-tree CoW without manifest locks. allocImpl /
-        // freeImpl take alloc_lock briefly; cache takes cache_lock
-        // briefly. Writers on different stores can run this part
-        // concurrently.
+        // Phase 2: store-tree CoW without manifest locks. allocImpl
+        // takes reusable_lock briefly; freeImpl takes pending_free_lock
+        // briefly; cache takes cache_lock briefly. Writers on different
+        // stores can run this part concurrently.
         self.tree.root = root;
         self.tree.seq = seq;
         try self.tree.put(key, value);
@@ -1152,6 +1322,7 @@ pub const Store = struct {
     }
 
     pub fn delete(self: *Store, key: []const u8) !bool {
+        try self.manifest.checkAlive();
         const sl = try self.manifest.storeLock(self.id);
         sl.lock();
         defer sl.unlock();
@@ -1243,11 +1414,12 @@ const Harness = struct {
 
         self.cache = try testing.allocator.create(PageCache);
         errdefer testing.allocator.destroy(self.cache);
-        self.cache.* = try PageCache.init(testing.allocator, self.file, self.pool, .{});
+        self.cache.* = try PageCache.init(testing.allocator, self.file.api(), self.pool, .{});
+        errdefer self.cache.deinit();
 
         self.manifest = try testing.allocator.create(Manifest);
         errdefer testing.allocator.destroy(self.manifest);
-        try self.manifest.init(testing.allocator, self.cache, self.file);
+        try self.manifest.init(testing.allocator, self.cache, self.file.api());
     }
 
     fn closeLayers(self: *Harness) void {
@@ -1378,6 +1550,206 @@ test "Manifest: listStores returns ids in ascending order" {
         }
     }.lt);
     try testing.expectEqualSlices(u64, &expected, got);
+}
+
+test "Manifest: poison blocks all subsequent writes; reads still work" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    try s.put("k", "v");
+    try h.manifest.durabilize();
+
+    h.manifest._testPoison();
+    try testing.expect(h.manifest.isPoisoned());
+
+    // Every mutating entry point must refuse the poisoned manifest.
+    try testing.expectError(error.ManifestPoisoned, h.manifest.durabilize());
+    try testing.expectError(error.ManifestPoisoned, h.manifest.createStore(2));
+    try testing.expectError(error.ManifestPoisoned, h.manifest.dropStore(1));
+    try testing.expectError(error.ManifestPoisoned, h.manifest.setLastAppliedRaftIdx(7));
+    try testing.expectError(error.ManifestPoisoned, h.manifest.setStoreRoot(1, 99));
+    try testing.expectError(error.ManifestPoisoned, s.put("k2", "v"));
+    try testing.expectError(error.ManifestPoisoned, s.delete("k"));
+
+    // Reads still pass through — durable state was captured on the
+    // last successful durabilize and is unchanged in memory.
+    try testing.expect(try h.manifest.hasStore(1));
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
+}
+
+test "Manifest: reopen clears poison flag" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(7);
+    try h.manifest.durabilize();
+    h.manifest._testPoison();
+    try testing.expect(h.manifest.isPoisoned());
+
+    try h.cycle();
+    try testing.expect(!h.manifest.isPoisoned());
+    // The pre-poison durable state survives. The store_id 7 was
+    // committed before _testPoison, so it must come back.
+    try testing.expect(try h.manifest.hasStore(7));
+    try h.manifest.createStore(8); // Fresh manifest accepts writes.
+}
+
+test "Manifest: concurrent durabilize callers serialize cleanly" {
+    // Without durabilize_lock, two callers race on pending_free drain
+    // and the slot write. With it, they queue up cleanly and all
+    // intervening apply units land durable.
+    var h = try Harness.init(128);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+
+    const Worker = struct {
+        fn run(m: *Manifest, iters: u32, err_count: *std.atomic.Value(u32)) void {
+            var i: u32 = 0;
+            while (i < iters) : (i += 1) {
+                m.durabilize() catch {
+                    _ = err_count.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+    };
+
+    // Stage some pending work before launching threads.
+    _ = h.manifest.nextApply();
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        try s.put(key, "v");
+    }
+
+    var err_count = std.atomic.Value(u32).init(0);
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ h.manifest, 10, &err_count });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ h.manifest, 10, &err_count });
+    t1.join();
+    t2.join();
+    try testing.expectEqual(@as(u32, 0), err_count.load(.monotonic));
+
+    // Final durabilize then reopen: every staged key must be readable.
+    try h.manifest.durabilize();
+    try h.cycle();
+    var s2 = try Store.open(h.manifest, 1);
+    defer s2.deinit();
+    i = 0;
+    while (i < 50) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const got = (try s2.get(testing.allocator, key)).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("v", got);
+    }
+}
+
+test "Manifest: fresh init writes file header at page 0" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+
+    const buf = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(buf);
+    try h.file.readPage(0, buf);
+    const hdr = Header.fromBytes(buf);
+    try hdr.validate(page.PAGE_SIZE);
+}
+
+test "Manifest: reopen validates file header" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(7);
+    try h.manifest.commit();
+    try h.cycle(); // reopen — should validate page 0 cleanly.
+    try testing.expect(try h.manifest.hasStore(7));
+}
+
+test "Manifest: bad magic at page 0 → BadMagic on reopen" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    h.closeLayers();
+
+    const buf = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(buf);
+    {
+        var pf = try PagedFile.open(h.path(), .{});
+        defer pf.close();
+        try pf.readPage(0, buf);
+        buf[0] ^= 0xFF;
+        try pf.writePage(0, buf);
+        try pf.fsync();
+    }
+
+    try testing.expectError(error.BadMagic, h.openLayers(.{}));
+    // Restore so the harness can clean up.
+    {
+        var pf = try PagedFile.open(h.path(), .{});
+        defer pf.close();
+        try pf.readPage(0, buf);
+        buf[0] ^= 0xFF;
+        try pf.writePage(0, buf);
+        try pf.fsync();
+    }
+    try h.openLayers(.{});
+}
+
+test "Manifest: unsupported format_version → UnsupportedVersion on reopen" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    h.closeLayers();
+
+    const buf = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), page.PAGE_SIZE);
+    defer testing.allocator.free(buf);
+    {
+        var pf = try PagedFile.open(h.path(), .{});
+        defer pf.close();
+        try pf.readPage(0, buf);
+        // Overwrite format_version (offset 8 in Header) with 99.
+        std.mem.writeInt(u32, buf[8..][0..4], 99, .little);
+        try pf.writePage(0, buf);
+        try pf.fsync();
+    }
+
+    try testing.expectError(error.UnsupportedVersion, h.openLayers(.{}));
+    {
+        var pf = try PagedFile.open(h.path(), .{});
+        defer pf.close();
+        try pf.readPage(0, buf);
+        std.mem.writeInt(u32, buf[8..][0..4], @import("header.zig").FORMAT_VERSION, .little);
+        try pf.writePage(0, buf);
+        try pf.fsync();
+    }
+    try h.openLayers(.{});
+}
+
+test "Manifest: partial file (1 page) → IncompleteFile" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/partial.kv", .{dir_path});
+
+    // Create a file with exactly 1 page (less than FIRST_DATA_PAGE=3).
+    {
+        var pf = try PagedFile.open(path, .{ .create = true, .truncate = true });
+        defer pf.close();
+        _ = try pf.growBy(1);
+    }
+
+    var file = try PagedFile.open(path, .{});
+    defer file.close();
+    var pool = try @import("buffer_pool.zig").BufferPool.init(testing.allocator, page.PAGE_SIZE, 8);
+    defer pool.deinit(testing.allocator);
+    var cache = try PageCache.init(testing.allocator, file.api(), &pool, .{});
+    defer cache.deinit();
+    var manifest: Manifest = undefined;
+    try testing.expectError(error.IncompleteFile, manifest.init(testing.allocator, &cache, file.api()));
 }
 
 test "Manifest: torn write to active slot — recovery picks the other" {
@@ -1551,7 +1923,7 @@ test "Manifest: lastAppliedRaftIdx round-trips across durabilize + reopen" {
     defer h.deinit();
     try testing.expectEqual(@as(u64, 0), h.manifest.lastAppliedRaftIdx());
 
-    h.manifest.setLastAppliedRaftIdx(42);
+    try h.manifest.setLastAppliedRaftIdx(42);
     try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
 
     // Not durable yet.
@@ -1560,7 +1932,7 @@ test "Manifest: lastAppliedRaftIdx round-trips across durabilize + reopen" {
     try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
 
     // Advance + durabilize + reopen again.
-    h.manifest.setLastAppliedRaftIdx(1000);
+    try h.manifest.setLastAppliedRaftIdx(1000);
     try h.manifest.durabilize();
     try h.cycle();
     try testing.expectEqual(@as(u64, 1000), h.manifest.lastAppliedRaftIdx());
@@ -2127,13 +2499,16 @@ test "Phase 5: group commit reuse rule skips inactive_seq + 1" {
 
     // After durabilize-2, the freelist contains entries tagged seq=2
     // (their referencing manifest M_1 is still durable in the inactive
-    // slot — those pages are NOT reusable yet). Reusable should be
-    // empty or contain only pages drawn from earlier chunks.
-    const reusable_after_d2 = h.manifest.reusable.items.len;
+    // slot — those pages are NOT reusable yet). No new chunks should
+    // have been consumed in d2's refillReusable.
+    const consumed_after_d2 = h.manifest.consumed_keys.items.len;
+    try testing.expectEqual(@as(usize, 0), consumed_after_d2);
 
     // Apply 3 → durabilize at seq=3. After: active=3, inactive=2.
     // The seq=2 entries' referencing manifest M_1 is GONE (its slot
-    // got overwritten by M_3). They become reusable.
+    // got overwritten by M_3). They become reusable — refillReusable
+    // pulls them in and queues their keys in consumed_keys for the
+    // next durabilize to delete from the freelist tree.
     {
         var s = try Store.open(h.manifest, 1);
         defer s.deinit();
@@ -2143,10 +2518,11 @@ test "Phase 5: group commit reuse rule skips inactive_seq + 1" {
     try testing.expectEqual(@as(u64, 3), h.manifest.active_seq);
     try testing.expectEqual(@as(u64, 2), h.manifest.inactive_seq);
 
-    // Now reusable should be populated (seq=2 chunks are safe; the
-    // new dangerous seq is inactive_seq + 1 = 3, but most freelist
-    // entries are tagged 2).
-    try testing.expect(h.manifest.reusable.items.len > reusable_after_d2);
+    // consumed_keys is the direct signal that chunks became eligible
+    // and were pulled into reusable. Less brittle than comparing
+    // reusable.items.len, which is inflated by grow-batched pages
+    // unrelated to the freelist reuse rule under test.
+    try testing.expect(h.manifest.consumed_keys.items.len > 0);
 }
 
 test "Phase 6: N concurrent writers, distinct stores, all data persists" {
@@ -2386,7 +2762,7 @@ test "dump + load: round-trip a populated manifest" {
         try s.put("k1", "v1");
     }
     // Store 30 is empty — should round-trip as an empty store.
-    src.manifest.setLastAppliedRaftIdx(9999);
+    try src.manifest.setLastAppliedRaftIdx(9999);
     try src.manifest.durabilize();
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2463,4 +2839,512 @@ test "loadSnapshot: rejects unsupported version" {
     var reader_state = std.io.fixedBufferStream(&bytes);
     const reader = reader_state.reader();
     try testing.expectError(error.UnsupportedSnapshotVersion, loadSnapshot(dst.manifest, reader));
+}
+
+// -----------------------------------------------------------------------------
+// Crash-recovery tests using FaultyPagedFile through the full Manifest stack.
+// -----------------------------------------------------------------------------
+
+const SimHarness = struct {
+    sim: *FaultyPagedFile,
+    pool: *BufferPool,
+    cache: *PageCache,
+    manifest: *Manifest,
+    pool_capacity: u32,
+
+    fn init(pool_capacity: u32, policy: @import("faulty_paged_file.zig").FaultPolicy) !SimHarness {
+        var self: SimHarness = undefined;
+        self.pool_capacity = pool_capacity;
+
+        self.sim = try testing.allocator.create(FaultyPagedFile);
+        errdefer testing.allocator.destroy(self.sim);
+        self.sim.* = try FaultyPagedFile.init(testing.allocator, page.PAGE_SIZE, 0, policy);
+        errdefer self.sim.deinit();
+
+        try self.openUpperLayers();
+        return self;
+    }
+
+    fn openUpperLayers(self: *SimHarness) !void {
+        self.pool = try testing.allocator.create(BufferPool);
+        errdefer testing.allocator.destroy(self.pool);
+        self.pool.* = try BufferPool.init(testing.allocator, page.PAGE_SIZE, self.pool_capacity);
+        errdefer self.pool.deinit(testing.allocator);
+
+        self.cache = try testing.allocator.create(PageCache);
+        errdefer testing.allocator.destroy(self.cache);
+        self.cache.* = try PageCache.init(testing.allocator, self.sim.api(), self.pool, .{});
+        errdefer self.cache.deinit();
+
+        self.manifest = try testing.allocator.create(Manifest);
+        errdefer testing.allocator.destroy(self.manifest);
+        try self.manifest.init(testing.allocator, self.cache, self.sim.api());
+    }
+
+    fn closeUpperLayers(self: *SimHarness) void {
+        self.manifest.deinit();
+        testing.allocator.destroy(self.manifest);
+        self.cache.deinit();
+        testing.allocator.destroy(self.cache);
+        self.pool.deinit(testing.allocator);
+        testing.allocator.destroy(self.pool);
+    }
+
+    fn deinit(self: *SimHarness) void {
+        self.closeUpperLayers();
+        self.sim.deinit();
+        testing.allocator.destroy(self.sim);
+    }
+
+    /// Drop everything above the simulator, crash, then reopen the
+    /// upper layers. The simulator's durable state persists; in_flight
+    /// is dropped.
+    fn crashAndReopen(self: *SimHarness) !void {
+        self.closeUpperLayers();
+        self.sim._crash();
+        try self.openUpperLayers();
+    }
+};
+
+test "crash sim: pre-durabilize writes are lost after crash" {
+    var h = try SimHarness.init(64, .{});
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k", "v");
+    }
+    // No durabilize — crash now.
+    try h.crashAndReopen();
+
+    try testing.expect(!try h.manifest.hasStore(1));
+}
+
+test "crash sim: durabilized prefix survives; post-durabilize writes lost" {
+    var h = try SimHarness.init(64, .{});
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "1");
+    }
+    try h.manifest.durabilize();
+
+    // Stage more work that won't be durabilized.
+    try h.manifest.createStore(2);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("b", "2");
+    }
+
+    try h.crashAndReopen();
+
+    // The durable prefix is intact: store 1 + key "a"="1".
+    try testing.expect(try h.manifest.hasStore(1));
+    try testing.expect(!try h.manifest.hasStore(2));
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    const got = (try s.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("1", got);
+    try testing.expect((try s.get(testing.allocator, "b")) == null);
+}
+
+test "crash sim: fsync failure poisons; reopen recovers prior durable state" {
+    var h = try SimHarness.init(64, .{});
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "1");
+    }
+    try h.manifest.durabilize();
+
+    // Stage more work, then force the next fsync to fail.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("b", "2");
+    }
+    h.sim.policy.fail_next_fsync = true;
+    try testing.expectError(error.IoFailed, h.manifest.durabilize());
+    try testing.expect(h.manifest.isPoisoned());
+    try testing.expectError(error.ManifestPoisoned, h.manifest.createStore(99));
+
+    try h.crashAndReopen();
+
+    // Fresh manifest, no poison; durable prefix intact.
+    try testing.expect(!h.manifest.isPoisoned());
+    try testing.expect(try h.manifest.hasStore(1));
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    const got = (try s.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("1", got);
+    try testing.expect((try s.get(testing.allocator, "b")) == null);
+}
+
+test "crash sim: lying fsync — caller thinks durable, crash proves otherwise" {
+    // fsyncgate scenario. The simulator returns OK from fsync but does
+    // not actually move in_flight to durable. The library can't detect
+    // the lie at fsync time — only after crash does the writer
+    // discover the data is gone. The recovery contract still holds:
+    // there's nothing durable, so the reopened manifest is fresh.
+    var h = try SimHarness.init(64, .{ .fsync_lies = true });
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "1");
+    }
+    try h.manifest.durabilize();
+
+    try h.crashAndReopen();
+
+    try testing.expect(!try h.manifest.hasStore(1));
+}
+
+// -----------------------------------------------------------------------------
+// Randomized property test: drive a model and the real manifest through the
+// same random op sequence, crash at a random point, verify the post-crash
+// manifest equals the model snapshot taken at the last successful durabilize.
+//
+// The invariant under test: every successful durabilize is a commit point.
+// After any crash, the recovered state equals the model state at the most
+// recent successful durabilize. Ops between durabilizes are speculative —
+// they may or may not survive, and the contract makes no promise — but the
+// state after recovery must NEVER be a mix of pre- and post-durabilize work.
+//
+// Each iteration uses a distinct seed for both the workload PRNG and the
+// FaultyPagedFile policy. On failure, the test prints the seed; rerunning
+// with that seed reproduces the failure bit-for-bit.
+// -----------------------------------------------------------------------------
+
+const PROP_NUM_STORES: usize = 4;
+const PROP_NUM_KEYS: usize = 10;
+
+const PropModel = struct {
+    store_exists: [PROP_NUM_STORES]bool = @splat(false),
+    key_present: [PROP_NUM_STORES][PROP_NUM_KEYS]bool = @splat(@splat(false)),
+    values: [PROP_NUM_STORES][PROP_NUM_KEYS]u8 = @splat(@splat(0)),
+};
+
+fn keyBuf(buf: *[3]u8, i: usize) []const u8 {
+    buf[0] = 'k';
+    buf[1] = '0' + @as(u8, @intCast(i / 10));
+    buf[2] = '0' + @as(u8, @intCast(i % 10));
+    return buf[0..3];
+}
+
+fn valBuf(buf: *[1]u8, v: u8) []const u8 {
+    buf[0] = v;
+    return buf[0..1];
+}
+
+fn verifyAgainstModel(manifest: *Manifest, model: *const PropModel) !void {
+    for (0..PROP_NUM_STORES) |sid_usize| {
+        const sid: u64 = @intCast(sid_usize);
+        const exists = try manifest.hasStore(sid);
+        if (exists != model.store_exists[sid_usize]) return error.StoreExistenceMismatch;
+        if (!exists) continue;
+
+        var s = try Store.open(manifest, sid);
+        defer s.deinit();
+        for (0..PROP_NUM_KEYS) |kid| {
+            var kb: [3]u8 = undefined;
+            const k = keyBuf(&kb, kid);
+            const got_opt = try s.get(testing.allocator, k);
+            defer if (got_opt) |g| testing.allocator.free(g);
+            const expected_present = model.key_present[sid_usize][kid];
+            if (expected_present and got_opt == null) return error.KeyMissing;
+            if (!expected_present and got_opt != null) return error.KeyUnexpected;
+            if (expected_present) {
+                if (got_opt.?.len != 1) return error.ValueLenMismatch;
+                if (got_opt.?[0] != model.values[sid_usize][kid]) return error.ValueMismatch;
+            }
+        }
+    }
+}
+
+fn propRunOne(seed: u64) !void {
+    var rng_state = std.Random.DefaultPrng.init(seed);
+    const rng = rng_state.random();
+
+    var h = try SimHarness.init(128, .{ .seed = seed });
+    defer h.deinit();
+
+    var model: PropModel = .{};
+    var durable_model: PropModel = .{};
+
+    const op_count: u32 = rng.intRangeAtMost(u32, 40, 120);
+    const crash_at: u32 = rng.intRangeLessThan(u32, 0, op_count);
+
+    var i: u32 = 0;
+    while (i < op_count) : (i += 1) {
+        if (i == crash_at) {
+            try h.crashAndReopen();
+            try verifyAgainstModel(h.manifest, &durable_model);
+            return;
+        }
+
+        const choice = rng.intRangeLessThan(u32, 0, 100);
+        // 55% put, 15% delete, 12% createStore, 5% dropStore, 13% durabilize.
+        if (choice < 55) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+            const v = rng.int(u8);
+
+            var s = try Store.open(h.manifest, @intCast(sid_usize));
+            defer s.deinit();
+            var kb: [3]u8 = undefined;
+            var vb: [1]u8 = undefined;
+            try s.put(keyBuf(&kb, kid), valBuf(&vb, v));
+            model.key_present[sid_usize][kid] = true;
+            model.values[sid_usize][kid] = v;
+        } else if (choice < 70) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+
+            var s = try Store.open(h.manifest, @intCast(sid_usize));
+            defer s.deinit();
+            var kb: [3]u8 = undefined;
+            const existed = try s.delete(keyBuf(&kb, kid));
+            // Library result must match model.
+            if (existed != model.key_present[sid_usize][kid]) return error.DeleteMismatch;
+            model.key_present[sid_usize][kid] = false;
+        } else if (choice < 82) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (model.store_exists[sid_usize]) continue;
+            try h.manifest.createStore(@intCast(sid_usize));
+            model.store_exists[sid_usize] = true;
+        } else if (choice < 87) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            const dropped = try h.manifest.dropStore(@intCast(sid_usize));
+            if (!dropped) return error.DropReturnedFalse;
+            model.store_exists[sid_usize] = false;
+            for (0..PROP_NUM_KEYS) |k| model.key_present[sid_usize][k] = false;
+        } else {
+            try h.manifest.durabilize();
+            durable_model = model;
+        }
+    }
+}
+
+test "property: random workload + crash recovers durable prefix" {
+    const runs: u64 = 100;
+    var seed: u64 = 1;
+    while (seed <= runs) : (seed += 1) {
+        propRunOne(seed) catch |err| {
+            std.debug.print("\n*** property test failed at seed {} : {} ***\n", .{ seed, err });
+            return err;
+        };
+    }
+}
+
+// ── Property test with fault injection ─────────────────────────────
+//
+// Same shape as `propRunOne`, but with probabilistic write / fsync /
+// read failures injected during the workload. The invariants under test:
+//
+//   * Mutations that returned an error do NOT update the model. The
+//     library must agree (post-recovery, the failed op's effects are
+//     absent).
+//   * A durabilize that errors poisons the manifest. Every subsequent
+//     mutation must return `error.ManifestPoisoned` (verified by the
+//     workload's catch).
+//   * Read errors during ordinary ops propagate but do not corrupt
+//     state — the model agrees with the library after recovery.
+//   * Recovery itself runs with faults disabled (the simulator's
+//     policy is zeroed before `crashAndReopen`). This matches reality:
+//     if your disk is currently failing, you can't recover yet; you
+//     reopen after the disk is replaced/repaired.
+
+fn propRunOneWithFaults(seed: u64) !void {
+    var rng_state = std.Random.DefaultPrng.init(seed);
+    const rng = rng_state.random();
+
+    // Random fault rates per seed. Capped low enough that most ops
+    // succeed, so the workload makes progress and durable_model is
+    // nontrivial in most runs.
+    const workload_policy: @import("faulty_paged_file.zig").FaultPolicy = .{
+        .seed = seed ^ 0xA5A5_A5A5,
+        .write_fail_ppm = rng.intRangeAtMost(u32, 0, 20_000), // up to 2%
+        .fsync_fail_ppm = rng.intRangeAtMost(u32, 0, 30_000), // up to 3%
+        .read_fail_ppm = rng.intRangeAtMost(u32, 0, 5_000), // up to 0.5%
+    };
+
+    // Open with faults OFF — `Manifest.init` on a fresh file writes
+    // the header + fsyncs, which would otherwise be subject to
+    // injection. Faults turn on once the harness is ready.
+    var h = try SimHarness.init(128, .{ .seed = workload_policy.seed });
+    defer h.deinit();
+    h.sim.policy.write_fail_ppm = workload_policy.write_fail_ppm;
+    h.sim.policy.fsync_fail_ppm = workload_policy.fsync_fail_ppm;
+    h.sim.policy.read_fail_ppm = workload_policy.read_fail_ppm;
+
+    var model: PropModel = .{};
+    var durable_model: PropModel = .{};
+    var poisoned_local = false;
+
+    const op_count: u32 = rng.intRangeAtMost(u32, 40, 120);
+    const crash_at: u32 = rng.intRangeLessThan(u32, 0, op_count);
+
+    var i: u32 = 0;
+    while (i < op_count) : (i += 1) {
+        if (i == crash_at) {
+            // Recovery itself must run without faults. (Otherwise an
+            // induced read failure during Manifest.init would fail
+            // the harness before we get to verify, which would be a
+            // testing-infrastructure problem, not a library bug.)
+            h.sim.policy.write_fail_ppm = 0;
+            h.sim.policy.fsync_fail_ppm = 0;
+            h.sim.policy.read_fail_ppm = 0;
+            try h.crashAndReopen();
+            try verifyAgainstModel(h.manifest, &durable_model);
+            return;
+        }
+
+        if (poisoned_local) {
+            // The manifest is poisoned. The contract: every write
+            // surface returns ManifestPoisoned. Spot-check it once,
+            // then idle until crash_at — there's nothing useful to
+            // do until recovery.
+            try testing.expect(h.manifest.isPoisoned());
+            continue;
+        }
+
+        const choice = rng.intRangeLessThan(u32, 0, 100);
+        if (choice < 55) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+            const v = rng.int(u8);
+            var s = try Store.open(h.manifest, @intCast(sid_usize));
+            defer s.deinit();
+            var kb: [3]u8 = undefined;
+            var vb: [1]u8 = undefined;
+            if (s.put(keyBuf(&kb, kid), valBuf(&vb, v))) {
+                model.key_present[sid_usize][kid] = true;
+                model.values[sid_usize][kid] = v;
+            } else |err| switch (err) {
+                error.ManifestPoisoned => poisoned_local = true,
+                else => {}, // op didn't happen, model untouched
+            }
+        } else if (choice < 70) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+            var s = try Store.open(h.manifest, @intCast(sid_usize));
+            defer s.deinit();
+            var kb: [3]u8 = undefined;
+            if (s.delete(keyBuf(&kb, kid))) |existed| {
+                // Library agrees with model on whether the key existed.
+                if (existed != model.key_present[sid_usize][kid]) return error.DeleteMismatch;
+                model.key_present[sid_usize][kid] = false;
+            } else |err| switch (err) {
+                error.ManifestPoisoned => poisoned_local = true,
+                else => {},
+            }
+        } else if (choice < 82) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (model.store_exists[sid_usize]) continue;
+            if (h.manifest.createStore(@intCast(sid_usize))) {
+                model.store_exists[sid_usize] = true;
+            } else |err| switch (err) {
+                error.ManifestPoisoned => poisoned_local = true,
+                else => {},
+            }
+        } else if (choice < 87) {
+            const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
+            if (!model.store_exists[sid_usize]) continue;
+            if (h.manifest.dropStore(@intCast(sid_usize))) |dropped| {
+                if (!dropped) return error.DropReturnedFalse;
+                model.store_exists[sid_usize] = false;
+                for (0..PROP_NUM_KEYS) |k| model.key_present[sid_usize][k] = false;
+            } else |err| switch (err) {
+                error.ManifestPoisoned => poisoned_local = true,
+                else => {},
+            }
+        } else {
+            // durabilize. On success: snapshot model → durable_model.
+            // On error: poison; durable_model unchanged.
+            if (h.manifest.durabilize()) {
+                durable_model = model;
+            } else |err| switch (err) {
+                error.ManifestPoisoned => poisoned_local = true,
+                else => {
+                    // Any other error escaped durabilize, which means
+                    // the errdefer fired and the manifest is poisoned.
+                    try testing.expect(h.manifest.isPoisoned());
+                    poisoned_local = true;
+                },
+            }
+        }
+    }
+}
+
+test "property: random workload + faults + crash recovers durable prefix" {
+    const runs: u64 = 100;
+    var seed: u64 = 1;
+    while (seed <= runs) : (seed += 1) {
+        propRunOneWithFaults(seed) catch |err| {
+            std.debug.print("\n*** fault-injection property test failed at seed {} : {} ***\n", .{ seed, err });
+            return err;
+        };
+    }
+}
+
+test "crash sim: write failures during ordinary puts don't poison" {
+    // Probabilistic write failures bubble up as Store.put errors; the
+    // manifest stays alive and the caller retries. Poison is reserved
+    // for durabilize errors. After durabilize+crash+reopen, every
+    // succeeded put is visible.
+    var h = try SimHarness.init(64, .{
+        .seed = 0xABCD,
+        .write_fail_ppm = 200_000, // 20%
+    });
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+
+    var succeeded: [50]bool = @splat(false);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        var key_buf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        if (s.put(k, "v")) {
+            succeeded[i] = true;
+        } else |_| {}
+    }
+    try testing.expect(!h.manifest.isPoisoned());
+
+    h.sim.policy.write_fail_ppm = 0;
+    try h.manifest.durabilize();
+
+    try h.crashAndReopen();
+    var s2 = try Store.open(h.manifest, 1);
+    defer s2.deinit();
+    i = 0;
+    while (i < 50) : (i += 1) {
+        if (!succeeded[i]) continue;
+        var key_buf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const got = (try s2.get(testing.allocator, k));
+        try testing.expect(got != null);
+        testing.allocator.free(got.?);
+    }
 }

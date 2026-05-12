@@ -12,6 +12,20 @@
 //!
 //! Leaf cell:      u16 key_len | u16 val_len | key | val
 //! Internal cell:  u16 key_len | u64 child   | key
+//!
+//! ## Per-page CRC32 (torn-write detection)
+//!
+//! Bytes [CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4) of every B-tree page hold
+//! a CRC32 of the rest of the page. The page cache stamps the CRC just
+//! before writePage (`finalize`) and verifies just after readPage
+//! (`verifyChecksum`). A partial-sector write that leaves the page half
+//! old / half new fails verification at next open, so the manifest's
+//! slot-swap invariant ("only durabilize promotes the slot, only after
+//! all referenced pages are on disk and fsynced") is reinforced against
+//! sub-page tears within referenced data pages.
+//!
+//! The CRC field sits at the same offset (8) in both leaf and internal
+//! headers, so `verifyChecksum` is kind-agnostic.
 
 const std = @import("std");
 
@@ -22,6 +36,12 @@ pub const SLOT_SIZE: u32 = 2;
 pub const MAX_KEY_LEN: u32 = 256;
 pub const MAX_VAL_LEN: u32 = 2048;
 
+/// Offset of the CRC32 field within a B-tree page header. Identical in
+/// LeafHeader and InternalHeader so the verify/finalize helpers can run
+/// without inspecting `kind`.
+pub const CHECKSUM_OFFSET: usize = 8;
+pub const CHECKSUM_SIZE: usize = 4;
+
 pub const Kind = enum(u8) { leaf = 1, internal = 2 };
 
 pub fn pageKind(buf: []const u8) Kind {
@@ -29,30 +49,130 @@ pub fn pageKind(buf: []const u8) Kind {
 }
 
 pub const LeafHeader = extern struct {
-    kind: u8 = @intFromEnum(Kind.leaf),
-    flags: u8 = 0,
-    n_entries: u16 = 0,
-    total_cell_bytes: u16 = 0,
-    _reserved: [HEADER_SIZE - 6]u8 = @splat(0),
+    kind: u8 align(1) = @intFromEnum(Kind.leaf),
+    flags: u8 align(1) = 0,
+    n_entries: u16 align(1) = 0,
+    total_cell_bytes: u16 align(1) = 0,
+    _pad: u16 align(1) = 0,
+    checksum: u32 align(1) = 0,
+    _reserved: [HEADER_SIZE - 12]u8 align(1) = @splat(0),
 
     comptime {
         std.debug.assert(@sizeOf(@This()) == HEADER_SIZE);
+        std.debug.assert(@offsetOf(@This(), "checksum") == CHECKSUM_OFFSET);
     }
 };
 
 pub const InternalHeader = extern struct {
-    kind: u8 = @intFromEnum(Kind.internal),
-    flags: u8 = 0,
-    n_entries: u16 = 0,
-    total_cell_bytes: u16 = 0,
-    _pad: u16 = 0,
-    rightmost_child: u64 = 0,
-    _reserved: [HEADER_SIZE - 16]u8 = @splat(0),
+    kind: u8 align(1) = @intFromEnum(Kind.internal),
+    flags: u8 align(1) = 0,
+    n_entries: u16 align(1) = 0,
+    total_cell_bytes: u16 align(1) = 0,
+    _pad: u16 align(1) = 0,
+    checksum: u32 align(1) = 0,
+    rightmost_child: u64 align(1) = 0,
+    _reserved: [HEADER_SIZE - 20]u8 align(1) = @splat(0),
 
     comptime {
         std.debug.assert(@sizeOf(@This()) == HEADER_SIZE);
+        std.debug.assert(@offsetOf(@This(), "checksum") == CHECKSUM_OFFSET);
+        std.debug.assert(@offsetOf(@This(), "rightmost_child") == 12);
     }
 };
+
+/// CRC32 of everything except the 4-byte checksum field. Computed
+/// incrementally so it never mutates `buf`.
+pub fn computeChecksum(buf: []const u8) u32 {
+    std.debug.assert(buf.len == PAGE_SIZE);
+    var h = std.hash.Crc32.init();
+    h.update(buf[0..CHECKSUM_OFFSET]);
+    h.update(buf[CHECKSUM_OFFSET + CHECKSUM_SIZE ..]);
+    return h.final();
+}
+
+/// Stamp the page's CRC field. Call just before writing the page to
+/// disk; safe to call repeatedly (idempotent on stable content).
+pub fn finalize(buf: []u8) void {
+    const crc = computeChecksum(buf);
+    std.mem.writeInt(u32, buf[CHECKSUM_OFFSET..][0..4], crc, .little);
+}
+
+/// True iff the CRC field matches the page contents. Pure function —
+/// does not mutate `buf`.
+pub fn verifyChecksum(buf: []const u8) bool {
+    const stored = std.mem.readInt(u32, buf[CHECKSUM_OFFSET..][0..4], .little);
+    return stored == computeChecksum(buf);
+}
+
+/// Structural validation of a B-tree page. Defense in depth: even if a
+/// page passes CRC32 (because a bit-flip happened in memory and the
+/// next writeback stamped a matching CRC), the parser must not be
+/// indexed off corrupt offsets. `verify` returns false on any of:
+///
+///   * Unknown `kind` byte.
+///   * `n_entries` so large that the slot array runs past PAGE_SIZE.
+///   * Any slot pointing inside the slot array (`offset < slot_area_end`)
+///     or past PAGE_SIZE.
+///   * Any cell extending past PAGE_SIZE.
+///   * Any key_len > MAX_KEY_LEN, val_len > MAX_VAL_LEN.
+///   * `total_cell_bytes` not matching the sum of decoded cell sizes.
+///
+/// Pages that fail this check should be treated as corrupt; the cache
+/// surfaces `error.PageStructureInvalid` on a failed verify.
+pub fn verifyStructure(buf: []const u8) bool {
+    std.debug.assert(buf.len == PAGE_SIZE);
+    if (buf[0] == @intFromEnum(Kind.leaf)) return verifyLeafStructure(buf);
+    if (buf[0] == @intFromEnum(Kind.internal)) return verifyInternalStructure(buf);
+    return false;
+}
+
+fn verifyLeafStructure(buf: []const u8) bool {
+    const h: *const LeafHeader = @ptrCast(@alignCast(buf.ptr));
+    const n_entries: usize = h.n_entries;
+    const total_cell_bytes: usize = h.total_cell_bytes;
+    const slot_area_end: usize = HEADER_SIZE + n_entries * SLOT_SIZE;
+    if (slot_area_end > PAGE_SIZE) return false;
+    if (total_cell_bytes > PAGE_SIZE - slot_area_end) return false;
+
+    var sum: usize = 0;
+    var i: usize = 0;
+    while (i < n_entries) : (i += 1) {
+        const off: usize = std.mem.readInt(u16, buf[HEADER_SIZE + i * SLOT_SIZE ..][0..2], .little);
+        if (off < slot_area_end) return false;
+        if (off + 4 > PAGE_SIZE) return false;
+        const key_len: usize = std.mem.readInt(u16, buf[off..][0..2], .little);
+        const val_len: usize = std.mem.readInt(u16, buf[off + 2 ..][0..2], .little);
+        if (key_len > MAX_KEY_LEN) return false;
+        if (val_len > MAX_VAL_LEN) return false;
+        const cell_size = 4 + key_len + val_len;
+        if (off + cell_size > PAGE_SIZE) return false;
+        sum += cell_size;
+    }
+    return sum == total_cell_bytes;
+}
+
+fn verifyInternalStructure(buf: []const u8) bool {
+    const h: *const InternalHeader = @ptrCast(@alignCast(buf.ptr));
+    const n_entries: usize = h.n_entries;
+    const total_cell_bytes: usize = h.total_cell_bytes;
+    const slot_area_end: usize = HEADER_SIZE + n_entries * SLOT_SIZE;
+    if (slot_area_end > PAGE_SIZE) return false;
+    if (total_cell_bytes > PAGE_SIZE - slot_area_end) return false;
+
+    var sum: usize = 0;
+    var i: usize = 0;
+    while (i < n_entries) : (i += 1) {
+        const off: usize = std.mem.readInt(u16, buf[HEADER_SIZE + i * SLOT_SIZE ..][0..2], .little);
+        if (off < slot_area_end) return false;
+        if (off + 10 > PAGE_SIZE) return false;
+        const key_len: usize = std.mem.readInt(u16, buf[off..][0..2], .little);
+        if (key_len > MAX_KEY_LEN) return false;
+        const cell_size = 10 + key_len;
+        if (off + cell_size > PAGE_SIZE) return false;
+        sum += cell_size;
+    }
+    return sum == total_cell_bytes;
+}
 
 pub fn leafCellSize(key_len: usize, val_len: usize) usize {
     return 4 + key_len + val_len;
@@ -353,4 +473,86 @@ test "pageKind reads kind from header byte 0" {
     var int_buf: [PAGE_SIZE]u8 align(4096) = undefined;
     _ = Internal.init(&int_buf, 7);
     try testing.expectEqual(Kind.internal, pageKind(&int_buf));
+}
+
+test "verifyStructure: empty leaf passes" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    @memset(&buf, 0xCD);
+    _ = Leaf.init(&buf);
+    try testing.expect(verifyStructure(&buf));
+}
+
+test "verifyStructure: populated leaf passes" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var l = Leaf.init(&buf);
+    _ = l.appendCell("alpha", "A");
+    _ = l.appendCell("beta", "BB");
+    _ = l.appendCell("gamma", "CCC");
+    try testing.expect(verifyStructure(&buf));
+}
+
+test "verifyStructure: empty internal passes" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    @memset(&buf, 0xCD);
+    _ = Internal.init(&buf, 42);
+    try testing.expect(verifyStructure(&buf));
+}
+
+test "verifyStructure: populated internal passes" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var n = Internal.init(&buf, 300);
+    _ = n.appendCell("m", 100);
+    _ = n.appendCell("s", 200);
+    try testing.expect(verifyStructure(&buf));
+}
+
+test "verifyStructure: unknown kind byte rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = [_]u8{0} ** PAGE_SIZE;
+    buf[0] = 99;
+    try testing.expect(!verifyStructure(&buf));
+}
+
+test "verifyStructure: oversized n_entries rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    _ = Leaf.init(&buf);
+    const h: *LeafHeader = @ptrCast(@alignCast(&buf));
+    h.n_entries = (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE + 1; // slot array overflows
+    try testing.expect(!verifyStructure(&buf));
+}
+
+test "verifyStructure: slot pointing into slot area rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var l = Leaf.init(&buf);
+    _ = l.appendCell("k", "v");
+    // Overwrite the slot offset to point inside the slot array.
+    std.mem.writeInt(u16, buf[HEADER_SIZE..][0..2], HEADER_SIZE, .little);
+    try testing.expect(!verifyStructure(&buf));
+}
+
+test "verifyStructure: cell running past PAGE_SIZE rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var l = Leaf.init(&buf);
+    _ = l.appendCell("k", "v");
+    // Forge a key_len that would push the cell past the end.
+    const off = std.mem.readInt(u16, buf[HEADER_SIZE..][0..2], .little);
+    std.mem.writeInt(u16, buf[off..][0..2], @intCast(PAGE_SIZE), .little);
+    try testing.expect(!verifyStructure(&buf));
+}
+
+test "verifyStructure: total_cell_bytes mismatch rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var l = Leaf.init(&buf);
+    _ = l.appendCell("k", "v");
+    const h: *LeafHeader = @ptrCast(@alignCast(&buf));
+    h.total_cell_bytes += 1;
+    try testing.expect(!verifyStructure(&buf));
+}
+
+test "verifyStructure: key_len > MAX_KEY_LEN rejected" {
+    var buf: [PAGE_SIZE]u8 align(4096) = undefined;
+    var l = Leaf.init(&buf);
+    _ = l.appendCell("k", "v");
+    const off = std.mem.readInt(u16, buf[HEADER_SIZE..][0..2], .little);
+    std.mem.writeInt(u16, buf[off..][0..2], MAX_KEY_LEN + 1, .little);
+    try testing.expect(!verifyStructure(&buf));
 }

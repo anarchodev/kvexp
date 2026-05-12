@@ -14,7 +14,7 @@
 //! — alloc grows the file, free is a no-op (pages leak).
 
 const std = @import("std");
-const PagedFile = @import("paged_file.zig").PagedFile;
+const PagedFileApi = @import("paged_file.zig").PagedFileApi;
 
 pub const PageAllocator = struct {
     ctx: *anyopaque,
@@ -35,7 +35,7 @@ pub const PageAllocator = struct {
 };
 
 pub const GrowOnlyAllocator = struct {
-    file: *PagedFile,
+    file: PagedFileApi,
 
     pub fn pageAllocator(self: *GrowOnlyAllocator) PageAllocator {
         return .{ .ctx = self, .vtable = &vtable };

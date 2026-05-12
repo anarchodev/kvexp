@@ -32,10 +32,15 @@
 //! and return the buffer to the caller.
 
 const std = @import("std");
-const PagedFile = @import("paged_file.zig").PagedFile;
+const paged_file = @import("paged_file.zig");
+const PagedFile = paged_file.PagedFile;
+const PagedFileApi = paged_file.PagedFileApi;
+const PageWrite = paged_file.PageWrite;
+const FileIoError = paged_file.IoError;
 const bp = @import("buffer_pool.zig");
 const BufferPool = bp.BufferPool;
 const BufferIndex = bp.BufferIndex;
+const page = @import("page.zig");
 
 pub const PageRef = struct {
     cache: *PageCache,
@@ -116,7 +121,7 @@ const Shard = struct {
 
 pub const PageCache = struct {
     allocator: std.mem.Allocator,
-    file: *PagedFile,
+    file: PagedFileApi,
     pool: *BufferPool,
     shards: []Shard,
 
@@ -128,7 +133,7 @@ pub const PageCache = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        file: *PagedFile,
+        file: PagedFileApi,
         pool: *BufferPool,
         options: Options,
     ) !PageCache {
@@ -206,7 +211,7 @@ pub const PageCache = struct {
         return &self.shards[page_no % self.shards.len];
     }
 
-    pub const PinError = error{ AllPagesPinned, OutOfMemory } || PagedFile.IoError;
+    pub const PinError = error{ AllPagesPinned, OutOfMemory, PageChecksumMismatch, PageStructureInvalid } || FileIoError;
 
     /// Pin a page in cache. On miss, reads from disk first. Caller
     /// must `.release()` the returned ref when done.
@@ -229,7 +234,15 @@ pub const PageCache = struct {
         // Miss path: assign a buffer (may evict, releasing lock during
         // dirty writeback), read content, install.
         const buffer_idx = try self.assignBuffer(shard);
+        errdefer self.returnFreshBuffer(shard, buffer_idx);
         try self.file.readPage(page_no, self.pool.buf(buffer_idx));
+        if (!page.verifyChecksum(self.pool.buf(buffer_idx))) return error.PageChecksumMismatch;
+        // Belt-and-suspenders after CRC: a bit-flip that happened
+        // *in memory* between the previous read and the writeback
+        // would stamp a matching CRC for the corrupt content. The
+        // structural check refuses any page whose slots/cells don't
+        // fit inside PAGE_SIZE, so we never index off garbage.
+        if (!page.verifyStructure(self.pool.buf(buffer_idx))) return error.PageStructureInvalid;
 
         shard.lock.lock();
         defer shard.lock.unlock();
@@ -368,7 +381,7 @@ pub const PageCache = struct {
         shard.lock.lock();
         defer shard.lock.unlock();
 
-        var writes: std.ArrayListUnmanaged(PagedFile.PageWrite) = .empty;
+        var writes: std.ArrayListUnmanaged(PageWrite) = .empty;
         defer writes.deinit(self.allocator);
         var to_clean: std.ArrayListUnmanaged(BufferIndex) = .empty;
         defer to_clean.deinit(self.allocator);
@@ -388,9 +401,16 @@ pub const PageCache = struct {
                     continue;
                 }
             }
+            // Stamp the CRC32 into the buffer just before we hand it to
+            // the I/O layer. Safe under shard.lock — no other thread is
+            // mutating this buffer (pin_count==0 implies no writers, and
+            // the only other reader holding the buffer via PageRef would
+            // not be racing with us under shard.lock).
+            const buf_slice = self.pool.buf(global_idx);
+            page.finalize(buf_slice);
             try writes.append(self.allocator, .{
                 .page_no = s.page_no,
-                .buf = self.pool.buf(global_idx),
+                .buf = buf_slice,
             });
             try to_clean.append(self.allocator, global_idx);
         }
@@ -436,6 +456,17 @@ pub const PageCache = struct {
         return try self.evictForReuse(shard);
     }
 
+    /// Return a buffer that `assignBuffer` produced but the caller
+    /// couldn't install (e.g., readPage failed or CRC verify failed).
+    /// The slot is left in the `.empty` state assignBuffer leaves it in;
+    /// only `free_globals` needs the index back.
+    fn returnFreshBuffer(self: *PageCache, shard: *Shard, buffer_idx: BufferIndex) void {
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        shard.free_globals.append(self.allocator, buffer_idx) catch
+            @panic("free_globals append failed (capacity reserved at init — bug)");
+    }
+
     /// Find a victim and produce a free buffer index. If the victim is
     /// dirty, the writeback runs **without holding the shard lock** —
     /// the slot's `.evicting` state pins the buffer for our use and
@@ -477,7 +508,12 @@ pub const PageCache = struct {
         }
 
         const wb = pending_wb.?;
-        try self.file.writePage(wb.page_no, self.pool.buf(wb.buffer_idx));
+        // Stamp CRC just before writeback. The buffer is locked by the
+        // `.evicting` slot state — no concurrent reader/writer can touch
+        // it until we transition back to `.empty` below.
+        const wb_buf = self.pool.buf(wb.buffer_idx);
+        page.finalize(wb_buf);
+        try self.file.writePage(wb.page_no, wb_buf);
 
         shard.lock.lock();
         defer shard.lock.unlock();
@@ -493,6 +529,24 @@ pub const PageCache = struct {
 // -----------------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Cache tests now exercise the structural-verify path (failures
+/// surface as `error.PageStructureInvalid` at `pin` time). Tests
+/// therefore initialize a real empty Leaf at the top of every buffer
+/// they round-trip, then fill the cell area with a sentinel byte for
+/// equality checks. `initLeafFilled` stamps an empty-but-valid Leaf
+/// header and overwrites the body; `expectBodyFilled` verifies the
+/// header is intact and every byte after it is the fill (the body
+/// includes the cell area but not the page header).
+fn initLeafFilled(buf: []u8, fill: u8) void {
+    _ = page.Leaf.init(buf);
+    @memset(buf[page.HEADER_SIZE..], fill);
+}
+
+fn expectBodyFilled(buf: []const u8, fill: u8) !void {
+    try testing.expectEqual(@as(u8, @intFromEnum(page.Kind.leaf)), buf[0]);
+    for (buf[page.HEADER_SIZE..]) |b| try testing.expectEqual(fill, b);
+}
 
 const Harness = struct {
     tmp: std.testing.TmpDir,
@@ -524,7 +578,7 @@ const Harness = struct {
         pool_ptr.* = try BufferPool.init(testing.allocator, 4096, pool_capacity);
         errdefer pool_ptr.deinit(testing.allocator);
 
-        const cache = try PageCache.init(testing.allocator, file_ptr, pool_ptr, .{ .shard_count = shard_count });
+        const cache = try PageCache.init(testing.allocator, file_ptr.api(), pool_ptr, .{ .shard_count = shard_count });
 
         return .{
             .tmp = tmp,
@@ -552,7 +606,7 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
         const ref = try h.cache.pinNew(3);
         defer ref.release();
         for (ref.buf()) |b| try testing.expectEqual(@as(u8, 0), b);
-        @memset(ref.buf(), 0x77);
+        initLeafFilled(ref.buf(), 0x77);
         ref.markDirty(10);
     }
 
@@ -561,15 +615,19 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
 
     {
         const a = try h.cache.pinNew(4);
+        initLeafFilled(a.buf(), 0);
         a.markDirty(11);
         defer a.release();
         const b = try h.cache.pinNew(5);
+        initLeafFilled(b.buf(), 0);
         b.markDirty(11);
         defer b.release();
         const c = try h.cache.pinNew(6);
+        initLeafFilled(c.buf(), 0);
         c.markDirty(11);
         defer c.release();
         const d = try h.cache.pinNew(7);
+        initLeafFilled(d.buf(), 0);
         d.markDirty(11);
         defer d.release();
     }
@@ -577,7 +635,7 @@ test "PageCache: pinNew gives zeroed buffer, persists after flush + reread" {
 
     const reread = try h.cache.pin(3);
     defer reread.release();
-    for (reread.buf()) |b| try testing.expectEqual(@as(u8, 0x77), b);
+    try expectBodyFilled(reread.buf(), 0x77);
 }
 
 test "PageCache: hit returns same buffer; release allows eviction" {
@@ -600,10 +658,10 @@ test "PageCache: pinned page cannot be evicted" {
     defer h.deinit();
 
     const a = try h.cache.pinNew(0);
-    @memset(a.buf(), 0x11);
+    initLeafFilled(a.buf(), 0x11);
     a.markDirty(1);
     const b = try h.cache.pinNew(1);
-    @memset(b.buf(), 0x22);
+    initLeafFilled(b.buf(), 0x22);
     b.markDirty(1);
 
     try testing.expectError(error.AllPagesPinned, h.cache.pin(2));
@@ -613,14 +671,14 @@ test "PageCache: pinned page cannot be evicted" {
 
     const c = try h.cache.pinNew(2);
     defer c.release();
-    @memset(c.buf(), 0x33);
+    initLeafFilled(c.buf(), 0x33);
     c.markDirty(1);
 
     try h.cache.flushUpTo(1);
 
     const a_check = try h.cache.pin(0);
     defer a_check.release();
-    for (a_check.buf()) |byte| try testing.expectEqual(@as(u8, 0x11), byte);
+    try expectBodyFilled(a_check.buf(), 0x11);
 }
 
 test "PageCache: flushUpTo is selective by seq" {
@@ -673,19 +731,151 @@ test "PageCache: dirty page is written back on eviction" {
 
     {
         const a = try h.cache.pinNew(0);
-        @memset(a.buf(), 0xCC);
+        initLeafFilled(a.buf(), 0xCC);
         a.markDirty(1);
         a.release();
     }
 
     {
         const b = try h.cache.pinNew(1);
+        initLeafFilled(b.buf(), 0);
         b.release();
     }
 
     const re = try h.cache.pin(0);
     defer re.release();
-    for (re.buf()) |byte| try testing.expectEqual(@as(u8, 0xCC), byte);
+    try expectBodyFilled(re.buf(), 0xCC);
+}
+
+test "PageCache: clean reread after flush verifies CRC and round-trips" {
+    // Cache capacity 1: pinning a different page evicts the first, so
+    // the next pin of page 0 forces a disk read + checksum verify.
+    var h = try Harness.init(1, 4);
+    defer h.deinit();
+
+    {
+        const a = try h.cache.pinNew(0);
+        initLeafFilled(a.buf(), 0xCC);
+        a.markDirty(1);
+        a.release();
+    }
+    try h.cache.flushUpTo(1);
+    try h.file.fsync();
+
+    // Evict page 0 from the cache by pinning another page.
+    {
+        const b = try h.cache.pinNew(1);
+        initLeafFilled(b.buf(), 0);
+        b.release();
+    }
+
+    const re = try h.cache.pin(0);
+    defer re.release();
+    try expectBodyFilled(re.buf(), 0xCC);
+}
+
+test "PageCache: corrupt page on disk → PageChecksumMismatch on pin" {
+    var h = try Harness.init(1, 4);
+    defer h.deinit();
+
+    // Write a valid page through the cache.
+    {
+        const a = try h.cache.pinNew(0);
+        initLeafFilled(a.buf(), 0xCC);
+        a.markDirty(1);
+        a.release();
+    }
+    try h.cache.flushUpTo(1);
+    try h.file.fsync();
+
+    // Evict page 0 (capacity 1) so the next pin re-reads from disk.
+    {
+        const b = try h.cache.pinNew(1);
+        initLeafFilled(b.buf(), 0);
+        b.release();
+    }
+
+    // Tamper with a byte well outside the checksum field.
+    {
+        const scratch = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+        defer testing.allocator.free(scratch);
+        try h.file.readPage(0, scratch);
+        scratch[2048] ^= 0xFF;
+        try h.file.writePage(0, scratch);
+        try h.file.fsync();
+    }
+
+    try testing.expectError(error.PageChecksumMismatch, h.cache.pin(0));
+}
+
+test "PageCache: corrupt byte INSIDE checksum field also rejected" {
+    var h = try Harness.init(1, 4);
+    defer h.deinit();
+
+    {
+        const a = try h.cache.pinNew(0);
+        initLeafFilled(a.buf(), 0xAB);
+        a.markDirty(1);
+        a.release();
+    }
+    try h.cache.flushUpTo(1);
+    try h.file.fsync();
+
+    // Evict, then corrupt one byte of the CRC itself.
+    {
+        const b = try h.cache.pinNew(1);
+        initLeafFilled(b.buf(), 0);
+        b.release();
+    }
+    {
+        const scratch = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+        defer testing.allocator.free(scratch);
+        try h.file.readPage(0, scratch);
+        scratch[page.CHECKSUM_OFFSET] ^= 0x01;
+        try h.file.writePage(0, scratch);
+        try h.file.fsync();
+    }
+
+    try testing.expectError(error.PageChecksumMismatch, h.cache.pin(0));
+}
+
+test "PageCache: structurally-invalid page rejected (CRC OK)" {
+    // CRC-but-not-structure attack: forge a page whose header claims
+    // n_entries=999 (way past the slot array's capacity), then
+    // recompute the CRC so verifyChecksum passes. verifyStructure
+    // must still refuse, returning PageStructureInvalid.
+    var h = try Harness.init(1, 4);
+    defer h.deinit();
+
+    {
+        const a = try h.cache.pinNew(0);
+        initLeafFilled(a.buf(), 0x00);
+        a.markDirty(1);
+        a.release();
+    }
+    try h.cache.flushUpTo(1);
+    try h.file.fsync();
+
+    {
+        const b = try h.cache.pinNew(1);
+        initLeafFilled(b.buf(), 0);
+        b.release();
+    }
+
+    const scratch = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+    defer testing.allocator.free(scratch);
+    try h.file.readPage(0, scratch);
+    // Forge: claim 999 entries (impossible — slot array alone would
+    // be 1998 bytes, plus 32 header = 2030, leaving 2066 for cells
+    // but each cell needs offsets that the verifier will reject).
+    const h_ptr: *page.LeafHeader = @ptrCast(@alignCast(scratch.ptr));
+    h_ptr.n_entries = 999;
+    // Re-stamp CRC over the forged content so verifyChecksum passes.
+    page.finalize(scratch);
+    try h.file.writePage(0, scratch);
+    try h.file.fsync();
+
+    try testing.expectError(error.PageStructureInvalid, h.cache.pin(0));
 }
 
 test "PageCache: auto-shard count scales with pool capacity" {

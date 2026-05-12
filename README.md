@@ -200,7 +200,7 @@ fn applyWriteSet(manifest: *kvexp.Manifest, writeset: WriteSet) !void {
 
 // On raft snapshot (rare — every N commits or T seconds):
 fn checkpoint(manifest: *kvexp.Manifest, apply_idx: u64) !void {
-    manifest.setLastAppliedRaftIdx(apply_idx);
+    try manifest.setLastAppliedRaftIdx(apply_idx);
     try manifest.durabilize();
     // raft.compactLog() can now trim entries up to apply_idx.
 }
@@ -331,7 +331,7 @@ try store.put(k, v);                            // ...mutate...
 try manifest.durabilize();                     // checkpoint to disk
 
 // Raft watermark.
-manifest.setLastAppliedRaftIdx(idx);
+try manifest.setLastAppliedRaftIdx(idx);
 const idx = manifest.lastAppliedRaftIdx();
 
 // Snapshots.

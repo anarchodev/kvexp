@@ -20,7 +20,9 @@
 
 const std = @import("std");
 const page = @import("page.zig");
-const PagedFile = @import("paged_file.zig").PagedFile;
+const paged_file_mod = @import("paged_file.zig");
+const PagedFile = paged_file_mod.PagedFile;
+const PagedFileApi = paged_file_mod.PagedFileApi;
 const PageCache = @import("page_cache.zig").PageCache;
 const page_allocator_mod = @import("page_allocator.zig");
 
@@ -85,7 +87,7 @@ const PathEntry = struct {
 
 pub const Tree = struct {
     cache: *PageCache,
-    file: *PagedFile,
+    file: PagedFileApi,
     allocator: std.mem.Allocator,
     page_allocator: PageAllocator,
     root: u64,
@@ -98,7 +100,7 @@ pub const Tree = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cache: *PageCache,
-        file: *PagedFile,
+        file: PagedFileApi,
         page_alloc: PageAllocator,
     ) !Tree {
         if (file.pageCount() == 0) {
@@ -941,13 +943,13 @@ const Harness = struct {
 
         const cache = try testing.allocator.create(PageCache);
         errdefer testing.allocator.destroy(cache);
-        cache.* = try PageCache.init(testing.allocator, file, pool, .{});
+        cache.* = try PageCache.init(testing.allocator, file.api(), pool, .{});
 
         const grow = try testing.allocator.create(GrowOnlyAllocator);
         errdefer testing.allocator.destroy(grow);
-        grow.* = .{ .file = file };
+        grow.* = .{ .file = file.api() };
 
-        const tree = try Tree.init(testing.allocator, cache, file, grow.pageAllocator());
+        const tree = try Tree.init(testing.allocator, cache, file.api(), grow.pageAllocator());
         return .{
             .tmp = tmp,
             .file = file,

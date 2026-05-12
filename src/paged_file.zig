@@ -14,6 +14,65 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 
+/// Unified error set across every PagedFile backend (real + simulated).
+/// Narrower implementations (e.g., `PagedFile` proper, which never
+/// allocates) auto-widen into this via Zig's error-set inference.
+pub const IoError = error{
+    ShortRead,
+    ShortWrite,
+    SubmitFailed,
+    IoFailed,
+    OutOfBounds,
+    MisalignedBuffer,
+    OutOfMemory,
+};
+
+/// Module-level so every backend speaks the same struct shape.
+pub const PageWrite = struct { page_no: u64, buf: []const u8 };
+
+/// Backend-agnostic file handle. `PageCache`, `Tree`, and `Manifest`
+/// hold this by value (two pointers — cheap to copy). `PagedFile.api()`
+/// returns one bound to a real io_uring + O_DIRECT backend;
+/// `FaultyPagedFile.api()` returns one bound to the in-memory
+/// simulator. Tests construct either and hand the api to the manifest
+/// layer; everything above the file boundary is unchanged.
+pub const PagedFileApi = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        readPageFn: *const fn (ptr: *anyopaque, page_no: u64, buf: []u8) IoError!void,
+        writePageFn: *const fn (ptr: *anyopaque, page_no: u64, buf: []const u8) IoError!void,
+        writePagesFn: *const fn (ptr: *anyopaque, writes: []const PageWrite) IoError!void,
+        fsyncFn: *const fn (ptr: *anyopaque) IoError!void,
+        fdatasyncFn: *const fn (ptr: *anyopaque) IoError!void,
+        growByFn: *const fn (ptr: *anyopaque, n: u64) anyerror!u64,
+        pageCountFn: *const fn (ptr: *anyopaque) u64,
+    };
+
+    pub fn readPage(self: PagedFileApi, page_no: u64, buf: []u8) IoError!void {
+        return self.vtable.readPageFn(self.ptr, page_no, buf);
+    }
+    pub fn writePage(self: PagedFileApi, page_no: u64, buf: []const u8) IoError!void {
+        return self.vtable.writePageFn(self.ptr, page_no, buf);
+    }
+    pub fn writePages(self: PagedFileApi, writes: []const PageWrite) IoError!void {
+        return self.vtable.writePagesFn(self.ptr, writes);
+    }
+    pub fn fsync(self: PagedFileApi) IoError!void {
+        return self.vtable.fsyncFn(self.ptr);
+    }
+    pub fn fdatasync(self: PagedFileApi) IoError!void {
+        return self.vtable.fdatasyncFn(self.ptr);
+    }
+    pub fn growBy(self: PagedFileApi, n: u64) anyerror!u64 {
+        return self.vtable.growByFn(self.ptr, n);
+    }
+    pub fn pageCount(self: PagedFileApi) u64 {
+        return self.vtable.pageCountFn(self.ptr);
+    }
+};
+
 pub const PagedFile = struct {
     fd: posix.fd_t,
     ring: linux.IoUring,
@@ -82,22 +141,23 @@ pub const PagedFile = struct {
     /// Extend the file by `n` pages. Returns the first new page number.
     /// New pages are sparse — reads from them return zeros until
     /// written.
+    ///
+    /// Takes `io_lock` to serialize concurrent growBy + I/O. Without
+    /// this, two workers calling growBy on the same file would race
+    /// on `page_count` and on the ftruncate syscall, losing one of the
+    /// grows. The lock is held for the duration of ftruncate (a
+    /// microsecond syscall), which is acceptable because the manifest's
+    /// allocator batches grows (32 pages per call) so this path is
+    /// hit ~1/32 as often as raw single-page allocs would.
     pub fn growBy(self: *PagedFile, n: u64) !u64 {
+        self.io_lock.lock();
+        defer self.io_lock.unlock();
         const first = self.page_count;
         const new_count = first + n;
         try posix.ftruncate(self.fd, new_count * self.page_size);
         self.page_count = new_count;
         return first;
     }
-
-    pub const IoError = error{
-        ShortRead,
-        ShortWrite,
-        SubmitFailed,
-        IoFailed,
-        OutOfBounds,
-        MisalignedBuffer,
-    };
 
     pub fn readPage(self: *PagedFile, page_no: u64, buf: []u8) IoError!void {
         try self.checkBuf(page_no, buf);
@@ -125,8 +185,6 @@ pub const PagedFile = struct {
         if (@as(u32, @intCast(cqe.res)) != self.page_size) return error.ShortWrite;
         self.pages_written += 1;
     }
-
-    pub const PageWrite = struct { page_no: u64, buf: []const u8 };
 
     /// Batched writes — submit in chunks sized to fit the ring, waiting
     /// for each chunk's completions before submitting the next. This is
@@ -164,10 +222,32 @@ pub const PagedFile = struct {
         }
     }
 
+    /// Full metadata sync. Use after operations that changed file
+    /// attributes other than size (currently: none — kvexp doesn't
+    /// touch ctime/atime/permissions). `fdatasync` is sufficient for
+    /// every kvexp call site today; `fsync` is retained for completeness
+    /// and for the very first commit on a fresh file (where the header
+    /// write is the only on-disk state and we want belt-and-suspenders
+    /// full metadata persistence).
     pub fn fsync(self: *PagedFile) IoError!void {
+        return self.syncInternal(0);
+    }
+
+    /// Data-only sync — also flushes any metadata required to make the
+    /// data readable (file size, allocation maps). Strictly faster than
+    /// fsync because access-time / permission updates are skipped. The
+    /// Linux man page guarantees fdatasync still propagates a size
+    /// increase needed to read newly-allocated pages, so this is the
+    /// correct primitive for durabilize's two sync points (post data
+    /// flush, post slot write).
+    pub fn fdatasync(self: *PagedFile) IoError!void {
+        return self.syncInternal(linux.IORING_FSYNC_DATASYNC);
+    }
+
+    fn syncInternal(self: *PagedFile, flags: u32) IoError!void {
         self.io_lock.lock();
         defer self.io_lock.unlock();
-        _ = self.ring.fsync(0, self.fd, 0) catch return error.SubmitFailed;
+        _ = self.ring.fsync(0, self.fd, flags) catch return error.SubmitFailed;
         _ = self.ring.submit_and_wait(1) catch return error.SubmitFailed;
         const cqe = self.ring.copy_cqe() catch return error.SubmitFailed;
         if (cqe.res < 0) return error.IoFailed;
@@ -183,6 +263,53 @@ pub const PagedFile = struct {
         if (page_no >= self.page_count) return error.OutOfBounds;
         if (buf.len < self.page_size) return error.MisalignedBuffer;
         if (!std.mem.isAligned(@intFromPtr(buf.ptr), self.page_size)) return error.MisalignedBuffer;
+    }
+
+    /// Wrap this concrete `PagedFile` in the backend-agnostic
+    /// `PagedFileApi` for handoff to `PageCache` / `Manifest`. Cheap
+    /// (two pointers); the caller still owns the PagedFile and is
+    /// responsible for its lifecycle.
+    pub fn api(self: *PagedFile) PagedFileApi {
+        return .{ .ptr = self, .vtable = &api_vtable };
+    }
+
+    const api_vtable: PagedFileApi.VTable = .{
+        .readPageFn = apiReadPage,
+        .writePageFn = apiWritePage,
+        .writePagesFn = apiWritePages,
+        .fsyncFn = apiFsync,
+        .fdatasyncFn = apiFdatasync,
+        .growByFn = apiGrowBy,
+        .pageCountFn = apiPageCount,
+    };
+
+    fn apiReadPage(ptr: *anyopaque, page_no: u64, buf: []u8) IoError!void {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.readPage(page_no, buf);
+    }
+    fn apiWritePage(ptr: *anyopaque, page_no: u64, buf: []const u8) IoError!void {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.writePage(page_no, buf);
+    }
+    fn apiWritePages(ptr: *anyopaque, writes: []const PageWrite) IoError!void {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.writePages(writes);
+    }
+    fn apiFsync(ptr: *anyopaque) IoError!void {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.fsync();
+    }
+    fn apiFdatasync(ptr: *anyopaque) IoError!void {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.fdatasync();
+    }
+    fn apiGrowBy(ptr: *anyopaque, n: u64) anyerror!u64 {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.growBy(n);
+    }
+    fn apiPageCount(ptr: *anyopaque) u64 {
+        const self: *PagedFile = @ptrCast(@alignCast(ptr));
+        return self.pageCount();
     }
 };
 
@@ -264,7 +391,7 @@ test "PagedFile: batched writePages then read each" {
     const bufs = try testing.allocator.alignedAlloc(u8, ALIGN_4K, 4 * 4096);
     defer testing.allocator.free(bufs);
 
-    var writes: [4]PagedFile.PageWrite = undefined;
+    var writes: [4]PageWrite = undefined;
     for (0..4) |i| {
         const slice = bufs[i * 4096 ..][0..4096];
         @memset(slice, @intCast(0x10 + i));
@@ -290,6 +417,23 @@ test "PagedFile: fsync after write succeeds" {
     @memset(buf, 0x42);
     try tf.pf.writePage(0, buf);
     try tf.pf.fsync();
+}
+
+test "PagedFile: fdatasync after grow+write durabilizes both content and size" {
+    var tf = try TestFile.open(.{ .create = true, .truncate = true });
+    defer tf.deinit();
+
+    _ = try tf.pf.growBy(2);
+    const buf = try alignedPage(testing.allocator);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0x9A);
+    try tf.pf.writePage(1, buf);
+    try tf.pf.fdatasync();
+
+    @memset(buf, 0);
+    try tf.pf.readPage(1, buf);
+    for (buf) |b| try testing.expectEqual(@as(u8, 0x9A), b);
+    try testing.expectEqual(@as(u64, 2), tf.pf.pageCount());
 }
 
 test "PagedFile: read past EOF errors" {
