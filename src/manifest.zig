@@ -112,12 +112,9 @@ pub const Manifest = struct {
     overlays_lock: std.Thread.Mutex = .{},
     /// Guards `store_locks`. Brief.
     store_locks_lock: std.Thread.Mutex = .{},
-    /// Guards `last_applied_raft_idx`. Tiny critical sections.
-    meta_lock: std.Thread.Mutex = .{},
     /// Single-caller serialization for durabilize. Held outermost.
     durabilize_lock: std.Thread.Mutex = .{},
 
-    last_applied_raft_idx: u64 = 0,
     poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(
@@ -149,11 +146,6 @@ pub const Manifest = struct {
             errdefer txn.abort();
             self.meta_dbi = try txn.openDbi(META_DBI_NAME, true);
             self.stores_dbi = try txn.openDbi(STORES_DBI_NAME, true);
-            if (try txn.get(self.meta_dbi, META_RAFT_APPLY_KEY)) |bytes| {
-                if (bytes.len == 8) {
-                    self.last_applied_raft_idx = std.mem.readInt(u64, bytes[0..8], .little);
-                }
-            }
             try txn.commit();
         }
         errdefer self.deinitMaps();
@@ -204,22 +196,20 @@ pub const Manifest = struct {
 
     // ── raft watermark ──────────────────────────────────────────────
 
-    pub fn lastAppliedRaftIdx(self: *Manifest) u64 {
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        return self.last_applied_raft_idx;
-    }
-
-    pub fn setLastAppliedRaftIdx(self: *Manifest, idx: u64) !void {
-        try self.checkAlive();
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        self.last_applied_raft_idx = idx;
+    /// The raft index at the last successful `durabilize`. Reads from
+    /// LMDB (one short read txn). Returns 0 if no durabilize has
+    /// written a watermark yet.
+    pub fn durableRaftIdx(self: *Manifest) !u64 {
+        var txn = try lmdb.Txn.beginRead(&self.env);
+        defer txn.abort();
+        const bytes = (try txn.get(self.meta_dbi, META_RAFT_APPLY_KEY)) orelse return 0;
+        if (bytes.len != 8) return 0;
+        return std.mem.readInt(u64, bytes[0..8], .little);
     }
 
     /// Drop every per-store overlay's contents in-memory. Does NOT
     /// touch LMDB. Used on leadership loss: the integration calls
-    /// this, then replays raft entries from `last_applied_raft_idx + 1`
+    /// this, then replays raft entries from `durableRaftIdx() + 1`
     /// onward, which repopulates the overlays with the confirmed
     /// (raft-committed) prefix. Speculative-but-uncommitted writes
     /// vanish along with the overlay — those proposals never made it
@@ -394,7 +384,20 @@ pub const Manifest = struct {
 
     // ── durabilize ──────────────────────────────────────────────────
 
-    pub fn durabilize(self: *Manifest) !void {
+    /// Commit every pending overlay + create + drop to LMDB in one
+    /// atomic write transaction, stamping the `raft_idx` watermark
+    /// into the `_meta` sub-DBI as part of the same commit.
+    ///
+    /// If `raft_idx == 0`, the watermark is NOT written (the previous
+    /// durable value is preserved). This lets test code and
+    /// integrations that don't track a raft idx call `commit()` (an
+    /// alias) without disturbing the watermark.
+    ///
+    /// If `raft_idx > 0`, the value is written verbatim — kvexp does
+    /// not enforce monotonicity. Callers should pass a value that
+    /// monotonically advances; passing a smaller value is technically
+    /// allowed (think: recovery scenarios) but typically a bug.
+    pub fn durabilize(self: *Manifest, raft_idx: u64) !void {
         try self.checkAlive();
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
@@ -473,12 +476,6 @@ pub const Manifest = struct {
             });
         }
 
-        const idx_to_write = blk: {
-            self.meta_lock.lock();
-            defer self.meta_lock.unlock();
-            break :blk self.last_applied_raft_idx;
-        };
-
         var txn = try lmdb.Txn.beginWrite(&self.env);
         errdefer txn.abort();
 
@@ -518,12 +515,14 @@ pub const Manifest = struct {
             }
         }
 
-        // Always write the watermark, even if 0 — keeps LMDB's value
-        // exactly equal to the in-memory value post-commit. A 0 write
-        // is harmless (idempotent on a never-set or already-0 entry).
-        var idx_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &idx_buf, idx_to_write, .little);
-        try txn.put(self.meta_dbi, META_RAFT_APPLY_KEY, &idx_buf);
+        // Only write the watermark when the caller supplied a non-zero
+        // value. `raft_idx == 0` means "don't disturb whatever's
+        // already durable" — used by tests and by `commit()`.
+        if (raft_idx != 0) {
+            var idx_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &idx_buf, raft_idx, .little);
+            try txn.put(self.meta_dbi, META_RAFT_APPLY_KEY, &idx_buf);
+        }
 
         try txn.commit();
 
@@ -557,8 +556,11 @@ pub const Manifest = struct {
         return self.dbis.get(id);
     }
 
+    /// Convenience: durabilize without disturbing the raft watermark.
+    /// Used by tests and by callers that don't track a raft idx.
+    /// Equivalent to `durabilize(0)`.
     pub fn commit(self: *Manifest) !void {
-        return self.durabilize();
+        return self.durabilize(0);
     }
 
     // ── snapshots ───────────────────────────────────────────────────
@@ -630,16 +632,17 @@ pub const Manifest = struct {
 
     pub const VerifyReport = struct {
         store_count: u64,
-        last_applied_raft_idx: u64,
+        durable_raft_idx: u64,
     };
 
     pub fn verify(self: *Manifest, allocator: std.mem.Allocator) !VerifyReport {
         _ = allocator;
+        const idx = try self.durableRaftIdx();
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
         return .{
             .store_count = self.dbis.count(),
-            .last_applied_raft_idx = self.last_applied_raft_idx,
+            .durable_raft_idx = idx,
         };
     }
 };
@@ -1217,7 +1220,7 @@ pub fn dumpSnapshot(snap: *Snapshot, writer: anytype) !void {
     // wire format so future tooling can re-purpose it without bumping
     // the version. loadSnapshot discards it.
     try writer.writeInt(u64, 0, .little);
-    try writer.writeInt(u64, snap.manifest.lastAppliedRaftIdx(), .little);
+    try writer.writeInt(u64, try snap.manifest.durableRaftIdx(), .little);
 
     const stores = try snap.listStores(snap.manifest.allocator);
     defer snap.manifest.allocator.free(stores);
@@ -1273,7 +1276,8 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
             else => return error.InvalidSnapshotFormat,
         }
     }
-    try manifest.setLastAppliedRaftIdx(last_applied);
+    // Caller passes `last_applied` to `durabilize` to commit it
+    // alongside the loaded data in a single LMDB txn.
     return last_applied;
 }
 
@@ -1474,15 +1478,24 @@ test "Store.scanPrefix: tombstone shadows tree entry" {
     try testing.expectEqual(@as(u8, 'c'), keys[1]);
 }
 
-test "Manifest: lastAppliedRaftIdx round-trips via durabilize" {
+test "Manifest: durableRaftIdx round-trips via durabilize(idx)" {
     var h = try Harness.init();
     defer h.deinit();
-    try testing.expectEqual(@as(u64, 0), h.manifest.lastAppliedRaftIdx());
-    try h.manifest.setLastAppliedRaftIdx(42);
-    try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
-    try h.manifest.commit();
+    try testing.expectEqual(@as(u64, 0), try h.manifest.durableRaftIdx());
+
+    try h.manifest.durabilize(42);
+    try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
+
     try h.cycle();
-    try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
+    try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
+
+    // `commit()` (alias for durabilize(0)) preserves the watermark.
+    try h.manifest.commit();
+    try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
+
+    // Advancing.
+    try h.manifest.durabilize(100);
+    try testing.expectEqual(@as(u64, 100), try h.manifest.durableRaftIdx());
 }
 
 test "discardOverlays: drops in-flight writes; durable state intact" {
@@ -1523,7 +1536,7 @@ test "Manifest: poison blocks writes; reopen clears it" {
     try h.manifest.commit();
     h.manifest._testPoison();
     try testing.expect(h.manifest.isPoisoned());
-    try testing.expectError(error.ManifestPoisoned, h.manifest.durabilize());
+    try testing.expectError(error.ManifestPoisoned, h.manifest.durabilize(0));
     try testing.expectError(error.ManifestPoisoned, h.manifest.createStore(2));
     var s = try Store.open(h.manifest, 1);
     defer s.deinit();
@@ -1575,8 +1588,7 @@ test "dumpSnapshot / loadSnapshot: full round-trip" {
         defer s.deinit();
         try s.put("z", "9");
     }
-    try src.manifest.setLastAppliedRaftIdx(99);
-    try src.manifest.commit();
+    try src.manifest.durabilize(99);
 
     var snap = try src.manifest.openSnapshot();
     defer snap.close();
@@ -1592,8 +1604,9 @@ test "dumpSnapshot / loadSnapshot: full round-trip" {
     const reader = reader_state.reader();
     const last = try loadSnapshot(dst.manifest, reader);
     try testing.expectEqual(@as(u64, 99), last);
-    try dst.manifest.commit();
+    try dst.manifest.durabilize(last);
 
+    try testing.expectEqual(@as(u64, 99), try dst.manifest.durableRaftIdx());
     try testing.expect(try dst.manifest.hasStore(10));
     try testing.expect(try dst.manifest.hasStore(20));
     var s10 = try Store.open(dst.manifest, 10);
@@ -1618,11 +1631,10 @@ test "verify: reports store count + raft watermark" {
     defer h.deinit();
     try h.manifest.createStore(1);
     try h.manifest.createStore(2);
-    try h.manifest.setLastAppliedRaftIdx(7);
-    try h.manifest.commit();
+    try h.manifest.durabilize(7);
     const report = try h.manifest.verify(testing.allocator);
     try testing.expectEqual(@as(u64, 2), report.store_count);
-    try testing.expectEqual(@as(u64, 7), report.last_applied_raft_idx);
+    try testing.expectEqual(@as(u64, 7), report.durable_raft_idx);
 }
 
 // -----------------------------------------------------------------------------
@@ -1726,7 +1738,7 @@ fn propRunOne(seed: u64) !void {
             model.store_exists[sid_usize] = false;
             for (0..PROP_NUM_KEYS) |k| model.key_present[sid_usize][k] = false;
         } else {
-            try h.manifest.durabilize();
+            try h.manifest.commit();
             durable_model = model;
         }
     }

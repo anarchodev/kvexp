@@ -92,9 +92,11 @@ while (try cursor.next()) {
     // copy if you need to retain past the next next() call.
 }
 
-// Make everything durable.
-try manifest.setLastAppliedRaftIdx(current_raft_idx);
-try manifest.durabilize();
+// Make everything durable, stamping the raft watermark in the same
+// atomic LMDB transaction.
+try manifest.durabilize(current_raft_idx);
+// `commit()` is the alias for `durabilize(0)` — flushes pending
+// writes without touching the watermark.
 ```
 
 ## API surface
@@ -107,9 +109,9 @@ pub fn createStore(self, id) !void
 pub fn dropStore(self, id) !bool
 pub fn hasStore(self, id) !bool
 pub fn listStores(self, allocator) ![]u64
-pub fn lastAppliedRaftIdx(self) u64
-pub fn setLastAppliedRaftIdx(self, idx) !void
-pub fn durabilize(self) !void                 // alias: commit
+pub fn durabilize(self, raft_idx: u64) !void  // raft_idx=0 → don't touch watermark
+pub fn commit(self) !void                     // alias: durabilize(0)
+pub fn durableRaftIdx(self) !u64              // reads from LMDB
 pub fn discardOverlays(self) void
 pub fn openSnapshot(self) !Snapshot
 pub fn isPoisoned(self) bool                  // becomes true on durabilize failure
@@ -180,26 +182,29 @@ fn workerLoop(manifest: *kvexp.Manifest, tenant_id: u64) !void {
     }
 }
 
-/// On every raft commit (driven by the raft thread).
-fn onRaftCommit(manifest: *kvexp.Manifest, committed_idx: u64) !void {
-    // The data is already in the overlay (workers applied it
-    // optimistically). Just advance the watermark.
-    try manifest.setLastAppliedRaftIdx(committed_idx);
+// In-flight raft commit watermark, owned by the integration.
+var latest_committed: u64 = 0;
 
-    // Release every pending response with raft_idx <= committed_idx.
+/// On every raft commit (driven by the raft thread).
+fn onRaftCommit(committed_idx: u64) void {
+    // The data is already in the overlay (workers applied it
+    // optimistically). Just record the watermark in our own variable
+    // and release pending responses.
+    latest_committed = committed_idx;
     while (pending.peekItem()) |head| {
         if (head.raft_idx > committed_idx) break;
         _ = pending.readItem();
-        try respond(head.request);
+        respond(head.request);
     }
 }
 
 /// Periodic checkpoint — every N commits, every T seconds, whichever
 /// comes first.
 fn checkpoint(manifest: *kvexp.Manifest) !void {
-    try manifest.durabilize();
-    // raft.compactLog(through: manifest.lastAppliedRaftIdx())
-    //   is now safe — every entry up to that idx is durable in LMDB.
+    // Atomic LMDB commit: every overlay entry + the watermark land
+    // together. After this returns, raft.compactLog(through: latest_committed)
+    // is safe — every entry up to that idx is durable in LMDB.
+    try manifest.durabilize(latest_committed);
 }
 ```
 
@@ -238,17 +243,18 @@ fn onLeadershipLoss(manifest: *kvexp.Manifest) !void {
 
     // Replay confirmed log entries past the durable watermark.
     // Each replay populates the overlay via store.put / store.delete.
-    const from = manifest.lastAppliedRaftIdx() + 1;
+    const from = (try manifest.durableRaftIdx()) + 1;
     const to = raft.committedIndex();
     var idx = from;
     while (idx <= to) : (idx += 1) {
         const writeset = try raft.entryAt(idx);
         try applyWriteset(manifest, writeset);
-        try manifest.setLastAppliedRaftIdx(idx);
     }
+    latest_committed = to;
 
     // The overlay now reflects exactly the raft-committed-but-not-
-    // yet-durabilized prefix. Next periodic checkpoint commits it.
+    // yet-durabilized prefix. Next periodic checkpoint commits it
+    // with `manifest.durabilize(latest_committed)`.
 }
 
 /// Apply a raft-committed writeset to kvexp. Same code path as
@@ -290,7 +296,7 @@ fn produceSnapshot(manifest: *kvexp.Manifest, dest_path: []const u8) !void {
     // committed state. (Snapshots taken on a non-empty overlay still
     // work — openSnapshot captures the overlay too — but draining
     // first simplifies the transfer.)
-    try manifest.durabilize();
+    try manifest.durabilize(latest_committed);
 
     var snap = try manifest.openSnapshot();
     defer snap.close();
@@ -322,12 +328,13 @@ fn installSnapshot(manifest: *kvexp.Manifest, src_path: []const u8) !void {
     var stream = std.io.fixedBufferStream(bytes);
 
     // loadSnapshot streams records, calling createStore + store.put.
-    // Everything lands in overlays first.
+    // Everything lands in overlays first. Returns the snapshot's
+    // raft watermark so we can stamp it on the commit.
     const last_applied_idx = try kvexp.loadSnapshot(manifest, stream.reader());
 
     // One durabilize commits the drops + all the loaded data + the
     // watermark in a single LMDB txn.
-    try manifest.durabilize();
+    try manifest.durabilize(last_applied_idx);
 
     // Tell raft: "my state covers everything up to this index;
     // resume applying from idx+1."
@@ -357,7 +364,6 @@ Key invariants:
 | `Overlay.lock` | per-store overlay contents | put / delete / get / scanPrefix snapshot — brief |
 | `Manifest.store_locks_lock` | per-store mutex map | once per first put per store |
 | `manifest.storeLock(id)` (per-store) | serialize writers on one tenant | Store.put / Store.delete |
-| `Manifest.meta_lock` | last_applied_raft_idx | very brief |
 | `Manifest.durabilize_lock` | single-caller for durabilize, openSnapshot | held for the entire operation |
 
 Writers on **different tenants** never share a lock (per-store
