@@ -1,15 +1,70 @@
 # kvexp
 
 Multi-tenant embedded key-value store in Zig, designed to sit under a
-raft log. Many independent stores share one LMDB file; each store has
-its own key space and atomic durability boundary. The raft log is the
-write-ahead log; kvexp is a periodically-checkpointed materialization
+raft log. Many independent stores share one LMDB file; each tenant
+has its own key space and atomic durability boundary. The raft log is
+the write-ahead log; kvexp is a periodically-checkpointed materialization
 of the applied prefix.
 
-Status: working over LMDB + in-memory memtable (29 tests pass). Earlier
-revisions of kvexp implemented a from-scratch CoW B-tree; that's been
-replaced by LMDB after profiling showed the per-write CoW overhead
-was unrecoverable. The public API is unchanged save for `Manifest.init`.
+Writes go through **per-tenant chains of nested transactions**.
+`Manifest.beginTxn(tenant_id)` opens a top-level Txn at the tail of
+that tenant's chain. `Txn.savepoint()` pushes a LIFO save point. The
+model cleanly supports raft-driven speculative writes: open a Txn per
+proposal, continue to the next proposal without waiting, commit when
+raft accepts, rollback on rejection — the chain handles ordering and
+cascade-rollback naturally.
+
+## Architecture
+
+```
+              Manifest
+              ┌──────────────────────────────────────────────────┐
+              │  LMDB env (durable state)                        │
+              │    ├─ "_meta"   raft_apply_idx watermark         │
+              │    ├─ "_stores" directory of tenant ids          │
+              │    └─ "s_<hex>" sub-DBI per tenant               │
+              │                                                  │
+              │  per-tenant TenantState (in memory, lazy)        │
+              │    ├─ main_overlay   ← committed but not durable │
+              │    └─ chain of open top-level Txns               │
+              │           (raft propose order)                   │
+              │           each Txn has:                          │
+              │           ├─ overlay (this txn's writes)         │
+              │           └─ open_child  ← single LIFO savepoint │
+              └──────────────────────────────────────────────────┘
+
+  beginTxn(tenant)        →  new Txn at chain tail
+  Txn.put / .delete       →  into Txn.overlay (no I/O)
+  Txn.get / .scanPrefix   →  walks savepoint stack → chain backward
+                              → main_overlay → LMDB
+  Txn.commit (top-level)  →  must be chain head; merges into main_overlay
+  Txn.commit (savepoint)  →  merges into parent.overlay
+  Txn.rollback (top)      →  discards self + every successor in chain
+  Txn.rollback (sp)       →  discards self + nested savepoints
+
+  durabilize(raft_idx)    →  one atomic LMDB write txn:
+                              - apply pending createStores / dropStores
+                              - drain every tenant's main_overlay
+                              - write raft_idx into _meta
+                             (open Txns are NOT touched — their writes
+                              live in their own overlays, which only
+                              hit main_overlay when the Txn commits)
+  openSnapshot()          →  LMDB read txn + captured main_overlay
+                             (in-flight Txns NOT visible)
+  openStore(tenant_id)    →  read-only handle: main_overlay + LMDB
+```
+
+**Crucial invariants:**
+
+- Every successful `durabilize(raft_idx)` is a single atomic LMDB
+  commit covering tenant data + the watermark.
+- `main_overlay` only ever receives **committed** writes (via `Txn.commit`).
+  Speculative state lives in open Txns and never reaches LMDB except
+  through commit → main_overlay → durabilize.
+- A `Txn` reads its own writes plus older chain entries' writes plus
+  the tenant's `main_overlay` plus LMDB — never another tenant's
+  speculation and never its own siblings' speculation (because there
+  are no siblings — chains are linear).
 
 ## Why this exists
 
@@ -22,44 +77,9 @@ past a few thousand tenants:
 - **No fsync amortization** across tenants — each commits its own WAL.
 
 kvexp gives every tenant its own ordered key space backed by an LMDB
-sub-DBI inside one shared env. Writes batch into a per-store in-memory
-memtable; a periodic `durabilize()` drains all memtables and the
-raft watermark into a single LMDB write transaction. Reads consult
-the memtable first, then LMDB. Snapshot reads use an LMDB read txn
-plus a captured copy of the memtable.
-
-## Architecture in one paragraph
-
-```
-                Manifest
-                ┌─────────────────────────────────────┐
-                │  LMDB env                           │
-                │  ├─ "_meta"   (last_applied_raft_idx)
-                │  ├─ "_stores" (store-id directory)  │
-                │  ├─ "s_<hex>" sub-DBI per tenant    │
-                │  └─ ...                             │
-                │                                     │
-                │  per-tenant in-memory overlays      │
-                │  ├─ tenant 1 → {k→v, k→tombstone}   │
-                │  ├─ tenant 2 → {k→v, ...}           │
-                │  └─ ...                             │
-                └─────────────────────────────────────┘
-
-  Store.put / Store.delete  →  overlay (in-memory; no I/O)
-  Store.get / scanPrefix    →  overlay first, LMDB on miss
-  durabilize()              →  one LMDB write txn:
-                                 - apply pending createStores / dropStores
-                                 - apply every overlay (puts, tombstones)
-                                 - write last_applied_raft_idx
-                               commit (atomic)
-  openSnapshot()            →  LMDB read txn + captured overlay
-  discardOverlays()         →  drop all in-flight memtables; LMDB untouched
-```
-
-The crucial property: **every successful `durabilize()` is a single
-atomic LMDB commit covering memtable data + the raft watermark.**
-Recovery on reopen reads the watermark from LMDB; the raft layer
-replays log entries past it.
+sub-DBI inside one shared env. Workers absorb writes into per-Txn
+overlays (free of any I/O). A periodic `durabilize` drains every
+tenant's `main_overlay` plus the raft watermark in one LMDB commit.
 
 ## Quick start
 
@@ -73,30 +93,26 @@ try manifest.init(allocator, "data.mdb", .{
 });
 defer manifest.deinit();
 
-// Tenant lifecycle. Buffered until next durabilize.
+// Tenant lifecycle (buffered until next durabilize).
 try manifest.createStore(42);
 const exists = try manifest.hasStore(42);
 
-// Per-tenant ops.
-var store = try kvexp.Store.open(&manifest, 42);
-defer store.deinit();
-try store.put("key", "value");
-const v = try store.get(allocator, "key");
+// Writes go through a transaction.
+var txn = try manifest.beginTxn(42);
+try txn.put("key", "value");
+const v = try txn.get(allocator, "key");      // sees its own write
 defer if (v) |b| allocator.free(b);
-_ = try store.delete("key");
+try txn.commit();                              // merge into main_overlay
 
-var cursor = try store.scanPrefix("user/");
-defer cursor.deinit();
-while (try cursor.next()) {
-    // cursor.key() / cursor.value() — slices alias internal memory;
-    // copy if you need to retain past the next next() call.
-}
+// Read-only access (sees main_overlay + LMDB; no in-flight txns).
+var store = try manifest.openStore(42);
+defer store.deinit();
+const v2 = try store.get(allocator, "key");
 
-// Make everything durable, stamping the raft watermark in the same
-// atomic LMDB transaction.
+// Make everything durable, stamping the raft watermark atomically.
 try manifest.durabilize(current_raft_idx);
-// `commit()` is the alias for `durabilize(0)` — flushes pending
-// writes without touching the watermark.
+// `commit()` is the alias for `durabilize(0)` — flushes without
+// disturbing the watermark.
 ```
 
 ## API surface
@@ -105,39 +121,58 @@ try manifest.durabilize(current_raft_idx);
 // Manifest
 pub fn init(self, allocator, path: [:0]const u8, options: InitOptions) !void
 pub fn deinit(self) void
+
+// Stores (buffered lifecycle).
 pub fn createStore(self, id) !void
 pub fn dropStore(self, id) !bool
 pub fn hasStore(self, id) !bool
 pub fn listStores(self, allocator) ![]u64
-pub fn durabilize(self, raft_idx: u64) !void  // raft_idx=0 → don't touch watermark
-pub fn commit(self) !void                     // alias: durabilize(0)
-pub fn durableRaftIdx(self) !u64              // reads from LMDB
-pub fn discardOverlays(self) void
-pub fn openSnapshot(self) !Snapshot
-pub fn isPoisoned(self) bool                  // becomes true on durabilize failure
-pub fn verify(self, allocator) !VerifyReport  // admin
 
-// Store
-pub fn open(manifest, id) !Store
-pub fn get(self, allocator, key) !?[]u8
+// Writes: go through a Txn. Reads-only: openStore.
+pub fn beginTxn(self, tenant_id) !*Txn
+pub fn openStore(self, tenant_id) !Store
+
+// Commit + recovery.
+pub fn durabilize(self, raft_idx: u64) !void   // raft_idx=0 ↦ don't touch watermark
+pub fn commit(self) !void                       // alias: durabilize(0)
+pub fn durableRaftIdx(self) !u64
+pub fn openSnapshot(self) !Snapshot
+
+// Health / admin.
+pub fn isPoisoned(self) bool
+pub fn verify(self, allocator) !VerifyReport
+
+// Txn (returned by beginTxn or by .savepoint()).
 pub fn put(self, key, value) !void
 pub fn delete(self, key) !bool
+pub fn get(self, allocator, key) !?[]u8
+pub fn scanPrefix(self, prefix) !TxnPrefixCursor
+pub fn savepoint(self) !*Txn       // pushes onto open_child slot
+pub fn commit(self) !void          // top-level must be chain head;
+                                   // savepoint merges into parent
+pub fn rollback(self) void         // top-level cascades to successors;
+                                   // savepoint drops self + nested
+
+// Store (read-only).
+pub fn get(self, allocator, key) !?[]u8
 pub fn scanPrefix(self, prefix) !StorePrefixCursor
 
-// Snapshot
+// Snapshot (point-in-time read txn + captured main_overlay).
 pub fn close(self) void
 pub fn get(self, allocator, store_id, key) !?[]u8
 pub fn scanPrefix(self, store_id, prefix) !SnapshotPrefixCursor
 pub fn listStores(self, allocator) ![]u64
 
-// Free functions
+// Free functions.
 pub fn dumpSnapshot(snap, writer) !void
-pub fn loadSnapshot(manifest, reader) !u64    // returns last_applied_raft_idx
+pub fn loadSnapshot(manifest, reader) !u64   // returns last_applied_raft_idx
 
-// Errors callers handle
+// Errors callers commonly handle.
 error.StoreAlreadyExists
 error.StoreNotFound
 error.ManifestPoisoned
+error.NotChainHead            // commit a non-head top-level Txn
+error.SavepointStillOpen      // commit/write a Txn with an open child
 error.InvalidSnapshotFormat
 error.UnsupportedSnapshotVersion
 ```
@@ -146,156 +181,125 @@ error.UnsupportedSnapshotVersion
 
 ### 1. Speculative apply (optimistic per-tenant writes)
 
-The classic raft-driven pattern: workers apply writes to the memtable
-*before* raft accepts the proposal, then gate response release on the
-raft commit. Cheap per-put cost (one hashmap insert) lets workers
-keep pushing requests into the raft propose queue.
+Open a Txn per request. Don't wait for raft — continue to the next
+request, opening a new Txn at the tail of the chain. Responses gate
+on raft commit; commits gate on raft commit; rollback drops on raft
+reject. Workers on different tenants run completely independently.
 
 ```zig
-const PendingResponse = struct {
-    request: *Request,
+const Pending = struct {
+    txn: *kvexp.Txn,
     raft_idx: u64,
+    request: *Request,
 };
 
-var pending: std.fifo.LinearFifo(PendingResponse, .Dynamic) =
-    std.fifo.LinearFifo(PendingResponse, .Dynamic).init(allocator);
+var pending: std.fifo.LinearFifo(Pending, .Dynamic) =
+    std.fifo.LinearFifo(Pending, .Dynamic).init(allocator);
+var latest_committed: u64 = 0;
 
-/// Per-tenant worker loop. One worker per tenant at a time; multiple
-/// tenants' workers run in parallel.
+/// Per-tenant worker loop. One worker per tenant at a time; different
+/// tenants in parallel.
 fn workerLoop(manifest: *kvexp.Manifest, tenant_id: u64) !void {
     while (true) {
         const request = try requestQueue(tenant_id).pop();
-
-        // Optimistic apply: the JS / business handler calls store.put,
-        // store.delete, store.get during its run. All puts/deletes
-        // land in the per-tenant overlay — no I/O.
-        var store = try kvexp.Store.open(manifest, tenant_id);
-        defer store.deinit();
-        try runHandler(&store, request);
-
-        // Propose to raft. We DON'T wait for consensus here — the
-        // worker continues to the next request immediately.
+        var txn = try manifest.beginTxn(tenant_id);
+        errdefer txn.rollback();
+        try runHandler(txn, request);    // handler reads its own writes
         const raft_idx = try raft.propose(request.payload);
-
-        // Queue the response release for after raft commits this idx.
-        try pending.writeItem(.{ .request = request, .raft_idx = raft_idx });
+        try pending.writeItem(.{
+            .txn = txn,
+            .raft_idx = raft_idx,
+            .request = request,
+        });
     }
 }
 
-// In-flight raft commit watermark, owned by the integration.
-var latest_committed: u64 = 0;
-
-/// On every raft commit (driven by the raft thread).
-fn onRaftCommit(committed_idx: u64) void {
-    // The data is already in the overlay (workers applied it
-    // optimistically). Just record the watermark in our own variable
-    // and release pending responses.
+/// On every raft commit (raft thread).
+fn onRaftCommit(committed_idx: u64) !void {
     latest_committed = committed_idx;
     while (pending.peekItem()) |head| {
         if (head.raft_idx > committed_idx) break;
+        try head.txn.commit();           // merges into main_overlay
+        try respond(head.request);
         _ = pending.readItem();
-        respond(head.request);
     }
 }
 
 /// Periodic checkpoint — every N commits, every T seconds, whichever
 /// comes first.
 fn checkpoint(manifest: *kvexp.Manifest) !void {
-    // Atomic LMDB commit: every overlay entry + the watermark land
-    // together. After this returns, raft.compactLog(through: latest_committed)
-    // is safe — every entry up to that idx is durable in LMDB.
     try manifest.durabilize(latest_committed);
+    // raft.compactLog(through: latest_committed) is now safe.
+}
+```
+
+Inside the handler, **try/except blocks become savepoints**:
+
+```zig
+fn runHandler(txn: *kvexp.Txn, request: Request) !void {
+    try txn.put("audit", "started");
+
+    var sp = try txn.savepoint();
+    riskyOp(sp) catch {
+        sp.rollback();                   // undo whatever riskyOp wrote
+        try txn.put("audit", "failed");
+        return;
+    };
+    try sp.commit();                     // merge sp's writes into txn
+    try txn.put("audit", "ok");
 }
 ```
 
 Key invariants:
 
-- **A response is never released for an idx > `lastAppliedRaftIdx`.**
-  The watermark advances only on `onRaftCommit`. So clients only see
-  "your write succeeded" after raft consensus.
-- **A request may be applied before consensus** (it's in the overlay
-  from `workerLoop`), but `durabilize` only happens after `setLastAppliedRaftIdx`
-  has advanced. If something kills the process between propose and
-  commit, the overlay is lost and the raft layer re-proposes.
-- **`durabilize` is exclusive with `openSnapshot`** (durabilize_lock
-  serializes them) but otherwise concurrent with `workerLoop` and
-  `onRaftCommit`. Workers writing during durabilize land in the fresh-
-  empty overlay that the swap leaves behind; their writes go in the
-  next durabilize round.
+- A response only releases after `onRaftCommit` for its `raft_idx`.
+- Each Txn's writes are **invisible to siblings** — when worker pulls
+  request K+1, that handler opens its own Txn, but it does see K's
+  writes (chain reads backward to K). What it does NOT see is its own
+  later writes or any other tenant's Txns.
+- `Txn.commit` is gated to chain head; if a worker forgets to call
+  `onRaftCommit` in order, commits return `error.NotChainHead`.
 
 ### 2. Leader switch (rollback after losing leadership)
 
-When raft loses leadership, every uncommitted proposal from this
-leader is invalidated. The overlay contains a mix of (a) confirmed
-writes from raft-committed proposals and (b) speculative writes from
-proposals that won't ever commit. Drop the whole overlay and replay
-the confirmed prefix from the raft log:
+Tail rejection in raft means every proposal from the failed leader
+past some point is invalid. Roll back the oldest pending Txn — chain
+rollback cascades to every successor.
 
 ```zig
-fn onLeadershipLoss(manifest: *kvexp.Manifest) !void {
-    // Drop every per-tenant overlay. LMDB is untouched — the state
-    // up to lastAppliedRaftIdx is still durable on disk.
-    manifest.discardOverlays();
-
-    // Drop any pending responses; we'll never release them. The
-    // requestors will retry against the new leader.
-    pending.discard(pending.count);
-
-    // Replay confirmed log entries past the durable watermark.
-    // Each replay populates the overlay via store.put / store.delete.
-    const from = (try manifest.durableRaftIdx()) + 1;
-    const to = raft.committedIndex();
-    var idx = from;
-    while (idx <= to) : (idx += 1) {
-        const writeset = try raft.entryAt(idx);
-        try applyWriteset(manifest, writeset);
+fn onLeadershipLoss() void {
+    // The pending queue is in raft-propose order. Rollback the first
+    // (oldest) pending Txn; the chain rollback cascades to drop every
+    // later open Txn for that tenant. Across tenants, do this per-
+    // tenant since each tenant has its own independent chain.
+    while (pending.readItem()) |item| {
+        item.txn.rollback();             // cascades for top-level Txns
     }
-    latest_committed = to;
-
-    // The overlay now reflects exactly the raft-committed-but-not-
-    // yet-durabilized prefix. Next periodic checkpoint commits it
-    // with `manifest.durabilize(latest_committed)`.
-}
-
-/// Apply a raft-committed writeset to kvexp. Same code path as
-/// optimistic apply, just driven by the raft thread instead of a
-/// worker thread.
-fn applyWriteset(manifest: *kvexp.Manifest, writeset: WriteSet) !void {
-    var store = try kvexp.Store.open(manifest, writeset.store_id);
-    defer store.deinit();
-    for (writeset.ops) |op| switch (op.kind) {
-        .put    => try store.put(op.key, op.value),
-        .delete => _ = try store.delete(op.key),
-    };
 }
 ```
 
-Key invariants:
+That's it — no `discardOverlays` call, no raft replay. The next
+proposals from the new leader will open fresh Txns; if they include
+state that was previously speculative but raft-committed, the new
+leader's raft log will include those entries and `onRaftCommit` will
+process them in order.
 
-- **Speculative-but-not-committed writes vanish atomically with
-  `discardOverlays`.** They were never in the raft log; no consumer
-  ever saw a "succeeded" response for them.
-- **Confirmed-but-not-durable writes are recovered via raft replay.**
-  Their raft entries are still in the log (haven't been compacted past
-  `lastAppliedRaftIdx`).
-- **No I/O happens during `discardOverlays`.** It's a pure in-memory
-  reset, fast enough to run on the raft thread on every leadership
-  transition.
+If your durable watermark falls behind by more than the raft log
+retains, do state transfer instead (recipe 3).
 
 ### 3. State transfer for catching-up followers
 
 When a follower has fallen so far behind that the leader's raft log
-has compacted past its `lastAppliedRaftIdx`, log replay alone can't
-catch it up. The leader ships a full snapshot file; the follower
-wipes its local state and reloads from the file.
+has compacted past `durableRaftIdx`, log replay alone can't catch it
+up. The leader ships a full snapshot file; the follower wipes and
+reloads.
 
 ```zig
 /// Leader: produce a snapshot file at dest_path.
 fn produceSnapshot(manifest: *kvexp.Manifest, dest_path: []const u8) !void {
-    // Make the overlay durable first so the snapshot reflects fully-
-    // committed state. (Snapshots taken on a non-empty overlay still
-    // work — openSnapshot captures the overlay too — but draining
-    // first simplifies the transfer.)
+    // Drain main_overlay first so the snapshot reflects fully durable
+    // state. (Open Txns are NOT in main_overlay yet, so they're not
+    // shipped — correct semantics for state transfer.)
     try manifest.durabilize(latest_committed);
 
     var snap = try manifest.openSnapshot();
@@ -314,9 +318,8 @@ fn produceSnapshot(manifest: *kvexp.Manifest, dest_path: []const u8) !void {
 
 /// Follower: install a snapshot file from src_path.
 fn installSnapshot(manifest: *kvexp.Manifest, src_path: []const u8) !void {
-    // Wipe every existing store so the receiver converges to the
-    // sender's exact set. Buffered drops; the next durabilize emits
-    // them in one txn.
+    // Drop every existing store so the receiver converges to the
+    // sender's exact set.
     const existing = try manifest.listStores(allocator);
     defer allocator.free(existing);
     for (existing) |id| _ = try manifest.dropStore(id);
@@ -327,79 +330,58 @@ fn installSnapshot(manifest: *kvexp.Manifest, src_path: []const u8) !void {
     defer allocator.free(bytes);
     var stream = std.io.fixedBufferStream(bytes);
 
-    // loadSnapshot streams records, calling createStore + store.put.
-    // Everything lands in overlays first. Returns the snapshot's
-    // raft watermark so we can stamp it on the commit.
-    const last_applied_idx = try kvexp.loadSnapshot(manifest, stream.reader());
+    // loadSnapshot streams records, opening a Txn per tenant and
+    // committing them at the end.
+    const last_applied = try kvexp.loadSnapshot(manifest, stream.reader());
 
-    // One durabilize commits the drops + all the loaded data + the
-    // watermark in a single LMDB txn.
-    try manifest.durabilize(last_applied_idx);
+    // One durabilize commits everything — drops + loaded data +
+    // watermark — in a single LMDB txn.
+    try manifest.durabilize(last_applied);
 
-    // Tell raft: "my state covers everything up to this index;
-    // resume applying from idx+1."
-    try raft.loadSnapshot(last_applied_idx);
+    try raft.loadSnapshot(last_applied);
 }
 ```
 
-Key invariants:
-
-- **Wire format is record-oriented**, not LMDB-page-level: a magic
-  header followed by `{store_id, key_len, val_len, key, val}` records
-  ending with a terminator. The sender doesn't need to know the
-  receiver's LMDB version or page size.
-- **Transport is the caller's concern.** kvexp produces a file; the
-  application's HTTP / gRPC / whatever layer ships it. The raft
-  message offering the snapshot is metadata only.
-- **Snapshots are infrastructure long-reads.** They are NOT for the
-  request path. Application requests serialize reads and writes
-  inside the per-tenant worker; they have no use for MVCC.
-
 ## Concurrency model
 
-| Lock | Purpose | When acquired |
-|---|---|---|
-| `Manifest.dbis_lock` | DBI handle map + pending create/drop sets | createStore, dropStore, hasStore, etc. — brief |
-| `Manifest.overlays_lock` | overlays hashmap (top-level) | overlayFor / maybeOverlayFor — brief |
-| `Overlay.lock` | per-store overlay contents | put / delete / get / scanPrefix snapshot — brief |
-| `Manifest.store_locks_lock` | per-store mutex map | once per first put per store |
-| `manifest.storeLock(id)` (per-store) | serialize writers on one tenant | Store.put / Store.delete |
-| `Manifest.durabilize_lock` | single-caller for durabilize, openSnapshot | held for the entire operation |
+| Lock | Purpose |
+|---|---|
+| `Manifest.dbis_lock` | durable lifecycle: dbis + pending_creates + pending_drops |
+| `Manifest.tenants_lock` | tenants map (top-level lookup only; per-tenant work uses the tenant's own lock) |
+| `TenantState.lock` (per-tenant) | this tenant's main_overlay + open Txn chain + savepoint substructure |
+| `Manifest.durabilize_lock` | single-caller for durabilize + openSnapshot |
 
-Writers on **different tenants** never share a lock (per-store
-locks + per-overlay locks). Writers on the same tenant serialize via
-the per-store mutex.
-
-`durabilize` holds `durabilize_lock` outermost; takes each overlay's
-lock briefly to swap. Writers writing during a durabilize land in the
-fresh post-swap overlay; no torn state visible.
+Writers on different tenants share no lock. Per-tenant Txn operations
+serialize through that tenant's lock. `durabilize` iterates tenants
+and grabs each TenantState lock briefly to swap its main_overlay.
 
 ## Failure modes
 
 - **Process crash mid-operation.** LMDB's commit is atomic; if it
-  hadn't completed, the LMDB env reverts to the previous commit. The
-  in-memory overlay is lost. Raft replays from `lastAppliedRaftIdx`.
+  hadn't completed, LMDB reverts to the previous commit. Every Txn
+  in memory is lost. Raft replays from `durableRaftIdx`.
 - **fsync failure / I/O error during durabilize.** `errdefer self.poison()`
-  fires; the manifest's `isPoisoned()` returns true. Every subsequent
-  mutation (`put`, `delete`, `createStore`, `dropStore`, `durabilize`)
-  returns `error.ManifestPoisoned`. The caller must close + reopen the
-  manifest to recover.
-- **Disk full.** LMDB commits fail; `durabilize` poisons.
-- **mmap exhausted.** LMDB's mmap size is fixed at open. If you blow
-  through `max_map_size`, commits fail. Set it large (sparse mmap;
-  costs nothing unless touched).
+  fires; `isPoisoned()` returns true. Every subsequent mutating call
+  (including `Txn.put`, `Txn.commit`, `createStore`, `durabilize`)
+  returns `error.ManifestPoisoned`. Close + reopen to recover.
+- **Disk full / mmap exhausted.** LMDB commits fail; `durabilize`
+  poisons. Set `max_map_size` large up front (sparse mmap; only
+  touched pages cost RAM).
+- **Use-after-drop**: calling `Txn.put` (or anything) on a Txn whose
+  tenant was just dropped is undefined. `dropStore` proactively frees
+  open Txn memory for that tenant; the caller is expected to drop its
+  handles to those Txns. Don't drop a tenant while another thread
+  holds a Txn into it.
 
 ## Limitations
 
 - **Linux + LMDB-only.** The Zig wrapper uses `@cImport("lmdb.h")`
-  against the system liblmdb. Portability is technically possible
-  but not validated.
-- **No cross-store atomicity.** Each store is its own LMDB sub-DBI.
-  Cross-store consistency is the application's responsibility (TCC
-  in the rove model).
-- **Snapshot files load into memory at install time.** Streaming
-  `loadSnapshot` is possible but not implemented; expected snapshot
-  sizes (MB range) make this fine in practice.
+  against the system liblmdb.
+- **No cross-tenant atomicity.** Cross-tenant consistency is the
+  application's responsibility (TCC in the rove model).
+- **Snapshot files load into memory at install time.** Streaming is
+  possible but not implemented; expected snapshot sizes (MB range)
+  make this fine.
 - **Empty stores don't round-trip in snapshots.** A store with zero
   entries emits no records; the receiver never learns it existed.
   Acceptable for raft state transfer where raft replay re-creates
@@ -410,15 +392,15 @@ fresh post-swap overlay; no torn state visible.
 ```
 src/
   lmdb.zig          Thin Zig wrapper over the LMDB C API.
-  overlay.zig       Per-store in-memory write buffer (memtable).
-  manifest.zig      Manifest, Store, Snapshot, dumpSnapshot /
-                    loadSnapshot, prefix cursors.
+  overlay.zig       Per-Txn / per-tenant write buffer (memtable).
+  manifest.zig      Manifest, Txn, Store, Snapshot, prefix cursors,
+                    dumpSnapshot / loadSnapshot.
   root.zig          Public re-exports.
 ```
 
 ## Building
 
-Requires the system `liblmdb` and its development headers (`lmdb.h`):
+Requires the system `liblmdb` and its development headers:
 
 ```
 # Fedora / RHEL

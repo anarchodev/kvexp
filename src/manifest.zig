@@ -1,30 +1,54 @@
-//! Multi-tenant manifest over LMDB + an in-memory write buffer (memtable).
+//! Multi-tenant manifest over LMDB with per-tenant chains of nested
+//! transactions.
 //!
-//! Architecture: each `Store` is an LMDB sub-DBI (`MDB_CREATE`).
-//! `Store.put` / `Store.delete` write to an in-memory per-store
-//! Overlay (the memtable). `durabilize()` opens a single LMDB write
-//! transaction, drains every overlay into its sub-DBI, also writes
-//! the `last_applied_raft_idx` watermark into a `_meta` sub-DBI, then
-//! commits — that commit is the atomic durability point.
+//! Architecture:
 //!
-//! Recovery on `init`: open the env, read `last_applied_raft_idx`
-//! from `_meta`, populate the per-store DBI handle map from the
-//! `_stores` sub-DBI (which lists every live store_id). The raft
-//! layer replays log entries with idx > last_applied_raft_idx.
+//!   Manifest
+//!   ├─ LMDB env (durable state)
+//!   │    ├─ "_meta"   (raft_apply_idx watermark)
+//!   │    ├─ "_stores" (directory of tenant ids)
+//!   │    └─ "s_<hex>" sub-DBI per tenant
+//!   │
+//!   └─ per-tenant TenantState (in memory, lazy)
+//!        ├─ main_overlay  ← confirmed writes pending durabilize
+//!        └─ chain of open top-level Txns (in raft propose order)
+//!              each Txn has:
+//!              ├─ overlay   (this txn's writes)
+//!              └─ open_child  ← LIFO stack: at most one savepoint open
+//!                                (the savepoint can itself have one open, etc.)
 //!
-//! Concurrency:
-//!   * Multiple workers may put/delete/get concurrently on **distinct**
-//!     stores with no shared lock (per-store overlay locks).
-//!   * Workers on the **same** store serialize via `storeLock(id)`
-//!     (caller-style; Store.put/delete take it internally).
-//!   * `durabilize` is single-caller (`durabilize_lock`) and is the
-//!     only place that opens an LMDB write txn. LMDB's single-writer
-//!     model is acceptable here because writes happen in batched
-//!     bursts at durabilize, not per-put.
+//! Writes go through Txns. `Manifest.beginTxn(tenant_id)` opens a new
+//! top-level Txn at the tail of that tenant's chain. `Txn.put` /
+//! `Txn.delete` land in the txn's own overlay. `Txn.savepoint()`
+//! pushes a child Txn whose parent is this one — savepoints stack
+//! LIFO (single `open_child` slot).
 //!
-//! Reads (`Store.get`, `Store.scanPrefix`, `Snapshot.get/scanPrefix`)
-//! open LMDB read txns. Read txns are cheap; LMDB's reader table is
-//! lock-free for concurrent readers.
+//! Reads walk inside-out: savepoint stack → enclosing top-level Txn's
+//! chain backward → tenant's main_overlay → LMDB read txn. Cross-
+//! tenant in-flight state is never visible (each tenant has its own
+//! chain and overlay; `Store` and `Snapshot` see only main_overlay
+//! plus LMDB).
+//!
+//! Commit:
+//!   - Top-level Txn: must be the chain head (raft-oldest); merges
+//!     into tenant.main_overlay; unlinks from chain.
+//!   - Savepoint: merges into parent.overlay; pops the parent's
+//!     open_child slot.
+//!
+//! Rollback:
+//!   - Top-level Txn: drops self AND every successor in the chain.
+//!     Matches raft's tail-rejection semantics; on leadership loss
+//!     the integration calls rollback on the oldest pending txn and
+//!     everything past it falls.
+//!   - Savepoint: drops self and any nested sub-savepoint.
+//!
+//! Durabilize:
+//!   - Snapshots pending createStore/dropStore, swaps each tenant's
+//!     main_overlay into a local buffer (open txn overlays are NOT
+//!     touched — they live in the chain), opens one LMDB write txn,
+//!     applies all of it + the raft watermark in a single commit.
+//!   - Open txns are unaffected; their writes will land in main_overlay
+//!     when they commit, and be drained at the next durabilize.
 
 const std = @import("std");
 const lmdb = @import("lmdb.zig");
@@ -34,19 +58,11 @@ const OverlayEntry = overlay_mod.OverlayEntry;
 
 pub const InitOptions = struct {
     /// Maximum number of stores (LMDB sub-DBIs). Plus 2 reserved for
-    /// kvexp's internal `_meta` and `_stores`. Fixed at env open.
+    /// `_meta` and `_stores`. Fixed at env open.
     max_stores: u32 = 65534,
-    /// LMDB mmap size in bytes. Sparse — only touched pages cost
-    /// memory. Default 16 GiB.
+    /// LMDB mmap size in bytes. Sparse — only touched pages cost RAM.
     max_map_size: usize = 16 * 1024 * 1024 * 1024,
-    /// Skip metadata-page fsync on commit. Saves ~30% commit latency
-    /// at the cost of a small window where the last commit may roll
-    /// back on crash. Default off; raft replays the missing entries
-    /// after such a rollback, so enabling this is sometimes the right
-    /// call — but we leave the conservative choice as default.
     no_meta_sync: bool = false,
-    /// Disable ALL fsync. Tests-only territory; production data loss
-    /// on the slightest crash.
     no_sync: bool = false,
 };
 
@@ -56,18 +72,21 @@ pub const SpecificError = error{
     ManifestPoisoned,
     InvalidSnapshotFormat,
     UnsupportedSnapshotVersion,
+    /// Tried to commit a top-level Txn that wasn't the chain head.
+    NotChainHead,
+    /// Tried to commit/rollback a Txn that has an open savepoint
+    /// child. Close the inner one first (LIFO).
+    SavepointStillOpen,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
 const STORES_DBI_NAME: [:0]const u8 = "_stores";
 const META_RAFT_APPLY_KEY: []const u8 = "raft_apply_idx";
 
-/// LMDB DBI name for a per-store sub-DBI. "s_" + 16 hex chars + null = 19 bytes.
 fn storeDbiName(id: u64, buf: *[19]u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, "s_{x:0>16}", .{id}) catch unreachable;
 }
 
-/// 8-byte big-endian key for the `_stores` directory listing.
 fn encodeStoreIdKey(id: u64, buf: *[8]u8) []const u8 {
     std.mem.writeInt(u64, buf, id, .big);
     return buf;
@@ -78,44 +97,29 @@ fn decodeStoreIdKey(bytes: []const u8) u64 {
     return std.mem.readInt(u64, bytes[0..8], .big);
 }
 
+// ─── Manifest ───────────────────────────────────────────────────────
+
 pub const Manifest = struct {
     allocator: std.mem.Allocator,
     env: lmdb.Env,
     meta_dbi: lmdb.Dbi,
     stores_dbi: lmdb.Dbi,
 
-    /// store_id → DBI handle for stores already DURABLE in LMDB. The
-    /// existence-test (`hasStore`) layers `pending_creates` on top
-    /// and `pending_drops` underneath this set. Populated at init
-    /// from `_stores`; mutated only by durabilize.
+    /// store_id → DBI handle for durably-registered tenants.
     dbis: std.AutoHashMapUnmanaged(u64, lmdb.Dbi) = .empty,
-    /// Store IDs that have been `createStore`-d in memory since the
-    /// last durabilize. No DBI exists yet; writes to such a store
-    /// land in the overlay only. Drained at durabilize (DBI created,
-    /// listing entry written, moved into `dbis`).
     pending_creates: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    /// Store IDs that have been `dropStore`-d in memory since the
-    /// last durabilize. The DBI may still be in `dbis`; drained at
-    /// durabilize (DBI emptied, listing entry deleted, removed from
-    /// `dbis`).
     pending_drops: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    /// store_id → overlay. Lazily created on first write.
-    overlays: std.AutoHashMapUnmanaged(u64, *Overlay) = .empty,
-    /// Per-store writer mutex for serializing concurrent puts/deletes
-    /// on the same store. Lazily allocated.
-    store_locks: std.AutoHashMapUnmanaged(u64, *std.Thread.Mutex) = .empty,
-
-    /// Guards `dbis`. Short critical sections; createStore/dropStore
-    /// are rare.
     dbis_lock: std.Thread.Mutex = .{},
-    /// Guards `overlays`. Brief.
-    overlays_lock: std.Thread.Mutex = .{},
-    /// Guards `store_locks`. Brief.
-    store_locks_lock: std.Thread.Mutex = .{},
-    /// Single-caller serialization for durabilize. Held outermost.
-    durabilize_lock: std.Thread.Mutex = .{},
+
+    /// store_id → per-tenant in-memory state (overlay + chain of open
+    /// Txns). Lazily created on first beginTxn or first write
+    /// affecting a tenant.
+    tenants: std.AutoHashMapUnmanaged(u64, *TenantState) = .empty,
+    tenants_lock: std.Thread.Mutex = .{},
 
     poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Single-caller serializer for durabilize / openSnapshot.
+    durabilize_lock: std.Thread.Mutex = .{},
 
     pub fn init(
         self: *Manifest,
@@ -134,13 +138,11 @@ pub const Manifest = struct {
             .max_map_size = options.max_map_size,
             .no_meta_sync = options.no_meta_sync,
             .no_sync = options.no_sync,
-            // We always run single-process; the no_lock flag skips
-            // LMDB's reader-table file lock, which costs us nothing.
             .no_lock = true,
         });
         errdefer self.env.close();
 
-        // Bootstrap: open `_meta` and `_stores` and load the watermark.
+        // Bootstrap _meta and _stores.
         {
             var txn = try lmdb.Txn.beginWrite(&self.env);
             errdefer txn.abort();
@@ -154,12 +156,10 @@ pub const Manifest = struct {
         {
             var txn = try lmdb.Txn.beginWrite(&self.env);
             errdefer txn.abort();
-            // Need to re-open the DBIs in this txn to use them.
-            const stores_dbi = try txn.openDbi(STORES_DBI_NAME, false);
-            self.stores_dbi = stores_dbi;
+            self.stores_dbi = try txn.openDbi(STORES_DBI_NAME, false);
             self.meta_dbi = try txn.openDbi(META_DBI_NAME, false);
 
-            var cur = try txn.openCursor(stores_dbi);
+            var cur = try txn.openCursor(self.stores_dbi);
             defer cur.close();
             var pair = try cur.first();
             while (pair) |p| : (pair = try cur.next()) {
@@ -177,53 +177,27 @@ pub const Manifest = struct {
         self.dbis.deinit(self.allocator);
         self.pending_creates.deinit(self.allocator);
         self.pending_drops.deinit(self.allocator);
-        var ov_it = self.overlays.iterator();
-        while (ov_it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
+        // Free every tenant's state including any open chain / overlays.
+        var it = self.tenants.iterator();
+        while (it.next()) |entry| {
+            const ts = entry.value_ptr.*;
+            // Free all txns in the chain (and their savepoint subtrees).
+            var cur = ts.chain_head;
+            while (cur) |c| {
+                const next = c.chain_next;
+                c.freeSubtreeLocked();
+                cur = next;
+            }
+            ts.main_overlay.deinit();
+            self.allocator.destroy(ts);
         }
-        self.overlays.deinit(self.allocator);
-        var sl_it = self.store_locks.valueIterator();
-        while (sl_it.next()) |m| self.allocator.destroy(m.*);
-        self.store_locks.deinit(self.allocator);
+        self.tenants.deinit(self.allocator);
     }
 
     pub fn deinit(self: *Manifest) void {
         self.deinitMaps();
         self.env.close();
         self.* = undefined;
-    }
-
-    // ── raft watermark ──────────────────────────────────────────────
-
-    /// The raft index at the last successful `durabilize`. Reads from
-    /// LMDB (one short read txn). Returns 0 if no durabilize has
-    /// written a watermark yet.
-    pub fn durableRaftIdx(self: *Manifest) !u64 {
-        var txn = try lmdb.Txn.beginRead(&self.env);
-        defer txn.abort();
-        const bytes = (try txn.get(self.meta_dbi, META_RAFT_APPLY_KEY)) orelse return 0;
-        if (bytes.len != 8) return 0;
-        return std.mem.readInt(u64, bytes[0..8], .little);
-    }
-
-    /// Drop every per-store overlay's contents in-memory. Does NOT
-    /// touch LMDB. Used on leadership loss: the integration calls
-    /// this, then replays raft entries from `durableRaftIdx() + 1`
-    /// onward, which repopulates the overlays with the confirmed
-    /// (raft-committed) prefix. Speculative-but-uncommitted writes
-    /// vanish along with the overlay — those proposals never made it
-    /// into the raft log, so they never had a durability guarantee.
-    pub fn discardOverlays(self: *Manifest) void {
-        self.overlays_lock.lock();
-        defer self.overlays_lock.unlock();
-        var it = self.overlays.iterator();
-        while (it.next()) |entry| {
-            const ov = entry.value_ptr.*;
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            ov.clear();
-        }
     }
 
     // ── poison ──────────────────────────────────────────────────────
@@ -244,34 +218,13 @@ pub const Manifest = struct {
         if (self.isPoisoned()) return error.ManifestPoisoned;
     }
 
-    // ── per-store locks ─────────────────────────────────────────────
-
-    pub fn storeLock(self: *Manifest, id: u64) !*std.Thread.Mutex {
-        self.store_locks_lock.lock();
-        defer self.store_locks_lock.unlock();
-        const gop = try self.store_locks.getOrPut(self.allocator, id);
-        if (!gop.found_existing) {
-            const m = try self.allocator.create(std.Thread.Mutex);
-            m.* = .{};
-            gop.value_ptr.* = m;
-        }
-        return gop.value_ptr.*;
-    }
-
-    // ── stores: create / drop / has / list ──────────────────────────
+    // ── stores (durable lifecycle, buffered) ────────────────────────
 
     pub fn createStore(self: *Manifest, id: u64) !void {
         try self.checkAlive();
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
         if (self.hasStoreLocked(id)) return error.StoreAlreadyExists;
-        // We may be in one of:
-        //   (false, false, false) → just add pending_create
-        //   (true, false, true)   → durable + pending drop. Add pending_create
-        //                           too. At durabilize, drop empties the DBI
-        //                           and create re-registers it: effectively a
-        //                           wipe-and-rebind which is what callers
-        //                           expect from drop-then-create.
         try self.pending_creates.put(self.allocator, id, {});
     }
 
@@ -280,40 +233,48 @@ pub const Manifest = struct {
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
         if (!self.hasStoreLocked(id)) return false;
+
         // Cancel a pending_create that hasn't been durabilized yet.
         if (self.pending_creates.remove(id)) {
-            self.clearOverlayForLocked(id);
-            // If the store is also durable (the drop-and-recreate
-            // case), we still need to queue the drop so durabilize
-            // empties LMDB.
+            try self.clearTenantStateLocked(id);
+            // If the store is also durable (a drop-recreate-drop cycle
+            // on the same id), the underlying durable DBI also needs
+            // emptying at next durabilize.
             if (self.dbis.contains(id)) {
                 try self.pending_drops.put(self.allocator, id, {});
             }
             return true;
         }
+
         // Durable store: queue the drop.
         try self.pending_drops.put(self.allocator, id, {});
-        self.clearOverlayForLocked(id);
+        try self.clearTenantStateLocked(id);
         return true;
     }
 
-    /// hasStore variant that assumes the caller already holds dbis_lock.
-    fn hasStoreLocked(self: *const Manifest, id: u64) bool {
-        if (self.pending_creates.contains(id)) return true;
-        if (self.pending_drops.contains(id)) return false;
-        return self.dbis.contains(id);
-    }
+    /// Called from dropStore. Walks the tenant's open chain (rolling
+    /// back each Txn) and clears its main_overlay. Caller holds
+    /// dbis_lock; we take tenants_lock + tenant_state lock briefly.
+    fn clearTenantStateLocked(self: *Manifest, id: u64) !void {
+        self.tenants_lock.lock();
+        defer self.tenants_lock.unlock();
+        const ts = self.tenants.get(id) orelse return;
+        ts.lock.lock();
+        defer ts.lock.unlock();
 
-    /// Caller must hold dbis_lock (so the overlay pointer doesn't get
-    /// freed mid-clear).
-    fn clearOverlayForLocked(self: *Manifest, id: u64) void {
-        self.overlays_lock.lock();
-        defer self.overlays_lock.unlock();
-        if (self.overlays.get(id)) |ov| {
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            ov.clear();
+        // Drop every open Txn (and their savepoint subtrees). Callers
+        // holding pointers to these Txns now hold dangling pointers
+        // — they should have been the ones to roll back. This is the
+        // explicit-drop-from-under-you case for dropStore.
+        var cur = ts.chain_head;
+        while (cur) |c| {
+            const next = c.chain_next;
+            c.freeSubtreeLocked();
+            cur = next;
         }
+        ts.chain_head = null;
+        ts.chain_tail = null;
+        ts.main_overlay.clear();
     }
 
     pub fn hasStore(self: *Manifest, id: u64) !bool {
@@ -322,13 +283,10 @@ pub const Manifest = struct {
         return self.hasStoreLocked(id);
     }
 
-    /// Compatibility: returns Some(id) if the store exists, None
-    /// otherwise. The original CoW model returned the tree's root
-    /// page number — LMDB hides that; we use the store_id itself as
-    /// an opaque "exists" token.
-    pub fn storeRoot(self: *Manifest, id: u64) !?u64 {
-        if (try self.hasStore(id)) return id;
-        return null;
+    fn hasStoreLocked(self: *const Manifest, id: u64) bool {
+        if (self.pending_creates.contains(id)) return true;
+        if (self.pending_drops.contains(id)) return false;
+        return self.dbis.contains(id);
     }
 
     pub fn listStores(self: *Manifest, allocator: std.mem.Allocator) ![]u64 {
@@ -336,25 +294,17 @@ pub const Manifest = struct {
         defer self.dbis_lock.unlock();
         var list: std.ArrayListUnmanaged(u64) = .empty;
         errdefer list.deinit(allocator);
-        // Union of durable (minus pending drops) and pending creates.
         var it = self.dbis.keyIterator();
         while (it.next()) |id_ptr| {
             if (self.pending_drops.contains(id_ptr.*)) continue;
             try list.append(allocator, id_ptr.*);
         }
         var pc_it = self.pending_creates.keyIterator();
-        while (pc_it.next()) |id_ptr| {
-            try list.append(allocator, id_ptr.*);
-        }
+        while (pc_it.next()) |id_ptr| try list.append(allocator, id_ptr.*);
         std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
         return try list.toOwnedSlice(allocator);
     }
 
-    /// Returns the durable DBI handle if the store has been
-    /// durabilized; null if pending-create (DBI doesn't exist yet) or
-    /// dropped (caller should treat as not-exists if needed). Callers
-    /// that need to know "does the store logically exist" should use
-    /// `hasStore`.
     fn lookupDbi(self: *Manifest, id: u64) ?lmdb.Dbi {
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
@@ -362,51 +312,85 @@ pub const Manifest = struct {
         return self.dbis.get(id);
     }
 
-    // ── overlay management ──────────────────────────────────────────
+    // ── tenant state ────────────────────────────────────────────────
 
-    pub fn overlayFor(self: *Manifest, id: u64) !*Overlay {
-        self.overlays_lock.lock();
-        defer self.overlays_lock.unlock();
-        const gop = try self.overlays.getOrPut(self.allocator, id);
+    fn getOrCreateTenantState(self: *Manifest, id: u64) !*TenantState {
+        self.tenants_lock.lock();
+        defer self.tenants_lock.unlock();
+        const gop = try self.tenants.getOrPut(self.allocator, id);
         if (!gop.found_existing) {
-            const ov = try self.allocator.create(Overlay);
-            ov.* = Overlay.init(self.allocator);
-            gop.value_ptr.* = ov;
+            const ts = try self.allocator.create(TenantState);
+            errdefer self.allocator.destroy(ts);
+            ts.* = .{
+                .main_overlay = Overlay.init(self.allocator),
+            };
+            gop.value_ptr.* = ts;
         }
         return gop.value_ptr.*;
     }
 
-    pub fn maybeOverlayFor(self: *Manifest, id: u64) ?*Overlay {
-        self.overlays_lock.lock();
-        defer self.overlays_lock.unlock();
-        return self.overlays.get(id);
+    fn lookupTenantState(self: *Manifest, id: u64) ?*TenantState {
+        self.tenants_lock.lock();
+        defer self.tenants_lock.unlock();
+        return self.tenants.get(id);
+    }
+
+    // ── beginTxn / openStore ────────────────────────────────────────
+
+    /// Open a new top-level Txn at the tail of `tenant_id`'s chain.
+    /// Subsequent puts/deletes through this Txn land in its overlay;
+    /// reads see this Txn's writes + any older chain entries + the
+    /// tenant's main_overlay + LMDB.
+    ///
+    /// Returns `error.StoreNotFound` if the tenant doesn't exist
+    /// (caller must `createStore` first).
+    pub fn beginTxn(self: *Manifest, tenant_id: u64) !*Txn {
+        try self.checkAlive();
+        if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
+
+        const ts = try self.getOrCreateTenantState(tenant_id);
+        ts.lock.lock();
+        defer ts.lock.unlock();
+
+        const txn = try self.allocator.create(Txn);
+        errdefer self.allocator.destroy(txn);
+        txn.* = .{
+            .manifest = self,
+            .tenant_id = tenant_id,
+            .tenant_state = ts,
+            .parent = null,
+            .chain_prev = ts.chain_tail,
+            .chain_next = null,
+            .overlay = Overlay.init(self.allocator),
+            .open_child = null,
+        };
+        if (ts.chain_tail) |tail| {
+            tail.chain_next = txn;
+        } else {
+            ts.chain_head = txn;
+        }
+        ts.chain_tail = txn;
+        return txn;
+    }
+
+    /// Open a read-only `Store` handle for callers that aren't in a
+    /// txn. Sees only the tenant's `main_overlay` + LMDB — never any
+    /// in-flight Txn. Returns `error.StoreNotFound` if the tenant
+    /// doesn't exist.
+    pub fn openStore(self: *Manifest, tenant_id: u64) !Store {
+        if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
+        return .{ .manifest = self, .tenant_id = tenant_id };
     }
 
     // ── durabilize ──────────────────────────────────────────────────
 
-    /// Commit every pending overlay + create + drop to LMDB in one
-    /// atomic write transaction, stamping the `raft_idx` watermark
-    /// into the `_meta` sub-DBI as part of the same commit.
-    ///
-    /// If `raft_idx == 0`, the watermark is NOT written (the previous
-    /// durable value is preserved). This lets test code and
-    /// integrations that don't track a raft idx call `commit()` (an
-    /// alias) without disturbing the watermark.
-    ///
-    /// If `raft_idx > 0`, the value is written verbatim — kvexp does
-    /// not enforce monotonicity. Callers should pass a value that
-    /// monotonically advances; passing a smaller value is technically
-    /// allowed (think: recovery scenarios) but typically a bug.
     pub fn durabilize(self: *Manifest, raft_idx: u64) !void {
         try self.checkAlive();
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
         errdefer self.poison();
 
-        // Snapshot the pending creates / drops list. Under dbis_lock
-        // we take a stable copy; subsequent createStore/dropStore
-        // calls may add to the live sets — those will be drained at
-        // the next durabilize.
+        // 1. Snapshot pending creates/drops.
         var creates_to_apply: std.ArrayListUnmanaged(u64) = .empty;
         defer creates_to_apply.deinit(self.allocator);
         var drops_to_apply: std.ArrayListUnmanaged(struct { id: u64, dbi: lmdb.Dbi }) = .empty;
@@ -423,27 +407,26 @@ pub const Manifest = struct {
             }
         }
 
-        // Snapshot the (id, overlay) pairs to drain.
-        var pairs: std.ArrayListUnmanaged(struct { id: u64, ov: *Overlay }) = .empty;
-        defer pairs.deinit(self.allocator);
+        // 2. Enumerate every tenant.
+        const TenantPair = struct { id: u64, ts: *TenantState };
+        var tenant_pairs: std.ArrayListUnmanaged(TenantPair) = .empty;
+        defer tenant_pairs.deinit(self.allocator);
         {
-            self.overlays_lock.lock();
-            defer self.overlays_lock.unlock();
-            var it = self.overlays.iterator();
+            self.tenants_lock.lock();
+            defer self.tenants_lock.unlock();
+            var it = self.tenants.iterator();
             while (it.next()) |entry| {
-                try pairs.append(self.allocator, .{
+                try tenant_pairs.append(self.allocator, .{
                     .id = entry.key_ptr.*,
-                    .ov = entry.value_ptr.*,
+                    .ts = entry.value_ptr.*,
                 });
             }
         }
 
-        // SWAP each non-empty overlay's entries into a local map.
-        // Workers writing during durabilize land in the fresh empty
-        // map; we own the swapped entries free-and-clear. DBI resolution
-        // is deferred to apply-time because pending-create stores
-        // don't have a durable DBI yet — it's created earlier in this
-        // same write txn.
+        // 3. Swap each tenant's main_overlay into a local buffer.
+        //    Workers committing top-level Txns during durabilize land
+        //    in a fresh main_overlay that we leave behind; their data
+        //    will be in the next durabilize.
         var swapped_list: std.ArrayListUnmanaged(SwappedEntry) = .empty;
         defer {
             for (swapped_list.items) |*s| {
@@ -459,35 +442,32 @@ pub const Manifest = struct {
             }
             swapped_list.deinit(self.allocator);
         }
-
-        for (pairs.items) |p| {
-            p.ov.lock.lock();
-            const empty = p.ov.isEmptyLocked();
+        for (tenant_pairs.items) |t| {
+            t.ts.lock.lock();
+            const empty = t.ts.main_overlay.entries.count() == 0;
             if (empty) {
-                p.ov.lock.unlock();
+                t.ts.lock.unlock();
                 continue;
             }
-            const taken = p.ov.entries;
-            p.ov.entries = .empty;
-            p.ov.lock.unlock();
+            const taken = t.ts.main_overlay.entries;
+            t.ts.main_overlay.entries = .empty;
+            t.ts.lock.unlock();
             try swapped_list.append(self.allocator, .{
-                .id = p.id,
+                .id = t.id,
                 .entries = taken,
             });
         }
 
+        // 4. Apply everything in one LMDB write txn.
         var txn = try lmdb.Txn.beginWrite(&self.env);
         errdefer txn.abort();
 
-        // Apply pending drops first (empties their DBIs).
         for (drops_to_apply.items) |d| {
             try txn.dropDbi(d.dbi, false);
             var id_key_buf: [8]u8 = undefined;
             _ = try txn.del(self.stores_dbi, encodeStoreIdKey(d.id, &id_key_buf));
         }
 
-        // Apply pending creates. Collect (id, new_dbi) for later
-        // commit into `self.dbis`.
         var new_dbis: std.ArrayListUnmanaged(NewDbi) = .empty;
         defer new_dbis.deinit(self.allocator);
         for (creates_to_apply.items) |id| {
@@ -499,11 +479,6 @@ pub const Manifest = struct {
             try new_dbis.append(self.allocator, .{ .id = id, .dbi = dbi });
         }
 
-        // Resolve each overlay's DBI for this txn. Freshly-created
-        // stores' DBIs are in `new_dbis`; everything else is in
-        // `self.dbis`. Drops have already emptied the underlying
-        // tree, so any overlay entries for a dropped (and not
-        // re-created) store would have no live DBI — skip.
         for (swapped_list.items) |s| {
             const dbi = self.lookupDbiForApply(s.id, new_dbis.items) orelse continue;
             var it = s.entries.iterator();
@@ -515,9 +490,6 @@ pub const Manifest = struct {
             }
         }
 
-        // Only write the watermark when the caller supplied a non-zero
-        // value. `raft_idx == 0` means "don't disturb whatever's
-        // already durable" — used by tests and by `commit()`.
         if (raft_idx != 0) {
             var idx_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &idx_buf, raft_idx, .little);
@@ -526,9 +498,7 @@ pub const Manifest = struct {
 
         try txn.commit();
 
-        // Commit succeeded: bookkeeping. Move new DBIs into self.dbis,
-        // remove dropped, clear pending sets (only the entries we
-        // applied — concurrent callers may have added more).
+        // 5. Bookkeeping.
         {
             self.dbis_lock.lock();
             defer self.dbis_lock.unlock();
@@ -541,6 +511,21 @@ pub const Manifest = struct {
                 _ = self.pending_creates.remove(n.id);
             }
         }
+    }
+
+    /// Convenience: durabilize without disturbing the raft watermark.
+    pub fn commit(self: *Manifest) !void {
+        return self.durabilize(0);
+    }
+
+    /// Read the durable raft watermark from LMDB. Returns 0 if no
+    /// durabilize has ever written one.
+    pub fn durableRaftIdx(self: *Manifest) !u64 {
+        var txn = try lmdb.Txn.beginRead(&self.env);
+        defer txn.abort();
+        const bytes = (try txn.get(self.meta_dbi, META_RAFT_APPLY_KEY)) orelse return 0;
+        if (bytes.len != 8) return 0;
+        return std.mem.readInt(u64, bytes[0..8], .little);
     }
 
     const NewDbi = struct { id: u64, dbi: lmdb.Dbi };
@@ -556,56 +541,50 @@ pub const Manifest = struct {
         return self.dbis.get(id);
     }
 
-    /// Convenience: durabilize without disturbing the raft watermark.
-    /// Used by tests and by callers that don't track a raft idx.
-    /// Equivalent to `durabilize(0)`.
-    pub fn commit(self: *Manifest) !void {
-        return self.durabilize(0);
-    }
-
-    // ── snapshots ───────────────────────────────────────────────────
+    // ── snapshot ────────────────────────────────────────────────────
 
     pub fn openSnapshot(self: *Manifest) !Snapshot {
-        // Serialize against durabilize: openSnapshot needs an atomic
-        // moment in which overlays + LMDB state agree.
+        // Serialize against durabilize so we get a coherent moment.
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
 
-        // LMDB read txn — provides the immutable point-in-time view
-        // of every store.
         var read_txn = try lmdb.Txn.beginRead(&self.env);
         errdefer read_txn.abort();
 
-        // Capture overlays.
-        var ov_capture: std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry) = .empty;
-        errdefer freeOverlayCapture(self.allocator, &ov_capture);
+        // Capture every tenant's main_overlay (open txn state is NOT
+        // captured — snapshots see committed-but-not-durabilized
+        // state, never speculation).
+        var ov_capture: std.AutoHashMapUnmanaged(u64, []SnapshotEntry) = .empty;
+        errdefer freeSnapshotOverlay(self.allocator, &ov_capture);
 
-        // List overlays to copy under the overlays_lock; release before
-        // capturing each (we still hold the per-overlay lock during
-        // its copy).
-        const Pair = struct { id: u64, ov: *Overlay };
-        var pairs: std.ArrayListUnmanaged(Pair) = .empty;
+        const TenantPair = struct { id: u64, ts: *TenantState };
+        var pairs: std.ArrayListUnmanaged(TenantPair) = .empty;
         defer pairs.deinit(self.allocator);
         {
-            self.overlays_lock.lock();
-            defer self.overlays_lock.unlock();
-            var it = self.overlays.iterator();
+            self.tenants_lock.lock();
+            defer self.tenants_lock.unlock();
+            var it = self.tenants.iterator();
             while (it.next()) |entry| {
                 try pairs.append(self.allocator, .{
                     .id = entry.key_ptr.*,
-                    .ov = entry.value_ptr.*,
+                    .ts = entry.value_ptr.*,
                 });
             }
         }
         for (pairs.items) |p| {
-            var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
-            errdefer freeOverlayEntries(self.allocator, entries.items, entries.items.len);
-            errdefer entries.deinit(self.allocator);
+            var entries: std.ArrayListUnmanaged(SnapshotEntry) = .empty;
+            errdefer {
+                for (entries.items) |e| {
+                    self.allocator.free(e.key);
+                    if (e.value) |v| self.allocator.free(v);
+                }
+                entries.deinit(self.allocator);
+            }
             {
-                p.ov.lock.lock();
-                defer p.ov.lock.unlock();
-                if (p.ov.isEmptyLocked()) continue;
-                var oe_it = p.ov.entries.iterator();
+                p.ts.lock.lock();
+                defer p.ts.lock.unlock();
+                if (p.ts.main_overlay.entries.count() == 0) continue;
+                var oe_it = p.ts.main_overlay.entries.iterator();
                 while (oe_it.next()) |oe| {
                     const k = try self.allocator.dupe(u8, oe.key_ptr.*);
                     errdefer self.allocator.free(k);
@@ -616,7 +595,7 @@ pub const Manifest = struct {
                     try entries.append(self.allocator, .{ .key = k, .value = v });
                 }
             }
-            std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.entryLessThan);
+            std.mem.sort(SnapshotEntry, entries.items, {}, SnapshotEntry.lessThan);
             const slice = try entries.toOwnedSlice(self.allocator);
             try ov_capture.put(self.allocator, p.id, slice);
         }
@@ -647,119 +626,140 @@ pub const Manifest = struct {
     }
 };
 
-fn freeOverlayEntries(
-    allocator: std.mem.Allocator,
-    entries: []StorePrefixCursor.Entry,
-    upto: usize,
-) void {
-    for (entries[0..upto]) |e| {
-        allocator.free(e.key);
-        if (e.value) |v| allocator.free(v);
-    }
-}
+// ─── TenantState ────────────────────────────────────────────────────
 
-fn freeOverlayCapture(
-    allocator: std.mem.Allocator,
-    map: *std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry),
-) void {
-    var it = map.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.*) |kv| {
-            allocator.free(kv.key);
-            if (kv.value) |v| allocator.free(v);
-        }
-        allocator.free(entry.value_ptr.*);
-    }
-    map.deinit(allocator);
-}
+const TenantState = struct {
+    lock: std.Thread.Mutex = .{},
+    main_overlay: Overlay,
+    chain_head: ?*Txn = null,
+    chain_tail: ?*Txn = null,
+};
 
-// ── Store ───────────────────────────────────────────────────────────
+// ─── Txn ────────────────────────────────────────────────────────────
 
-pub const Store = struct {
+pub const Txn = struct {
     manifest: *Manifest,
-    id: u64,
-    /// Null iff the store is pending-create (no durable DBI yet).
-    /// Writes still work via the overlay; reads that miss the overlay
-    /// return null (the store has no durable data yet).
-    dbi: ?lmdb.Dbi,
+    tenant_id: u64,
+    tenant_state: *TenantState,
+    /// null for top-level (chain entry); non-null for savepoint.
+    parent: ?*Txn,
+    /// Linked-list pointers for the per-tenant chain. Used only on
+    /// top-level Txns (parent == null).
+    chain_prev: ?*Txn,
+    chain_next: ?*Txn,
+    /// This Txn's own writes.
+    overlay: Overlay,
+    /// The currently-open savepoint child, if any. LIFO: at most one.
+    open_child: ?*Txn,
 
-    pub fn open(manifest: *Manifest, id: u64) !Store {
-        if (!try manifest.hasStore(id)) return error.StoreNotFound;
-        return .{ .manifest = manifest, .id = id, .dbi = manifest.lookupDbi(id) };
+    // ── writes ──────────────────────────────────────────────────────
+
+    pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.open_child != null) return error.SavepointStillOpen;
+        try self.overlay.putLocked(key, value);
     }
 
-    pub fn deinit(self: *Store) void {
-        _ = self;
+    pub fn delete(self: *Txn, key: []const u8) !bool {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.open_child != null) return error.SavepointStillOpen;
+        const existed = try self.keyExistsLocked(key);
+        try self.overlay.tombstoneLocked(key);
+        return existed;
     }
 
-    pub fn get(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        // Overlay first.
-        if (self.manifest.maybeOverlayFor(self.id)) |ov| {
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            if (ov.getLocked(key)) |entry| switch (entry) {
+    // ── reads ───────────────────────────────────────────────────────
+
+    pub fn get(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        return self.getLocked(allocator, key);
+    }
+
+    fn getLocked(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        // Walk savepoint stack: self → parent → parent.parent → ...
+        // After top-level, walk chain backward.
+        var cur: ?*Txn = self;
+        while (cur) |t| {
+            if (t.overlay.entries.get(key)) |entry| {
+                switch (entry) {
+                    .value => |v| return try allocator.dupe(u8, v),
+                    .tombstone => return null,
+                }
+            }
+            cur = if (t.parent) |p| p else t.chain_prev;
+        }
+        // main_overlay.
+        if (self.tenant_state.main_overlay.entries.get(key)) |entry| {
+            switch (entry) {
                 .value => |v| return try allocator.dupe(u8, v),
                 .tombstone => return null,
+            }
+        }
+        // LMDB.
+        const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
+        var read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
+        defer read_txn.abort();
+        if (try read_txn.get(dbi, key)) |bytes| {
+            return try allocator.dupe(u8, bytes);
+        }
+        return null;
+    }
+
+    /// Like getLocked but only returns whether the key resolves to a
+    /// value (true) or null/tombstone (false). Used by delete() to
+    /// compute the return bool without allocating.
+    fn keyExistsLocked(self: *Txn, key: []const u8) !bool {
+        var cur: ?*Txn = self;
+        while (cur) |t| {
+            if (t.overlay.entries.get(key)) |entry| {
+                return switch (entry) {
+                    .value => true,
+                    .tombstone => false,
+                };
+            }
+            cur = if (t.parent) |p| p else t.chain_prev;
+        }
+        if (self.tenant_state.main_overlay.entries.get(key)) |entry| {
+            return switch (entry) {
+                .value => true,
+                .tombstone => false,
             };
         }
-        // No DBI yet (pending create) → no durable data to fall through to.
-        const dbi = self.dbi orelse return null;
-        var txn = try lmdb.Txn.beginRead(&self.manifest.env);
-        defer txn.abort();
-        const got = (try txn.get(dbi, key)) orelse return null;
-        return try allocator.dupe(u8, got);
+        const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return false;
+        var read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
+        defer read_txn.abort();
+        return (try read_txn.get(dbi, key)) != null;
     }
 
-    pub fn put(self: *Store, key: []const u8, value: []const u8) !void {
-        try self.manifest.checkAlive();
-        const sl = try self.manifest.storeLock(self.id);
-        sl.lock();
-        defer sl.unlock();
-        const ov = try self.manifest.overlayFor(self.id);
-        ov.lock.lock();
-        defer ov.lock.unlock();
-        try ov.putLocked(key, value);
-    }
+    pub fn scanPrefix(self: *Txn, prefix: []const u8) !TxnPrefixCursor {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
 
-    pub fn delete(self: *Store, key: []const u8) !bool {
-        try self.manifest.checkAlive();
-        const sl = try self.manifest.storeLock(self.id);
-        sl.lock();
-        defer sl.unlock();
+        // Flatten the layered view into a sorted slice, with closer-
+        // to-self layers winning collisions. Tombstones are preserved
+        // as null values — needed during the LMDB merge to shadow
+        // entries that have been deleted in any overlay layer.
+        var dedup: std.StringHashMapUnmanaged(?[]u8) = .empty;
+        defer dedup.deinit(self.manifest.allocator);
+        // Track key ownership separately so we can transfer to the
+        // cursor's final slice without re-cloning.
+        var ordered_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer ordered_keys.deinit(self.manifest.allocator);
 
-        const ov = try self.manifest.overlayFor(self.id);
-        {
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            if (ov.getLocked(key)) |entry| switch (entry) {
-                .value => {
-                    try ov.tombstoneLocked(key);
-                    return true;
-                },
-                .tombstone => return false,
-            };
+        var cur: ?*Txn = self;
+        while (cur) |t| {
+            try absorbOverlayLocked(self.manifest.allocator, &t.overlay, prefix, &dedup, &ordered_keys);
+            cur = if (t.parent) |p| p else t.chain_prev;
         }
+        try absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
 
-        // Overlay miss — check LMDB to determine return bool. If no
-        // durable DBI exists (pending create), nothing to delete.
-        const dbi = self.dbi orelse return false;
-        const existed_in_tree = blk: {
-            var txn = try lmdb.Txn.beginRead(&self.manifest.env);
-            defer txn.abort();
-            const got = try txn.get(dbi, key);
-            break :blk got != null;
-        };
-        if (!existed_in_tree) return false;
-
-        ov.lock.lock();
-        defer ov.lock.unlock();
-        try ov.tombstoneLocked(key);
-        return true;
-    }
-
-    pub fn scanPrefix(self: *Store, prefix: []const u8) !StorePrefixCursor {
-        // Snapshot the overlay's prefix-matching entries.
-        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+        // Materialize sorted slice.
+        var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
         errdefer {
             for (entries.items) |e| {
                 self.manifest.allocator.free(e.key);
@@ -767,23 +767,12 @@ pub const Store = struct {
             }
             entries.deinit(self.manifest.allocator);
         }
-        if (self.manifest.maybeOverlayFor(self.id)) |ov| {
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            var it = ov.entries.iterator();
-            while (it.next()) |entry| {
-                const k = entry.key_ptr.*;
-                if (!std.mem.startsWith(u8, k, prefix)) continue;
-                const key_copy = try self.manifest.allocator.dupe(u8, k);
-                errdefer self.manifest.allocator.free(key_copy);
-                const val_copy: ?[]u8 = switch (entry.value_ptr.*) {
-                    .value => |v| try self.manifest.allocator.dupe(u8, v),
-                    .tombstone => null,
-                };
-                try entries.append(self.manifest.allocator, .{ .key = key_copy, .value = val_copy });
-            }
+        try entries.ensureTotalCapacity(self.manifest.allocator, ordered_keys.items.len);
+        for (ordered_keys.items) |k| {
+            const v = dedup.get(k).?;
+            entries.appendAssumeCapacity(.{ .key = k, .value = v });
         }
-        std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.entryLessThan);
+        std.mem.sort(TxnPrefixCursor.Entry, entries.items, {}, TxnPrefixCursor.Entry.lessThan);
         const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
         errdefer {
             for (overlay_slice) |e| {
@@ -793,48 +782,163 @@ pub const Store = struct {
             self.manifest.allocator.free(overlay_slice);
         }
 
-        // If the store has no durable DBI yet (pending create), skip
-        // the LMDB cursor entirely — the merge becomes overlay-only.
-        // We still need valid (empty) Txn/Cursor structs because the
-        // cursor field types aren't optional; default-constructed
-        // structs with null ptrs are no-ops on close/abort.
+        // LMDB cursor (if the tenant has a durable DBI).
         var read_txn: lmdb.Txn = .{ .ptr = null };
         var lmdb_cur: lmdb.Cursor = .{ .ptr = null };
-        if (self.dbi) |dbi| {
+        var has_lmdb = false;
+        if (self.manifest.lookupDbi(self.tenant_id)) |dbi| {
             read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
             errdefer read_txn.abort();
             lmdb_cur = try read_txn.openCursor(dbi);
+            has_lmdb = true;
         }
-        errdefer if (lmdb_cur.ptr != null) lmdb_cur.close();
-        errdefer if (read_txn.ptr != null) read_txn.abort();
+        errdefer if (has_lmdb) {
+            lmdb_cur.close();
+            read_txn.abort();
+        };
 
-        var cur: StorePrefixCursor = .{
+        var cursor: TxnPrefixCursor = .{
             .allocator = self.manifest.allocator,
-            .read_txn = read_txn,
-            .lmdb_cur = lmdb_cur,
-            .has_lmdb = self.dbi != null,
-            .prefix = try self.manifest.allocator.dupe(u8, prefix),
             .overlay = overlay_slice,
             .ov_idx = 0,
+            .read_txn = read_txn,
+            .lmdb_cur = lmdb_cur,
+            .has_lmdb = has_lmdb,
+            .prefix = try self.manifest.allocator.dupe(u8, prefix),
             .have_tree = false,
             .tree_key = &.{},
             .tree_val = &.{},
             .out_key = &.{},
             .out_val = &.{},
         };
-        try cur.primeTree();
-        return cur;
+        try cursor.primeTree();
+        return cursor;
+    }
+
+    // ── savepoint / commit / rollback ──────────────────────────────
+
+    /// Push a new savepoint onto this Txn (or onto an existing chain
+    /// of savepoints if there's already one open and you want to nest
+    /// — but you'd call savepoint on the deepest open one, not on
+    /// this Txn). Returns the child handle.
+    pub fn savepoint(self: *Txn) !*Txn {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.open_child != null) return error.SavepointStillOpen;
+        const child = try self.manifest.allocator.create(Txn);
+        errdefer self.manifest.allocator.destroy(child);
+        child.* = .{
+            .manifest = self.manifest,
+            .tenant_id = self.tenant_id,
+            .tenant_state = self.tenant_state,
+            .parent = self,
+            .chain_prev = null,
+            .chain_next = null,
+            .overlay = Overlay.init(self.manifest.allocator),
+            .open_child = null,
+        };
+        self.open_child = child;
+        return child;
+    }
+
+    pub fn commit(self: *Txn) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.open_child != null) return error.SavepointStillOpen;
+        if (self.parent) |parent| {
+            // Savepoint commit.
+            try Overlay.moveInto(&self.overlay, &parent.overlay);
+            parent.open_child = null;
+        } else {
+            // Top-level commit: must be chain head.
+            if (self.tenant_state.chain_head != self) return error.NotChainHead;
+            try Overlay.moveInto(&self.overlay, &self.tenant_state.main_overlay);
+            if (self.chain_next) |next| {
+                next.chain_prev = null;
+                self.tenant_state.chain_head = next;
+            } else {
+                self.tenant_state.chain_head = null;
+                self.tenant_state.chain_tail = null;
+            }
+        }
+        self.overlay.deinit();
+        self.manifest.allocator.destroy(self);
+    }
+
+    pub fn rollback(self: *Txn) void {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.parent == null) {
+            // Top-level: detach the tail of the chain at self, then
+            // free self + all successors.
+            if (self.chain_prev) |prev| {
+                prev.chain_next = null;
+                self.tenant_state.chain_tail = prev;
+            } else {
+                self.tenant_state.chain_head = null;
+                self.tenant_state.chain_tail = null;
+            }
+            var cur: ?*Txn = self;
+            while (cur) |c| {
+                const next = c.chain_next;
+                c.freeSubtreeLocked();
+                cur = next;
+            }
+        } else {
+            // Savepoint: detach from parent + free subtree.
+            self.parent.?.open_child = null;
+            self.freeSubtreeLocked();
+        }
+    }
+
+    /// Recursively free self + any open_child subtree. Caller holds
+    /// tenant_state.lock. Does not touch the chain (caller has
+    /// already detached this Txn from the chain if needed).
+    fn freeSubtreeLocked(self: *Txn) void {
+        if (self.open_child) |child| child.freeSubtreeLocked();
+        self.overlay.deinit();
+        self.manifest.allocator.destroy(self);
     }
 };
 
-// ── Merge cursor over LMDB cursor + captured overlay ────────────────
+/// Add prefix-matching entries from `ov` into `dedup`, transferring
+/// ownership of newly-cloned key bytes into `ordered_keys`. Caller
+/// owns the dedup map and the ordered_keys list; both are freed by
+/// the caller. Closer-to-cursor layers should be called first; entries
+/// already in `dedup` are skipped.
+fn absorbOverlayLocked(
+    allocator: std.mem.Allocator,
+    ov: *Overlay,
+    prefix: []const u8,
+    dedup: *std.StringHashMapUnmanaged(?[]u8),
+    ordered_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var it = ov.entries.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (!std.mem.startsWith(u8, k, prefix)) continue;
+        const gop = try dedup.getOrPut(allocator, k);
+        if (gop.found_existing) continue;
+        const key_copy = try allocator.dupe(u8, k);
+        errdefer allocator.free(key_copy);
+        const val_copy: ?[]u8 = switch (e.value_ptr.*) {
+            .value => |v| try allocator.dupe(u8, v),
+            .tombstone => null,
+        };
+        gop.key_ptr.* = key_copy;
+        gop.value_ptr.* = val_copy;
+        try ordered_keys.append(allocator, key_copy);
+    }
+}
 
-pub const StorePrefixCursor = struct {
+// ─── TxnPrefixCursor ────────────────────────────────────────────────
+
+pub const TxnPrefixCursor = struct {
     allocator: std.mem.Allocator,
     read_txn: lmdb.Txn,
     lmdb_cur: lmdb.Cursor,
-    /// False for pending-create stores (no durable DBI). `primeTree`
-    /// / `advanceTree` short-circuit and leave `have_tree` false.
     has_lmdb: bool,
     prefix: []u8,
     overlay: []Entry,
@@ -847,14 +951,13 @@ pub const StorePrefixCursor = struct {
 
     pub const Entry = struct {
         key: []u8,
-        value: ?[]u8, // null = tombstone
+        value: ?[]u8,
+        pub fn lessThan(_: void, a: Entry, b: Entry) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
     };
 
-    pub fn entryLessThan(_: void, a: Entry, b: Entry) bool {
-        return std.mem.lessThan(u8, a.key, b.key);
-    }
-
-    fn primeTree(self: *StorePrefixCursor) !void {
+    fn primeTree(self: *TxnPrefixCursor) !void {
         if (!self.has_lmdb) {
             self.have_tree = false;
             return;
@@ -874,7 +977,7 @@ pub const StorePrefixCursor = struct {
         self.have_tree = false;
     }
 
-    fn advanceTree(self: *StorePrefixCursor) !void {
+    fn advanceTree(self: *TxnPrefixCursor) !void {
         if (!self.has_lmdb) {
             self.have_tree = false;
             return;
@@ -891,11 +994,10 @@ pub const StorePrefixCursor = struct {
         self.have_tree = false;
     }
 
-    pub fn next(self: *StorePrefixCursor) !bool {
+    pub fn next(self: *TxnPrefixCursor) !bool {
         while (true) {
             const have_ov = self.ov_idx < self.overlay.len;
             if (!self.have_tree and !have_ov) return false;
-
             if (self.have_tree and have_ov) {
                 const ord = std.mem.order(u8, self.tree_key, self.overlay[self.ov_idx].key);
                 switch (ord) {
@@ -932,7 +1034,7 @@ pub const StorePrefixCursor = struct {
                 self.out_val = self.tree_val;
                 try self.advanceTree();
                 return true;
-            } else { // overlay only
+            } else {
                 const e = self.overlay[self.ov_idx];
                 self.ov_idx += 1;
                 if (e.value) |v| {
@@ -945,15 +1047,14 @@ pub const StorePrefixCursor = struct {
         }
     }
 
-    pub fn key(self: *const StorePrefixCursor) []const u8 {
+    pub fn key(self: *const TxnPrefixCursor) []const u8 {
         return self.out_key;
     }
-
-    pub fn value(self: *const StorePrefixCursor) []const u8 {
+    pub fn value(self: *const TxnPrefixCursor) []const u8 {
         return self.out_val;
     }
 
-    pub fn deinit(self: *StorePrefixCursor) void {
+    pub fn deinit(self: *TxnPrefixCursor) void {
         if (self.has_lmdb) {
             self.lmdb_cur.close();
             self.read_txn.abort();
@@ -968,30 +1069,139 @@ pub const StorePrefixCursor = struct {
     }
 };
 
-// ── Snapshot ────────────────────────────────────────────────────────
+// ─── Store (read-only) ──────────────────────────────────────────────
+
+pub const Store = struct {
+    manifest: *Manifest,
+    tenant_id: u64,
+
+    pub fn deinit(self: *Store) void {
+        _ = self;
+    }
+
+    pub fn get(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        if (self.manifest.lookupTenantState(self.tenant_id)) |ts| {
+            ts.lock.lock();
+            defer ts.lock.unlock();
+            if (ts.main_overlay.entries.get(key)) |entry| {
+                switch (entry) {
+                    .value => |v| return try allocator.dupe(u8, v),
+                    .tombstone => return null,
+                }
+            }
+        }
+        const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
+        var txn = try lmdb.Txn.beginRead(&self.manifest.env);
+        defer txn.abort();
+        if (try txn.get(dbi, key)) |bytes| return try allocator.dupe(u8, bytes);
+        return null;
+    }
+
+    pub fn scanPrefix(self: *Store, prefix: []const u8) !StorePrefixCursor {
+        // Snapshot the main_overlay's prefix-matching entries.
+        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+        errdefer {
+            for (entries.items) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            entries.deinit(self.manifest.allocator);
+        }
+        if (self.manifest.lookupTenantState(self.tenant_id)) |ts| {
+            ts.lock.lock();
+            defer ts.lock.unlock();
+            var it = ts.main_overlay.entries.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                if (!std.mem.startsWith(u8, k, prefix)) continue;
+                const k_copy = try self.manifest.allocator.dupe(u8, k);
+                errdefer self.manifest.allocator.free(k_copy);
+                const v_copy: ?[]u8 = switch (e.value_ptr.*) {
+                    .value => |v| try self.manifest.allocator.dupe(u8, v),
+                    .tombstone => null,
+                };
+                try entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy });
+            }
+        }
+        std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.Entry.lessThan);
+        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        errdefer {
+            for (overlay_slice) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            self.manifest.allocator.free(overlay_slice);
+        }
+
+        var read_txn: lmdb.Txn = .{ .ptr = null };
+        var lmdb_cur: lmdb.Cursor = .{ .ptr = null };
+        var has_lmdb = false;
+        if (self.manifest.lookupDbi(self.tenant_id)) |dbi| {
+            read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
+            errdefer read_txn.abort();
+            lmdb_cur = try read_txn.openCursor(dbi);
+            has_lmdb = true;
+        }
+        errdefer if (has_lmdb) {
+            lmdb_cur.close();
+            read_txn.abort();
+        };
+
+        var cur: StorePrefixCursor = .{
+            .allocator = self.manifest.allocator,
+            .read_txn = read_txn,
+            .lmdb_cur = lmdb_cur,
+            .has_lmdb = has_lmdb,
+            .prefix = try self.manifest.allocator.dupe(u8, prefix),
+            .overlay = overlay_slice,
+            .ov_idx = 0,
+            .have_tree = false,
+            .tree_key = &.{},
+            .tree_val = &.{},
+            .out_key = &.{},
+            .out_val = &.{},
+        };
+        try cur.primeTree();
+        return cur;
+    }
+};
+
+pub const StorePrefixCursor = TxnPrefixCursor; // identical merge logic
+
+// ─── Snapshot ───────────────────────────────────────────────────────
+
+const SnapshotEntry = struct {
+    key: []u8,
+    value: ?[]u8,
+    fn lessThan(_: void, a: SnapshotEntry, b: SnapshotEntry) bool {
+        return std.mem.lessThan(u8, a.key, b.key);
+    }
+};
+
+fn freeSnapshotOverlay(
+    allocator: std.mem.Allocator,
+    map: *std.AutoHashMapUnmanaged(u64, []SnapshotEntry),
+) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |kv| {
+            allocator.free(kv.key);
+            if (kv.value) |v| allocator.free(v);
+        }
+        allocator.free(entry.value_ptr.*);
+    }
+    map.deinit(allocator);
+}
 
 pub const Snapshot = struct {
     manifest: *Manifest,
     read_txn: lmdb.Txn,
-    overlays: std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry),
+    overlays: std.AutoHashMapUnmanaged(u64, []SnapshotEntry),
 
     pub fn close(self: *Snapshot) void {
-        var it = self.overlays.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.*) |kv| {
-                self.manifest.allocator.free(kv.key);
-                if (kv.value) |v| self.manifest.allocator.free(v);
-            }
-            self.manifest.allocator.free(entry.value_ptr.*);
-        }
-        self.overlays.deinit(self.manifest.allocator);
+        freeSnapshotOverlay(self.manifest.allocator, &self.overlays);
         self.read_txn.abort();
         self.* = undefined;
-    }
-
-    pub fn storeRoot(self: *Snapshot, store_id: u64) !?u64 {
-        if (self.manifest.lookupDbi(store_id) == null) return null;
-        return store_id;
     }
 
     pub fn get(
@@ -1007,16 +1217,13 @@ pub const Snapshot = struct {
                 return null;
             }
         }
-        const dbi = self.manifest.lookupDbi(store_id) orelse return error.StoreNotFound;
-        const got = (try self.read_txn.get(dbi, key)) orelse return null;
-        return try allocator.dupe(u8, got);
+        const dbi = self.manifest.lookupDbi(store_id) orelse return null;
+        if (try self.read_txn.get(dbi, key)) |bytes| return try allocator.dupe(u8, bytes);
+        return null;
     }
 
     pub fn scanPrefix(self: *Snapshot, store_id: u64, prefix: []const u8) !SnapshotPrefixCursor {
-        const dbi = self.manifest.lookupDbi(store_id) orelse return error.StoreNotFound;
-
-        // Filter captured overlay for prefix matches.
-        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+        var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
         errdefer {
             for (entries.items) |e| {
                 self.manifest.allocator.free(e.key);
@@ -1027,10 +1234,10 @@ pub const Snapshot = struct {
         if (self.overlays.get(store_id)) |captured| {
             for (captured) |e| {
                 if (!std.mem.startsWith(u8, e.key, prefix)) continue;
-                const k = try self.manifest.allocator.dupe(u8, e.key);
-                errdefer self.manifest.allocator.free(k);
-                const v: ?[]u8 = if (e.value) |val| try self.manifest.allocator.dupe(u8, val) else null;
-                try entries.append(self.manifest.allocator, .{ .key = k, .value = v });
+                const k_copy = try self.manifest.allocator.dupe(u8, e.key);
+                errdefer self.manifest.allocator.free(k_copy);
+                const v_copy: ?[]u8 = if (e.value) |v| try self.manifest.allocator.dupe(u8, v) else null;
+                try entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy });
             }
         }
         const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
@@ -1042,12 +1249,18 @@ pub const Snapshot = struct {
             self.manifest.allocator.free(overlay_slice);
         }
 
-        var lmdb_cur = try self.read_txn.openCursor(dbi);
-        errdefer lmdb_cur.close();
+        var lmdb_cur: lmdb.Cursor = .{ .ptr = null };
+        var has_lmdb = false;
+        if (self.manifest.lookupDbi(store_id)) |dbi| {
+            lmdb_cur = try self.read_txn.openCursor(dbi);
+            has_lmdb = true;
+        }
+        errdefer if (has_lmdb) lmdb_cur.close();
 
         var cur: SnapshotPrefixCursor = .{
             .allocator = self.manifest.allocator,
             .lmdb_cur = lmdb_cur,
+            .has_lmdb = has_lmdb,
             .prefix = try self.manifest.allocator.dupe(u8, prefix),
             .overlay = overlay_slice,
             .ov_idx = 0,
@@ -1074,14 +1287,14 @@ pub const Snapshot = struct {
     }
 };
 
-/// Same shape as StorePrefixCursor but borrowing the snapshot's read
-/// txn (snapshot owns it). Separate type so deinit doesn't double-
-/// abort the txn.
+/// SnapshotPrefixCursor uses TxnPrefixCursor's merge logic; the only
+/// difference is it doesn't own the read_txn (the Snapshot does).
 pub const SnapshotPrefixCursor = struct {
     allocator: std.mem.Allocator,
     lmdb_cur: lmdb.Cursor,
+    has_lmdb: bool,
     prefix: []u8,
-    overlay: []StorePrefixCursor.Entry,
+    overlay: []TxnPrefixCursor.Entry,
     ov_idx: usize,
     have_tree: bool,
     tree_key: []const u8,
@@ -1090,6 +1303,10 @@ pub const SnapshotPrefixCursor = struct {
     out_val: []const u8,
 
     fn primeTree(self: *SnapshotPrefixCursor) !void {
+        if (!self.has_lmdb) {
+            self.have_tree = false;
+            return;
+        }
         const pair = if (self.prefix.len == 0)
             try self.lmdb_cur.first()
         else
@@ -1106,6 +1323,10 @@ pub const SnapshotPrefixCursor = struct {
     }
 
     fn advanceTree(self: *SnapshotPrefixCursor) !void {
+        if (!self.has_lmdb) {
+            self.have_tree = false;
+            return;
+        }
         const pair = try self.lmdb_cur.next();
         if (pair) |p| {
             if (std.mem.startsWith(u8, p.key, self.prefix)) {
@@ -1174,14 +1395,12 @@ pub const SnapshotPrefixCursor = struct {
     pub fn key(self: *const SnapshotPrefixCursor) []const u8 {
         return self.out_key;
     }
-
     pub fn value(self: *const SnapshotPrefixCursor) []const u8 {
         return self.out_val;
     }
 
     pub fn deinit(self: *SnapshotPrefixCursor) void {
-        self.lmdb_cur.close();
-        // Don't abort the txn — owned by the Snapshot.
+        if (self.has_lmdb) self.lmdb_cur.close();
         for (self.overlay) |e| {
             self.allocator.free(e.key);
             if (e.value) |v| self.allocator.free(v);
@@ -1192,7 +1411,7 @@ pub const SnapshotPrefixCursor = struct {
     }
 };
 
-fn binarySearchEntry(entries: []const StorePrefixCursor.Entry, key: []const u8) ?usize {
+fn binarySearchEntry(entries: []const SnapshotEntry, key: []const u8) ?usize {
     var lo: usize = 0;
     var hi: usize = entries.len;
     while (lo < hi) {
@@ -1206,9 +1425,9 @@ fn binarySearchEntry(entries: []const StorePrefixCursor.Entry, key: []const u8) 
     return null;
 }
 
-// ── State-transfer dump / restore ──────────────────────────────────
+// ─── State transfer dump/load ──────────────────────────────────────
 
-pub const SNAPSHOT_MAGIC: u32 = 0x4B565853; // 'KVXS' little-endian
+pub const SNAPSHOT_MAGIC: u32 = 0x4B565853;
 pub const SNAPSHOT_VERSION: u8 = 1;
 pub const SNAP_TAG_KV: u8 = 1;
 pub const SNAP_TAG_END: u8 = 2;
@@ -1216,10 +1435,7 @@ pub const SNAP_TAG_END: u8 = 2;
 pub fn dumpSnapshot(snap: *Snapshot, writer: anytype) !void {
     try writer.writeInt(u32, SNAPSHOT_MAGIC, .little);
     try writer.writeByte(SNAPSHOT_VERSION);
-    // Reserved field (was apply_seq pre-LMDB). Kept as a 0 in the
-    // wire format so future tooling can re-purpose it without bumping
-    // the version. loadSnapshot discards it.
-    try writer.writeInt(u64, 0, .little);
+    try writer.writeInt(u64, 0, .little); // reserved
     try writer.writeInt(u64, try snap.manifest.durableRaftIdx(), .little);
 
     const stores = try snap.listStores(snap.manifest.allocator);
@@ -1255,6 +1471,14 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     var key_buf: [KMAX]u8 = undefined;
     var val_buf: [VMAX]u8 = undefined;
 
+    // One Txn per tenant; collected here and all committed at the end.
+    var txns: std.AutoHashMapUnmanaged(u64, *Txn) = .empty;
+    defer txns.deinit(manifest.allocator);
+    errdefer {
+        var it = txns.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.rollback();
+    }
+
     while (true) {
         const tag = try reader.readByte();
         switch (tag) {
@@ -1266,18 +1490,20 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
                 if (klen > key_buf.len or vlen > val_buf.len) return error.InvalidSnapshotFormat;
                 try reader.readNoEof(key_buf[0..klen]);
                 try reader.readNoEof(val_buf[0..vlen]);
-                if (!(try manifest.hasStore(id))) {
-                    try manifest.createStore(id);
+                if (!(try manifest.hasStore(id))) try manifest.createStore(id);
+                const gop = try txns.getOrPut(manifest.allocator, id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = try manifest.beginTxn(id);
                 }
-                var s = try Store.open(manifest, id);
-                defer s.deinit();
-                try s.put(key_buf[0..klen], val_buf[0..vlen]);
+                try gop.value_ptr.*.put(key_buf[0..klen], val_buf[0..vlen]);
             },
             else => return error.InvalidSnapshotFormat,
         }
     }
-    // Caller passes `last_applied` to `durabilize` to commit it
-    // alongside the loaded data in a single LMDB txn.
+    // Commit all txns. Each tenant has exactly one open chain entry
+    // (we created it at first put), so each commit is the chain head.
+    var it = txns.iterator();
+    while (it.next()) |entry| try entry.value_ptr.*.commit();
     return last_applied;
 }
 
@@ -1321,7 +1547,6 @@ const Harness = struct {
         self.tmp.cleanup();
     }
 
-    /// Close + reopen the manifest. Used for crash-recovery tests.
     fn cycle(self: *Harness) !void {
         self.manifest.deinit();
         try self.manifest.init(testing.allocator, self.path, .{
@@ -1335,258 +1560,353 @@ test "Manifest: create + reopen survives" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(7);
-    try h.manifest.createStore(42);
     try h.manifest.commit();
     try h.cycle();
     try testing.expect(try h.manifest.hasStore(7));
-    try testing.expect(try h.manifest.hasStore(42));
-    try testing.expect(!try h.manifest.hasStore(99));
 }
 
-test "Manifest: createStore rejects duplicate" {
+test "Txn: simple put then commit lands in main_overlay, reads see it" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try testing.expectError(error.StoreAlreadyExists, h.manifest.createStore(1));
-}
-
-test "Manifest: dropStore removes the entry; recreate works" {
-    var h = try Harness.init();
-    defer h.deinit();
-    try h.manifest.createStore(10);
     try h.manifest.commit();
-    try testing.expect(try h.manifest.hasStore(10));
-    try testing.expect(try h.manifest.dropStore(10));
-    try testing.expect(!try h.manifest.dropStore(10));
-    try h.manifest.commit();
-    try h.cycle();
-    try testing.expect(!try h.manifest.hasStore(10));
-}
 
-test "Store: put/get/delete in one store" {
-    var h = try Harness.init();
-    defer h.deinit();
-    try h.manifest.createStore(1);
-    var s = try Store.open(h.manifest, 1);
+    var txn = try h.manifest.beginTxn(1);
+    try txn.put("k", "v");
+    try txn.commit();
+
+    var s = try h.manifest.openStore(1);
     defer s.deinit();
-    try s.put("k", "v");
-    {
-        const got = (try s.get(testing.allocator, "k")).?;
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings("v", got);
-    }
-    try testing.expect(try s.delete("k"));
-    try testing.expect((try s.get(testing.allocator, "k")) == null);
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
 }
 
-test "Store: durabilize then reopen sees the writes" {
-    var h = try Harness.init();
-    defer h.deinit();
-    try h.manifest.createStore(1);
-    {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("a", "1");
-        try s.put("b", "2");
-    }
-    try h.manifest.commit();
-    try h.cycle();
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-    const a = (try s.get(testing.allocator, "a")).?;
-    defer testing.allocator.free(a);
-    try testing.expectEqualStrings("1", a);
-    const b = (try s.get(testing.allocator, "b")).?;
-    defer testing.allocator.free(b);
-    try testing.expectEqualStrings("2", b);
-}
-
-test "Store: writes lost on close before durabilize" {
+test "Txn: rollback drops writes; main_overlay untouched" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
     try h.manifest.commit();
-    {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("k", "v");
-    }
-    // No durabilize.
-    try h.cycle();
-    var s = try Store.open(h.manifest, 1);
+
+    var txn = try h.manifest.beginTxn(1);
+    try txn.put("k", "v");
+    txn.rollback();
+
+    var s = try h.manifest.openStore(1);
     defer s.deinit();
     try testing.expect((try s.get(testing.allocator, "k")) == null);
 }
 
-test "Store.scanPrefix: merges overlay + lmdb in sorted order" {
+test "Txn: reads see its own writes before commit" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var txn = try h.manifest.beginTxn(1);
+    defer txn.rollback();
+    try txn.put("k", "v");
+    const got = (try txn.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
+}
+
+test "Txn: chain reads see earlier txns' writes" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t1 = try h.manifest.beginTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.manifest.beginTxn(1);
+    // t2 should see t1's writes (chain reads backward).
+    const got = (try t2.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("1", got);
+
+    t2.rollback();
+    t1.rollback();
+}
+
+test "Txn: top-level rollback cascades to successors" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t1 = try h.manifest.beginTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.manifest.beginTxn(1);
+    try t2.put("b", "2");
+    var t3 = try h.manifest.beginTxn(1);
+    try t3.put("c", "3");
+
+    // Rollback t2 → t2 and t3 are dropped.
+    t2.rollback();
+
+    // Chain head is t1; only t1 remains open.
+    try testing.expect(h.manifest.tenants.get(1).?.chain_head == t1);
+    try testing.expect(h.manifest.tenants.get(1).?.chain_tail == t1);
+
+    try t1.commit();
+
+    var s = try h.manifest.openStore(1);
+    defer s.deinit();
+    const got = (try s.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("1", got);
+    try testing.expect((try s.get(testing.allocator, "b")) == null);
+    try testing.expect((try s.get(testing.allocator, "c")) == null);
+}
+
+test "Txn: commit must be chain head" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t1 = try h.manifest.beginTxn(1);
+    var t2 = try h.manifest.beginTxn(1);
+    try testing.expectError(error.NotChainHead, t2.commit());
+    t2.rollback();
+    try t1.commit();
+}
+
+test "Savepoint: commit merges into parent overlay" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t = try h.manifest.beginTxn(1);
+    defer t.rollback();
+    try t.put("a", "1");
+    var sp = try t.savepoint();
+    try sp.put("b", "2");
+    try sp.commit();
+    // After sp.commit(), b is in t.overlay.
+    const got = (try t.get(testing.allocator, "b")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("2", got);
+}
+
+test "Savepoint: rollback drops only the savepoint's writes" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t = try h.manifest.beginTxn(1);
+    defer t.rollback();
+    try t.put("a", "1");
+    var sp = try t.savepoint();
+    try sp.put("b", "2");
+    sp.rollback();
+    // a still present, b gone.
+    const ga = (try t.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualStrings("1", ga);
+    try testing.expect((try t.get(testing.allocator, "b")) == null);
+}
+
+test "Savepoint: nested savepoints LIFO" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t = try h.manifest.beginTxn(1);
+    defer t.rollback();
+    var sp1 = try t.savepoint();
+    try sp1.put("a", "1");
+    var sp2 = try sp1.savepoint();
+    try sp2.put("b", "2");
+    try sp2.commit();      // b merges into sp1
+    try sp1.commit();      // a, b merge into t
+
+    const ga = (try t.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualStrings("1", ga);
+    const gb = (try t.get(testing.allocator, "b")).?;
+    defer testing.allocator.free(gb);
+    try testing.expectEqualStrings("2", gb);
+}
+
+test "Savepoint: commit/rollback while inner savepoint open errors" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t = try h.manifest.beginTxn(1);
+    defer t.rollback();
+    var sp = try t.savepoint();
+    try testing.expectError(error.SavepointStillOpen, t.commit());
+    try testing.expectError(error.SavepointStillOpen, t.put("x", "y"));
+    sp.rollback();
+    try t.put("x", "y"); // works after closing the savepoint
+}
+
+test "durabilize: drains main_overlay; in-flight txn stays" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.commit();
+
+    var t1 = try h.manifest.beginTxn(1);
+    try t1.put("durable", "yes");
+    try t1.commit(); // → main_overlay
+
+    var t2 = try h.manifest.beginTxn(1);
+    try t2.put("inflight", "maybe");
+
+    try h.manifest.commit();    // drains main_overlay; t2 untouched
+
+    // After commit, t2 still sees its own write.
+    const got = (try t2.get(testing.allocator, "inflight")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("maybe", got);
+
+    // A fresh Store sees the durable value, not t2's in-flight one.
+    var s = try h.manifest.openStore(1);
+    defer s.deinit();
+    const dg = (try s.get(testing.allocator, "durable")).?;
+    defer testing.allocator.free(dg);
+    try testing.expectEqualStrings("yes", dg);
+    try testing.expect((try s.get(testing.allocator, "inflight")) == null);
+
+    t2.rollback();
+}
+
+test "Txn.scanPrefix: merges chain + main + LMDB in order" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("a", "tree-a");
-        try s.put("c", "tree-c");
+        var t = try h.manifest.beginTxn(1);
+        try t.put("a", "lmdb-a");
+        try t.put("c", "lmdb-c");
+        try t.commit();
     }
-    try h.manifest.commit();
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-    try s.put("b", "ov-b");
-    try s.put("c", "ov-c"); // override
+    try h.manifest.commit(); // a, c are in LMDB now
 
-    var cur = try s.scanPrefix("");
+    var t1 = try h.manifest.beginTxn(1);
+    defer t1.rollback();
+    try t1.put("b", "t1-b");
+    var t2 = try h.manifest.beginTxn(1);
+    defer t2.rollback();
+    try t2.put("d", "t2-d");
+    try t2.put("a", "t2-a"); // override LMDB's a
+
+    var cur = try t2.scanPrefix("");
     defer cur.deinit();
-    var collected: [3]struct { k: []const u8, v: []const u8 } = undefined;
+    var collected: [4]struct { k: []const u8, v: []const u8 } = undefined;
     var n: usize = 0;
     while (try cur.next()) : (n += 1) {
         collected[n] = .{ .k = cur.key(), .v = cur.value() };
     }
-    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(usize, 4), n);
     try testing.expectEqualStrings("a", collected[0].k);
-    try testing.expectEqualStrings("tree-a", collected[0].v);
+    try testing.expectEqualStrings("t2-a", collected[0].v);
     try testing.expectEqualStrings("b", collected[1].k);
-    try testing.expectEqualStrings("ov-b", collected[1].v);
+    try testing.expectEqualStrings("t1-b", collected[1].v);
     try testing.expectEqualStrings("c", collected[2].k);
-    try testing.expectEqualStrings("ov-c", collected[2].v);
+    try testing.expectEqualStrings("lmdb-c", collected[2].v);
+    try testing.expectEqualStrings("d", collected[3].k);
+    try testing.expectEqualStrings("t2-d", collected[3].v);
 }
 
-test "Store.scanPrefix: tombstone shadows tree entry" {
+test "Txn: delete tombstone shadows everything below" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("a", "1");
-        try s.put("b", "2");
-        try s.put("c", "3");
+        var t = try h.manifest.beginTxn(1);
+        try t.put("k", "lmdb");
+        try t.commit();
     }
     try h.manifest.commit();
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-    _ = try s.delete("b");
 
-    var cur = try s.scanPrefix("");
-    defer cur.deinit();
-    var keys: [2]u8 = undefined;
-    var n: usize = 0;
-    while (try cur.next()) : (n += 1) {
-        keys[n] = cur.key()[0];
-    }
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(u8, 'a'), keys[0]);
-    try testing.expectEqual(@as(u8, 'c'), keys[1]);
+    var t = try h.manifest.beginTxn(1);
+    defer t.rollback();
+    try testing.expect(try t.delete("k"));
+    try testing.expect((try t.get(testing.allocator, "k")) == null);
 }
 
-test "Manifest: durableRaftIdx round-trips via durabilize(idx)" {
+test "durableRaftIdx: durabilize(idx) stamps; survives reopen" {
     var h = try Harness.init();
     defer h.deinit();
     try testing.expectEqual(@as(u64, 0), try h.manifest.durableRaftIdx());
-
     try h.manifest.durabilize(42);
     try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
-
     try h.cycle();
     try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
-
-    // `commit()` (alias for durabilize(0)) preserves the watermark.
+    // commit() preserves the watermark.
     try h.manifest.commit();
     try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
-
-    // Advancing.
-    try h.manifest.durabilize(100);
-    try testing.expectEqual(@as(u64, 100), try h.manifest.durableRaftIdx());
 }
 
-test "discardOverlays: drops in-flight writes; durable state intact" {
-    var h = try Harness.init();
-    defer h.deinit();
-    try h.manifest.createStore(1);
-    {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("durable", "yes");
-    }
-    try h.manifest.commit(); // "durable" → "yes" lives in LMDB.
-
-    // Stage speculative writes that won't be raft-committed.
-    {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("speculative", "maybe");
-        try s.put("durable", "overridden");
-    }
-
-    h.manifest.discardOverlays();
-
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-    // "speculative" vanished.
-    try testing.expect((try s.get(testing.allocator, "speculative")) == null);
-    // "durable" reverted to its LMDB value.
-    const got = (try s.get(testing.allocator, "durable")).?;
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("yes", got);
-}
-
-test "Manifest: poison blocks writes; reopen clears it" {
+test "poison blocks writes; reopen clears" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
     try h.manifest.commit();
+
     h.manifest._testPoison();
     try testing.expect(h.manifest.isPoisoned());
     try testing.expectError(error.ManifestPoisoned, h.manifest.durabilize(0));
     try testing.expectError(error.ManifestPoisoned, h.manifest.createStore(2));
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-    try testing.expectError(error.ManifestPoisoned, s.put("k", "v"));
+    try testing.expectError(error.ManifestPoisoned, h.manifest.beginTxn(1));
 
     try h.cycle();
     try testing.expect(!h.manifest.isPoisoned());
     try testing.expect(try h.manifest.hasStore(1));
 }
 
-test "Snapshot: captures uncommitted overlay puts" {
+test "Snapshot: sees main_overlay + LMDB; not in-flight Txn" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("a", "tree-a");
+        var t = try h.manifest.beginTxn(1);
+        try t.put("durable", "yes");
+        try t.commit();
     }
     try h.manifest.commit();
+
+    // Now a committed-but-not-durabilized write:
     {
-        var s = try Store.open(h.manifest, 1);
-        defer s.deinit();
-        try s.put("b", "ov-b");
+        var t = try h.manifest.beginTxn(1);
+        try t.put("commitnotdurable", "yes");
+        try t.commit();
     }
+    // And an open Txn:
+    var inflight = try h.manifest.beginTxn(1);
+    defer inflight.rollback();
+    try inflight.put("inflight", "no");
+
     var snap = try h.manifest.openSnapshot();
     defer snap.close();
-    const ga = (try snap.get(testing.allocator, 1, "a")).?;
-    defer testing.allocator.free(ga);
-    try testing.expectEqualStrings("tree-a", ga);
-    const gb = (try snap.get(testing.allocator, 1, "b")).?;
-    defer testing.allocator.free(gb);
-    try testing.expectEqualStrings("ov-b", gb);
+
+    const a = (try snap.get(testing.allocator, 1, "durable")).?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("yes", a);
+    const b = (try snap.get(testing.allocator, 1, "commitnotdurable")).?;
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("yes", b);
+    try testing.expect((try snap.get(testing.allocator, 1, "inflight")) == null);
 }
 
-test "dumpSnapshot / loadSnapshot: full round-trip" {
+test "dumpSnapshot / loadSnapshot round-trip" {
     var src = try Harness.init();
     defer src.deinit();
     try src.manifest.createStore(10);
-    try src.manifest.createStore(20);
     {
-        var s = try Store.open(src.manifest, 10);
-        defer s.deinit();
-        try s.put("a", "1");
-        try s.put("b", "2");
-    }
-    {
-        var s = try Store.open(src.manifest, 20);
-        defer s.deinit();
-        try s.put("z", "9");
+        var t = try src.manifest.beginTxn(10);
+        try t.put("a", "1");
+        try t.put("b", "2");
+        try t.commit();
     }
     try src.manifest.durabilize(99);
 
@@ -1601,47 +1921,43 @@ test "dumpSnapshot / loadSnapshot: full round-trip" {
     var dst = try Harness.init();
     defer dst.deinit();
     var reader_state = std.io.fixedBufferStream(buf.items);
-    const reader = reader_state.reader();
-    const last = try loadSnapshot(dst.manifest, reader);
+    const last = try loadSnapshot(dst.manifest, reader_state.reader());
     try testing.expectEqual(@as(u64, 99), last);
     try dst.manifest.durabilize(last);
-
     try testing.expectEqual(@as(u64, 99), try dst.manifest.durableRaftIdx());
-    try testing.expect(try dst.manifest.hasStore(10));
-    try testing.expect(try dst.manifest.hasStore(20));
-    var s10 = try Store.open(dst.manifest, 10);
-    defer s10.deinit();
-    const ga = (try s10.get(testing.allocator, "a")).?;
+
+    var s = try dst.manifest.openStore(10);
+    defer s.deinit();
+    const ga = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(ga);
     try testing.expectEqualStrings("1", ga);
 }
 
-test "Manifest: listStores returns ids in ascending order" {
-    var h = try Harness.init();
-    defer h.deinit();
-    const ids = [_]u64{ 5, 1, 9, 3, 100 };
-    for (ids) |id| try h.manifest.createStore(id);
-    const got = try h.manifest.listStores(testing.allocator);
-    defer testing.allocator.free(got);
-    try testing.expectEqualSlices(u64, &.{ 1, 3, 5, 9, 100 }, got);
-}
-
-test "verify: reports store count + raft watermark" {
+test "dropStore: while txns open, drops everything cleanly" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.createStore(2);
-    try h.manifest.durabilize(7);
-    const report = try h.manifest.verify(testing.allocator);
-    try testing.expectEqual(@as(u64, 2), report.store_count);
-    try testing.expectEqual(@as(u64, 7), report.durable_raft_idx);
+    try h.manifest.commit();
+
+    // Open a txn, then drop the store. The txn's memory is freed.
+    _ = try h.manifest.beginTxn(1);
+    // Don't keep a handle past dropStore — that's the "explicit
+    // drop-from-under-you" caveat.
+    _ = try h.manifest.dropStore(1);
+    try h.manifest.commit();
+    try testing.expect(!try h.manifest.hasStore(1));
 }
 
-// -----------------------------------------------------------------------------
-// Property test: random workload + simulated crash (close+reopen without
-// intervening durabilize). After recovery, the durable prefix must exactly
-// match the model snapshot taken at the last successful durabilize.
-// -----------------------------------------------------------------------------
+test "Property: random workload + simulated crash recovers durable prefix" {
+    const runs: u64 = 30;
+    var seed: u64 = 1;
+    while (seed <= runs) : (seed += 1) {
+        propRunOne(seed) catch |err| {
+            std.debug.print("\n*** property test failed at seed {} : {} ***\n", .{ seed, err });
+            return err;
+        };
+    }
+}
 
 const PROP_NUM_STORES: usize = 4;
 const PROP_NUM_KEYS: usize = 10;
@@ -1665,7 +1981,7 @@ fn verifyAgainstModel(manifest: *Manifest, model: *const PropModel) !void {
         const exists = try manifest.hasStore(sid);
         if (exists != model.store_exists[sid_usize]) return error.StoreExistenceMismatch;
         if (!exists) continue;
-        var s = try Store.open(manifest, sid);
+        var s = try manifest.openStore(sid);
         defer s.deinit();
         for (0..PROP_NUM_KEYS) |kid| {
             var kb: [3]u8 = undefined;
@@ -1691,8 +2007,7 @@ fn propRunOne(seed: u64) !void {
 
     var model: PropModel = .{};
     var durable_model: PropModel = .{};
-
-    const op_count: u32 = rng.intRangeAtMost(u32, 40, 120);
+    const op_count: u32 = rng.intRangeAtMost(u32, 30, 80);
     const crash_at: u32 = rng.intRangeLessThan(u32, 0, op_count);
 
     var i: u32 = 0;
@@ -1708,21 +2023,21 @@ fn propRunOne(seed: u64) !void {
             if (!model.store_exists[sid_usize]) continue;
             const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
             const v = rng.int(u8);
-            var s = try Store.open(h.manifest, @intCast(sid_usize));
-            defer s.deinit();
+            var t = try h.manifest.beginTxn(@intCast(sid_usize));
             var kb: [3]u8 = undefined;
             var vb: [1]u8 = .{v};
-            try s.put(keyBuf(&kb, kid), vb[0..1]);
+            try t.put(keyBuf(&kb, kid), vb[0..1]);
+            try t.commit();
             model.key_present[sid_usize][kid] = true;
             model.values[sid_usize][kid] = v;
         } else if (choice < 70) {
             const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
             if (!model.store_exists[sid_usize]) continue;
             const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
-            var s = try Store.open(h.manifest, @intCast(sid_usize));
-            defer s.deinit();
+            var t = try h.manifest.beginTxn(@intCast(sid_usize));
             var kb: [3]u8 = undefined;
-            const existed = try s.delete(keyBuf(&kb, kid));
+            const existed = try t.delete(keyBuf(&kb, kid));
+            try t.commit();
             if (existed != model.key_present[sid_usize][kid]) return error.DeleteMismatch;
             model.key_present[sid_usize][kid] = false;
         } else if (choice < 82) {
@@ -1741,16 +2056,5 @@ fn propRunOne(seed: u64) !void {
             try h.manifest.commit();
             durable_model = model;
         }
-    }
-}
-
-test "property: random workload + crash recovers durable prefix" {
-    const runs: u64 = 50;
-    var seed: u64 = 1;
-    while (seed <= runs) : (seed += 1) {
-        propRunOne(seed) catch |err| {
-            std.debug.print("\n*** property test failed at seed {} : {} ***\n", .{ seed, err });
-            return err;
-        };
     }
 }

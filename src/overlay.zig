@@ -123,6 +123,38 @@ pub const Overlay = struct {
         return self.entries.get(key);
     }
 
+    /// Move every entry from `src` into `dest`, transferring ownership
+    /// of the key/value bytes rather than re-cloning. After the call,
+    /// `src` is empty; `dest` has the union of both sets with `src`'s
+    /// entries winning collisions (key existed in both → dest gets
+    /// src's value, dest's old value/tombstone is freed). Caller must
+    /// hold both overlays' locks (or otherwise serialize access).
+    pub fn moveInto(src: *Overlay, dest: *Overlay) !void {
+        std.debug.assert(src.allocator.ptr == dest.allocator.ptr);
+        var it = src.entries.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            const v = e.value_ptr.*;
+            const gop = try dest.entries.getOrPut(dest.allocator, k);
+            if (gop.found_existing) {
+                // dest already has this key. Free OUR key bytes (dest
+                // keeps its own copy), free dest's prior value, install
+                // our value.
+                src.allocator.free(k);
+                switch (gop.value_ptr.*) {
+                    .value => |old| dest.allocator.free(old),
+                    .tombstone => {},
+                }
+                gop.value_ptr.* = v;
+            } else {
+                // Transfer src's key and value into dest verbatim.
+                gop.key_ptr.* = k;
+                gop.value_ptr.* = v;
+            }
+        }
+        src.entries.clearRetainingCapacity();
+    }
+
     /// True iff the overlay has no entries (use to skip durabilize-time
     /// work for untouched stores). Caller must hold `self.lock`.
     pub fn isEmptyLocked(self: *const Overlay) bool {
