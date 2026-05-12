@@ -179,7 +179,16 @@ error.UnsupportedSnapshotVersion
 
 ## Recipes
 
-### 1. Speculative apply (optimistic per-tenant writes)
+The recipes below walk a raft integration end-to-end:
+
+1. **Leader speculative apply** — accept and start work optimistically.
+2. **Leader switch** — discard speculation when leadership is lost.
+3. **State transfer** — ship/receive a snapshot when log replay won't catch a follower up.
+4. **Cold start** — open the manifest and tell raft where to resume.
+5. **Follower apply** — apply already-committed entries without speculation.
+6. **Graceful shutdown** — drain, checkpoint, close.
+
+### 1. Leader speculative apply (optimistic per-tenant writes)
 
 Open a Txn per request. Don't wait for raft — continue to the next
 request, opening a new Txn at the tail of the chain. Responses gate
@@ -339,6 +348,97 @@ fn installSnapshot(manifest: *kvexp.Manifest, src_path: []const u8) !void {
     try manifest.durabilize(last_applied);
 
     try raft.loadSnapshot(last_applied);
+}
+```
+
+### 4. Cold start / recovery
+
+On process boot, open the manifest, ask LMDB for the durable raft
+watermark, and tell raft to resume from there. Raft delivers every
+committed entry past the watermark through your apply path (recipe 5).
+
+```zig
+fn nodeStartup(path: [:0]const u8) !*kvexp.Manifest {
+    const manifest = try allocator.create(kvexp.Manifest);
+    errdefer allocator.destroy(manifest);
+    try manifest.init(allocator, path, .{
+        .max_stores = 65534,
+        .max_map_size = 16 * 1024 * 1024 * 1024,
+    });
+    errdefer manifest.deinit();
+
+    // Raft resumes from the watermark. Everything up to and including
+    // `resume_from` is materialized in LMDB; everything past replays
+    // through `applyEntry` (recipe 5).
+    const resume_from = try manifest.durableRaftIdx();
+    try raft.openAt(resume_from);
+
+    return manifest;
+}
+```
+
+If `durableRaftIdx` is older than the leader's compaction floor, raft
+will refuse to replay and instead ask for a snapshot — apply recipe 3.
+
+### 5. Follower apply (non-leader path)
+
+A follower never proposes; it just applies entries the leader committed.
+No pending queue, no speculation, no rollback path — open a Txn per
+entry, write the ops, commit.
+
+```zig
+/// Called by raft once an entry passes the commit threshold and is the
+/// next to apply. Same hook runs on the new leader when it replays its
+/// own log after recovery.
+fn applyEntry(manifest: *kvexp.Manifest, entry: RaftEntry) !void {
+    const ws = entry.decodeWriteset();
+
+    // Tenant lifecycle ops flow through the manifest, not a Txn.
+    switch (ws.kind) {
+        .create_store => { try manifest.createStore(ws.tenant_id); },
+        .drop_store   => { _ = try manifest.dropStore(ws.tenant_id); },
+        .writeset     => {
+            var txn = try manifest.beginTxn(ws.tenant_id);
+            errdefer txn.rollback();
+            for (ws.ops) |op| switch (op.kind) {
+                .put    => try txn.put(op.key, op.value),
+                .delete => _ = try txn.delete(op.key),
+            };
+            try txn.commit();        // chain is length 1; head == tail
+        },
+    }
+
+    latest_committed = entry.idx;
+}
+
+/// Same checkpoint cadence as the leader.
+fn checkpoint(manifest: *kvexp.Manifest) !void {
+    try manifest.durabilize(latest_committed);
+}
+```
+
+When a follower wins an election, no kvexp-side handoff is needed: its
+chain is empty (every prior entry was committed by `applyEntry`), so
+new client requests can start using the leader path (recipe 1)
+immediately.
+
+### 6. Graceful shutdown
+
+Drain workers, flush, close. The final `durabilize` lets raft compact
+past `latest_committed`; skipping it just means more replay next boot.
+
+```zig
+fn shutdown(manifest: *kvexp.Manifest) !void {
+    // Stop accepting new client work and let in-flight proposals
+    // resolve (commit or reject) so the pending queue empties.
+    try workers.drain();
+
+    // Any Txn still in the chain at this point was never accepted by
+    // raft and is not durable anywhere — let it die with the process.
+    try manifest.durabilize(latest_committed);
+
+    manifest.deinit();
+    allocator.destroy(manifest);
 }
 ```
 
