@@ -61,6 +61,9 @@ const PagedFileApi = paged_file_mod.PagedFileApi;
 const FaultyPagedFile = @import("faulty_paged_file.zig").FaultyPagedFile;
 const PageCache = @import("page_cache.zig").PageCache;
 const Header = @import("header.zig").Header;
+const overlay_mod = @import("overlay.zig");
+const Overlay = overlay_mod.Overlay;
+const OverlayEntry = overlay_mod.OverlayEntry;
 
 pub const SLOT_A_PAGE: u64 = 1;
 pub const SLOT_B_PAGE: u64 = 2;
@@ -224,6 +227,11 @@ pub const STORE_ROOT_SHARD_COUNT: usize = 16;
 const StoreRootShard = struct {
     lock: std.Thread.Mutex = .{},
     cache: std.AutoHashMapUnmanaged(u64, RootSlot) = .empty,
+    /// store_id → overlay pointer. The overlay is heap-allocated so
+    /// its address stays stable while we drop the shard lock to use
+    /// the overlay's own lock. Created lazily on the first put or
+    /// delete for that store_id.
+    overlays: std.AutoHashMapUnmanaged(u64, *Overlay) = .empty,
     _pad: [64]u8 = @splat(0),
 };
 
@@ -595,6 +603,37 @@ pub const Manifest = struct {
         return &self.store_root_shards[id % STORE_ROOT_SHARD_COUNT];
     }
 
+    /// Get or lazily create the in-memory overlay for `id`. The
+    /// returned pointer is stable for the lifetime of the manifest
+    /// (overlays are never freed until `deinit`; `dropStore` clears
+    /// the contents but keeps the shell — wasted memory for a dropped
+    /// store is bounded and rare). Caller does NOT hold the shard
+    /// lock on return — they should acquire the overlay's own lock
+    /// before reading or writing it.
+    pub fn overlayFor(self: *Manifest, id: u64) !*Overlay {
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        const gop = try shard.overlays.getOrPut(self.allocator, id);
+        if (!gop.found_existing) {
+            const ov = try self.allocator.create(Overlay);
+            ov.* = Overlay.init(self.allocator);
+            gop.value_ptr.* = ov;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Return the overlay if it exists; null if none has been created
+    /// for this store yet. Lets readers skip the lock entirely for
+    /// stores that have seen no writes since the last durabilize that
+    /// dropped the overlay (or have never been written at all).
+    pub fn maybeOverlayFor(self: *Manifest, id: u64) ?*Overlay {
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        return shard.overlays.get(id);
+    }
+
     /// Start a new apply unit. Subsequent mutations tag dirty pages
     /// with the returned sequence. Multiple applies between durabilize
     /// calls accumulate in-memory state tagged with distinct seqs;
@@ -669,7 +708,15 @@ pub const Manifest = struct {
         while (it.next()) |m| self.allocator.destroy(m.*);
         self.store_locks.deinit(self.allocator);
         self.snapshot_counts.deinit(self.allocator);
-        for (&self.store_root_shards) |*sh| sh.cache.deinit(self.allocator);
+        for (&self.store_root_shards) |*sh| {
+            sh.cache.deinit(self.allocator);
+            var ov_it = sh.overlays.iterator();
+            while (ov_it.next()) |entry| {
+                entry.value_ptr.*.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
+            }
+            sh.overlays.deinit(self.allocator);
+        }
         self.* = undefined;
     }
 
@@ -886,6 +933,14 @@ pub const Manifest = struct {
         const k = encodeStoreId(id, &id_buf);
         _ = try self.tree.delete(k);
         _ = shard.cache.remove(id);
+        // Clear the overlay if one exists for this id. Otherwise a
+        // drop-then-recreate cycle on the same id would resurrect
+        // stale entries written before the drop.
+        if (shard.overlays.get(id)) |ov| {
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            ov.clear();
+        }
         return true;
     }
 
@@ -1005,6 +1060,13 @@ pub const Manifest = struct {
         // safe recovery from an fsync gate (kernel may have forgotten
         // the EIO; a naive retry could silently succeed).
         errdefer self.poison();
+
+        // Step -1: drain every non-empty overlay into its store's
+        // tree. This is where the per-put CoW cost is paid — but in
+        // bulk, single-threaded, after coalescing all puts to the
+        // same key since the last durabilize into one tree.put. Hot
+        // keys updated 100× generate one CoW chain, not 100.
+        try self.applyOverlays();
 
         // Step 0: flush dirty store_root cache entries into the
         // manifest tree. The hot apply path bypasses tree_lock via
@@ -1162,6 +1224,92 @@ pub const Manifest = struct {
     /// yet (those applies aren't durabilized). Group commit makes
     /// large gaps between durable seqs possible, so this rule
     /// generalizes phase-4's "max_eligible = sequence - 1."
+    /// Drain every non-empty overlay into its store's tree. Caller
+    /// must hold `durabilize_lock`. Done as the very first phase of
+    /// durabilize so subsequent steps see a tree that reflects all
+    /// applied work, and the dirty store_root cache entries land in
+    /// step 0's drain naturally.
+    ///
+    /// Overlay swap: we atomically take ownership of each overlay's
+    /// current entries and replace the live map with a fresh empty
+    /// one. Workers continuing to call `Store.put` during durabilize
+    /// land in the fresh map; the swapped-out entries are applied to
+    /// the tree without any further coordination with writers.
+    fn applyOverlays(self: *Manifest) !void {
+        for (&self.store_root_shards) |*shard| {
+            // Snapshot the (id, overlay, root) tuples for this shard.
+            // We can't hold shard.lock while calling tree.put (that
+            // would re-enter the lock via setStoreRoot), so we copy
+            // out the work list under the lock and release.
+            const WorkItem = struct { id: u64, overlay: *Overlay, root: u64 };
+            var work: std.ArrayListUnmanaged(WorkItem) = .empty;
+            defer work.deinit(self.allocator);
+
+            shard.lock.lock();
+            var ov_it = shard.overlays.iterator();
+            while (ov_it.next()) |entry| {
+                const id = entry.key_ptr.*;
+                const ov = entry.value_ptr.*;
+                const root_slot = shard.cache.get(id) orelse continue;
+                try work.append(self.allocator, .{
+                    .id = id,
+                    .overlay = ov,
+                    .root = root_slot.root,
+                });
+            }
+            shard.lock.unlock();
+
+            for (work.items) |w| {
+                try self.applyOneOverlay(w.id, w.overlay, w.root);
+            }
+        }
+    }
+
+    fn applyOneOverlay(self: *Manifest, id: u64, ov: *Overlay, initial_root: u64) !void {
+        // Swap: take ownership of the overlay's current entries,
+        // leave a fresh empty map. Workers writing during the apply
+        // land in the fresh map and DON'T race the in-flight apply.
+        var swapped: std.StringHashMapUnmanaged(OverlayEntry) = undefined;
+        {
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            if (ov.isEmptyLocked()) return;
+            swapped = ov.entries;
+            ov.entries = .empty;
+        }
+        defer {
+            var it = swapped.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                switch (e.value_ptr.*) {
+                    .value => |v| self.allocator.free(v),
+                    .tombstone => {},
+                }
+            }
+            swapped.deinit(self.allocator);
+        }
+
+        // Build a Tree at the store's current root and apply the
+        // swapped entries.
+        var tree = try Tree.init(self.allocator, self.cache, self.file, self.pageAllocator());
+        tree.root = initial_root;
+        self.tree_lock.lock();
+        tree.seq = self.tree.seq;
+        self.tree_lock.unlock();
+
+        var it = swapped.iterator();
+        while (it.next()) |e| {
+            switch (e.value_ptr.*) {
+                .value => |v| try tree.put(e.key_ptr.*, v),
+                .tombstone => _ = try tree.delete(e.key_ptr.*),
+            }
+        }
+
+        // Publish the new tree.root into the store_root cache
+        // (dirty=true so step 0 writes it into the manifest tree).
+        try self.setStoreRoot(id, tree.root);
+    }
+
     fn refillReusable(self: *Manifest) !void {
         if (self.active_seq < 1) return;
         const min_snap = self.minLiveSnapSeq();
@@ -1473,15 +1621,21 @@ pub const Store = struct {
     }
 
     pub fn get(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        self.manifest.tree_lock.lock();
-        const root_opt = try self.manifest.storeRootLocked(self.id);
-        self.manifest.tree_lock.unlock();
+        // Overlay first — any put/delete since the last durabilize is
+        // here. Tombstones short-circuit the tree walk.
+        if (self.manifest.maybeOverlayFor(self.id)) |ov| {
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            if (ov.getLocked(key)) |entry| switch (entry) {
+                .value => |v| return try allocator.dupe(u8, v),
+                .tombstone => return null,
+            };
+        }
+
+        // Overlay miss — fall through to the durable tree.
+        const root_opt = try self.manifest.storeRoot(self.id);
         const root = root_opt orelse return error.StoreNotFound;
         self.tree.root = root;
-        // tree.get runs without any manifest lock; it uses cache_lock
-        // internally for pin/release. A concurrent setStoreRoot may
-        // change the durable root while we read, but our local
-        // self.tree.root snapshot stays valid for this get.
         return try self.tree.get(allocator, key);
     }
 
@@ -1493,24 +1647,17 @@ pub const Store = struct {
         sl.lock();
         defer sl.unlock();
 
-        // Phase 1: read storeRoot + capture current apply seq.
-        self.manifest.tree_lock.lock();
-        const root_opt = try self.manifest.storeRootLocked(self.id);
-        const seq = self.manifest.tree.seq;
-        self.manifest.tree_lock.unlock();
-        const root = root_opt orelse return error.StoreNotFound;
+        if ((try self.manifest.storeRoot(self.id)) == null) return error.StoreNotFound;
 
-        // Phase 2: store-tree CoW without manifest locks. allocImpl /
-        // freeImpl each briefly take this worker's allocator shard
-        // lock (workers on distinct cache lines, by design); cache
-        // takes its shard lock briefly. Writers on different stores
-        // run this part concurrently.
-        self.tree.root = root;
-        self.tree.seq = seq;
-        try self.tree.put(key, value);
-
-        // Phase 3: publish the new store root via the manifest tree.
-        try self.manifest.setStoreRoot(self.id, self.tree.root);
+        // Write into the overlay. No CoW, no tree walk, no page
+        // allocation, no CRC. Durabilize will apply this entry (along
+        // with every other overlay write for this store) to the tree
+        // in bulk — at which point the hybrid-CoW path collapses many
+        // writes-to-the-same-leaf into one page write.
+        const ov = try self.manifest.overlayFor(self.id);
+        ov.lock.lock();
+        defer ov.lock.unlock();
+        try ov.putLocked(key, value);
     }
 
     pub fn delete(self: *Store, key: []const u8) !bool {
@@ -1519,26 +1666,218 @@ pub const Store = struct {
         sl.lock();
         defer sl.unlock();
 
-        self.manifest.tree_lock.lock();
-        const root_opt = try self.manifest.storeRootLocked(self.id);
-        const seq = self.manifest.tree.seq;
-        self.manifest.tree_lock.unlock();
-        const root = root_opt orelse return error.StoreNotFound;
+        if ((try self.manifest.storeRoot(self.id)) == null) return error.StoreNotFound;
 
+        const ov = try self.manifest.overlayFor(self.id);
+
+        // Overlay-first check. If the key is in the overlay, the
+        // answer is fully determined without touching the tree.
+        {
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            if (ov.getLocked(key)) |entry| switch (entry) {
+                .value => {
+                    try ov.tombstoneLocked(key);
+                    return true;
+                },
+                .tombstone => return false,
+            };
+        }
+
+        // Overlay miss. We need to know whether the key existed in
+        // the durable tree to return the right bool. store_lock keeps
+        // writers out, so this read-then-tombstone sequence is safe;
+        // a brief window of readers may see the old value before the
+        // tombstone lands.
+        const root_opt = try self.manifest.storeRoot(self.id);
+        const root = root_opt orelse return error.StoreNotFound;
         self.tree.root = root;
-        self.tree.seq = seq;
-        const existed = try self.tree.delete(key);
-        if (existed) try self.manifest.setStoreRoot(self.id, self.tree.root);
-        return existed;
+        const existed_in_tree = blk: {
+            const v = try self.tree.get(self.manifest.allocator, key) orelse break :blk false;
+            self.manifest.allocator.free(v);
+            break :blk true;
+        };
+        if (!existed_in_tree) return false;
+
+        ov.lock.lock();
+        defer ov.lock.unlock();
+        try ov.tombstoneLocked(key);
+        return true;
     }
 
-    pub fn scanPrefix(self: *Store, prefix: []const u8) !btree.PrefixCursor {
-        self.manifest.tree_lock.lock();
-        const root_opt = try self.manifest.storeRootLocked(self.id);
-        self.manifest.tree_lock.unlock();
+    pub fn scanPrefix(self: *Store, prefix: []const u8) !StorePrefixCursor {
+        // Snapshot the overlay's prefix-matching entries first. The
+        // snapshot owns its own byte buffers, so the overlay lock is
+        // released the moment the snapshot is built. The merge cursor
+        // walks the snapshot in lock-step with the tree's cursor.
+        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+        errdefer {
+            for (entries.items) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            entries.deinit(self.manifest.allocator);
+        }
+        if (self.manifest.maybeOverlayFor(self.id)) |ov| {
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            var it = ov.entries.iterator();
+            while (it.next()) |entry| {
+                const k = entry.key_ptr.*;
+                if (!std.mem.startsWith(u8, k, prefix)) continue;
+                const key_copy = try self.manifest.allocator.dupe(u8, k);
+                errdefer self.manifest.allocator.free(key_copy);
+                const val_copy: ?[]u8 = switch (entry.value_ptr.*) {
+                    .value => |v| try self.manifest.allocator.dupe(u8, v),
+                    .tombstone => null,
+                };
+                try entries.append(self.manifest.allocator, .{
+                    .key = key_copy,
+                    .value = val_copy,
+                });
+            }
+        }
+        std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.entryLessThan);
+        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        errdefer {
+            for (overlay_slice) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            self.manifest.allocator.free(overlay_slice);
+        }
+
+        const root_opt = try self.manifest.storeRoot(self.id);
         const root = root_opt orelse return error.StoreNotFound;
         self.tree.root = root;
-        return try self.tree.scanPrefix(prefix);
+        var tree_cur = try self.tree.scanPrefix(prefix);
+        errdefer tree_cur.deinit();
+
+        var cur: StorePrefixCursor = .{
+            .allocator = self.manifest.allocator,
+            .tree_cur = tree_cur,
+            .overlay = overlay_slice,
+            .ov_idx = 0,
+            .have_tree = false,
+            .tree_key = &.{},
+            .tree_val = &.{},
+            .out_key = &.{},
+            .out_val = &.{},
+        };
+        try cur.primeTree();
+        return cur;
+    }
+};
+
+/// Merge-cursor over (Store overlay snapshot) + (durable tree cursor).
+/// Emits each key once in sorted order; overlay entries shadow tree
+/// entries with the same key; overlay tombstones suppress the
+/// underlying tree entry. The overlay snapshot is taken at scan open
+/// time and owned by the cursor — subsequent overlay mutations are
+/// invisible to this scan (consistent point-in-time view).
+pub const StorePrefixCursor = struct {
+    allocator: std.mem.Allocator,
+    tree_cur: btree.PrefixCursor,
+    overlay: []Entry,
+    ov_idx: usize,
+    have_tree: bool,
+    tree_key: []const u8,
+    tree_val: []const u8,
+    out_key: []const u8,
+    out_val: []const u8,
+
+    pub const Entry = struct {
+        key: []u8,
+        value: ?[]u8, // null = tombstone
+    };
+
+    fn entryLessThan(_: void, a: Entry, b: Entry) bool {
+        return std.mem.lessThan(u8, a.key, b.key);
+    }
+
+    fn primeTree(self: *StorePrefixCursor) !void {
+        if (try self.tree_cur.next()) {
+            self.tree_key = self.tree_cur.key();
+            self.tree_val = self.tree_cur.value();
+            self.have_tree = true;
+        } else {
+            self.have_tree = false;
+        }
+    }
+
+    pub fn next(self: *StorePrefixCursor) !bool {
+        while (true) {
+            const have_ov = self.ov_idx < self.overlay.len;
+            if (!self.have_tree and !have_ov) return false;
+
+            if (self.have_tree and have_ov) {
+                const ord = std.mem.order(u8, self.tree_key, self.overlay[self.ov_idx].key);
+                switch (ord) {
+                    .lt => {
+                        self.out_key = self.tree_key;
+                        self.out_val = self.tree_val;
+                        try self.primeTree();
+                        return true;
+                    },
+                    .gt => {
+                        const e = self.overlay[self.ov_idx];
+                        self.ov_idx += 1;
+                        if (e.value) |v| {
+                            self.out_key = e.key;
+                            self.out_val = v;
+                            return true;
+                        }
+                        // Tombstone with no underlying tree match — skip.
+                        continue;
+                    },
+                    .eq => {
+                        // Same key: overlay wins.
+                        const e = self.overlay[self.ov_idx];
+                        self.ov_idx += 1;
+                        try self.primeTree();
+                        if (e.value) |v| {
+                            self.out_key = e.key;
+                            self.out_val = v;
+                            return true;
+                        }
+                        // Tombstone shadows the tree entry — skip.
+                        continue;
+                    },
+                }
+            } else if (self.have_tree) {
+                self.out_key = self.tree_key;
+                self.out_val = self.tree_val;
+                try self.primeTree();
+                return true;
+            } else { // have_ov only
+                const e = self.overlay[self.ov_idx];
+                self.ov_idx += 1;
+                if (e.value) |v| {
+                    self.out_key = e.key;
+                    self.out_val = v;
+                    return true;
+                }
+                continue;
+            }
+        }
+    }
+
+    pub fn key(self: *const StorePrefixCursor) []const u8 {
+        return self.out_key;
+    }
+
+    pub fn value(self: *const StorePrefixCursor) []const u8 {
+        return self.out_val;
+    }
+
+    pub fn deinit(self: *StorePrefixCursor) void {
+        self.tree_cur.deinit();
+        for (self.overlay) |e| {
+            self.allocator.free(e.key);
+            if (e.value) |v| self.allocator.free(v);
+        }
+        self.allocator.free(self.overlay);
+        self.* = undefined;
     }
 };
 
@@ -1693,6 +2032,120 @@ test "Store: put/get/delete round-trip in one store" {
 
     try testing.expect(try s.delete("hello"));
     try testing.expect((try s.get(testing.allocator, "hello")) == null);
+}
+
+test "Overlay scan: put then scanPrefix sees overlay-only entries" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+
+    try s.put("k1", "v1");
+    try s.put("k2", "v2");
+    try s.put("k3", "v3");
+    // No durabilize — all three live in the overlay only.
+
+    var cur = try s.scanPrefix("k");
+    defer cur.deinit();
+    var n: u32 = 0;
+    var seen: [3]u8 = @splat(0);
+    while (try cur.next()) {
+        if (std.mem.eql(u8, cur.key(), "k1") and std.mem.eql(u8, cur.value(), "v1")) seen[0] = 1;
+        if (std.mem.eql(u8, cur.key(), "k2") and std.mem.eql(u8, cur.value(), "v2")) seen[1] = 1;
+        if (std.mem.eql(u8, cur.key(), "k3") and std.mem.eql(u8, cur.value(), "v3")) seen[2] = 1;
+        n += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), n);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, &seen);
+}
+
+test "Overlay scan: tombstone in overlay shadows tree entry" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k1", "v1");
+        try s.put("k2", "v2");
+        try s.put("k3", "v3");
+    }
+    try h.manifest.commit(); // All three in the tree now.
+
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    _ = try s.delete("k2"); // Tombstone in overlay.
+
+    var cur = try s.scanPrefix("k");
+    defer cur.deinit();
+    var keys_seen: [4][2]u8 = undefined;
+    var n: usize = 0;
+    while (try cur.next()) {
+        keys_seen[n][0] = cur.key()[0];
+        keys_seen[n][1] = cur.key()[1];
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u8, "k1", &keys_seen[0]);
+    try testing.expectEqualSlices(u8, "k3", &keys_seen[1]);
+}
+
+test "Overlay scan: overlay value shadows tree value at same key" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k1", "old");
+    }
+    try h.manifest.commit();
+
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    try s.put("k1", "new"); // Overrides in overlay.
+
+    var cur = try s.scanPrefix("k");
+    defer cur.deinit();
+    try testing.expect(try cur.next());
+    try testing.expectEqualStrings("k1", cur.key());
+    try testing.expectEqualStrings("new", cur.value());
+    try testing.expect(!try cur.next());
+}
+
+test "Overlay scan: sorted merge — interleaved overlay and tree" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "tree-a");
+        try s.put("c", "tree-c");
+        try s.put("e", "tree-e");
+    }
+    try h.manifest.commit();
+
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    try s.put("b", "ov-b");
+    try s.put("d", "ov-d");
+    try s.put("c", "ov-c"); // Override tree's "c".
+
+    var cur = try s.scanPrefix("");
+    defer cur.deinit();
+    var keys_collected: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys_collected.deinit(testing.allocator);
+    while (try cur.next()) {
+        try keys_collected.append(testing.allocator, cur.key());
+    }
+    try testing.expectEqual(@as(usize, 5), keys_collected.items.len);
+    try testing.expectEqualStrings("a", keys_collected.items[0]);
+    try testing.expectEqualStrings("b", keys_collected.items[1]);
+    try testing.expectEqualStrings("c", keys_collected.items[2]);
+    try testing.expectEqualStrings("d", keys_collected.items[3]);
+    try testing.expectEqualStrings("e", keys_collected.items[4]);
 }
 
 test "Manifest: multi-store writes commit and survive reopen" {
@@ -2021,26 +2474,31 @@ test "Manifest: 1000-store stress, commit, reopen, sample-verify" {
 // Phase 4 tests: durable free-list, reuse, net-zero workload
 // -----------------------------------------------------------------------------
 
-test "Freelist: pending_free populated by mutations, drained at commit" {
+test "Freelist: pending_free populated during durabilize" {
+    // With the overlay model, puts don't generate pending_free at
+    // put-time — they just buffer in the overlay. Durabilize is what
+    // runs the CoW that produces freed pages. To observe pending_free
+    // mid-flight you'd need a hook inside durabilize; here we settle
+    // for asserting the contract: after durabilize, pending_free has
+    // been folded into the freelist tree and is now near-empty.
     var h = try Harness.init(64);
     defer h.deinit();
     try h.manifest.createStore(1);
-    var s = try Store.open(h.manifest, 1);
-    defer s.deinit();
-
-    // Each put runs in its own apply unit (the production pattern:
-    // every writeset calls nextApply via begin). This forces the
-    // hybrid CoW path to treat each put as touching durable pages,
-    // so orphans actually accumulate.
-    _ = h.manifest.nextApply();
-    try s.put("a", "1");
-    _ = h.manifest.nextApply();
-    try s.put("b", "2");
-    _ = h.manifest.nextApply();
-    try s.put("c", "3");
-    try testing.expect(h.manifest.pendingFreeCount() > 0);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        _ = h.manifest.nextApply();
+        try s.put("a", "1");
+        _ = h.manifest.nextApply();
+        try s.put("b", "2");
+        _ = h.manifest.nextApply();
+        try s.put("c", "3");
+    }
+    // Pre-durabilize: nothing freed yet (overlay holds the writes).
+    try testing.expectEqual(@as(usize, 0), h.manifest.pendingFreeCount());
 
     try h.manifest.commit();
+    // Post-durabilize: pending_free was drained + folded into freelist.
     try testing.expect(h.manifest.pendingFreeCount() < 10);
 }
 
@@ -2488,71 +2946,45 @@ test "Phase 7: long-running prefix scan sees consistent view during heavy writes
     try testing.expectEqualStrings("v3", cur);
 }
 
-test "Hybrid CoW: same-seq puts to one leaf reuse the shadow page" {
-    // The hybrid CoW path mutates a page in place when it was already
-    // dirtied in the current apply unit. This test verifies the
-    // observable side effect: a batch of same-seq puts produces far
-    // fewer orphans (and grows the file less) than the same batch
-    // with seq advances between each put.
-    var h_same = try Harness.init(128);
-    defer h_same.deinit();
-    try h_same.manifest.createStore(1);
-    var size_before_same: u64 = 0;
+test "Overlay: repeated puts to the same keys coalesce" {
+    // With the overlay model, many puts to the same key collapse
+    // into ONE tree.put at durabilize. The hybrid-CoW machinery that
+    // used to elide redundant pages at put-time has moved to
+    // durabilize-time, where it operates on the deduplicated overlay
+    // set. Observable: 1000 puts across 5 keys leaves an overlay of
+    // exactly 5 entries, and durabilize grows the file by a small
+    // bounded amount (5 leaves' worth, not 1000).
+    var h = try Harness.init(128);
+    defer h.deinit();
+    try h.manifest.createStore(1);
     {
-        var s = try Store.open(h_same.manifest, 1);
+        var s = try Store.open(h.manifest, 1);
         defer s.deinit();
-        size_before_same = h_same.manifest.fileSizePages();
+        const keys = [_][]const u8{ "a", "b", "c", "d", "e" };
         var i: u32 = 0;
-        while (i < 50) : (i += 1) {
-            var kb: [16]u8 = undefined;
-            const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
-            try s.put(k, "x");
+        while (i < 1000) : (i += 1) {
+            var vb: [16]u8 = undefined;
+            const v = try std.fmt.bufPrint(&vb, "v{d}", .{i});
+            try s.put(keys[i % keys.len], v);
         }
+        const ov = h.manifest.maybeOverlayFor(1).?;
+        ov.lock.lock();
+        try testing.expectEqual(@as(usize, 5), ov.countLocked());
+        ov.lock.unlock();
     }
-    const orphans_same = h_same.manifest.pendingFreeCount();
-    const grew_same = h_same.manifest.fileSizePages() - size_before_same;
+    try h.manifest.commit();
 
-    var h_per_seq = try Harness.init(128);
-    defer h_per_seq.deinit();
-    try h_per_seq.manifest.createStore(1);
-    var size_before_per: u64 = 0;
-    {
-        var s = try Store.open(h_per_seq.manifest, 1);
-        defer s.deinit();
-        size_before_per = h_per_seq.manifest.fileSizePages();
-        var i: u32 = 0;
-        while (i < 50) : (i += 1) {
-            _ = h_per_seq.manifest.nextApply();
-            var kb: [16]u8 = undefined;
-            const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
-            try s.put(k, "x");
-        }
-    }
-    const orphans_per = h_per_seq.manifest.pendingFreeCount();
-    const grew_per = h_per_seq.manifest.fileSizePages() - size_before_per;
-
-    // Hybrid path generates strictly fewer orphans and grows the file
-    // less than the per-seq path on the same workload.
-    try testing.expect(orphans_same < orphans_per);
-    try testing.expect(grew_same <= grew_per);
-
-    // Both runs end up with the same final state observable through
-    // the public API.
-    var s1 = try Store.open(h_same.manifest, 1);
-    defer s1.deinit();
-    var s2 = try Store.open(h_per_seq.manifest, 1);
-    defer s2.deinit();
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        var kb: [16]u8 = undefined;
-        const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
-        const v1 = (try s1.get(testing.allocator, k)) orelse return error.MissingKey;
-        defer testing.allocator.free(v1);
-        const v2 = (try s2.get(testing.allocator, k)) orelse return error.MissingKey;
-        defer testing.allocator.free(v2);
-        try testing.expectEqualStrings("x", v1);
-        try testing.expectEqualStrings("x", v2);
-    }
+    // Final values: each key has the LAST value written for it.
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    // "a" was written at i=0, 5, 10, ..., 995 (every 5 starting at 0).
+    // The last write for "a" was v995.
+    const ga = (try s.get(testing.allocator, "a")) orelse return error.MissingKey;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualStrings("v995", ga);
+    const ge = (try s.get(testing.allocator, "e")) orelse return error.MissingKey;
+    defer testing.allocator.free(ge);
+    try testing.expectEqualStrings("v999", ge);
 }
 
 test "Hybrid CoW: same-seq updates to one key keep the same leaf page_no" {

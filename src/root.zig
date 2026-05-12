@@ -11,6 +11,7 @@ pub const buffer_pool = @import("buffer_pool.zig");
 pub const page_cache = @import("page_cache.zig");
 pub const page = @import("page.zig");
 pub const btree = @import("btree.zig");
+pub const overlay = @import("overlay.zig");
 pub const Tree = btree.Tree;
 pub const manifest = @import("manifest.zig");
 pub const Manifest = manifest.Manifest;
