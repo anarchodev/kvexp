@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Link against the system's liblmdb. lmdb.h is consumed via
+    // @cImport at the call site (src/lmdb.zig).
+    kvexp_mod.linkSystemLibrary("lmdb", .{});
+    kvexp_mod.link_libc = true;
 
     const kvexp_lib = b.addLibrary(.{
         .linkage = .static,
