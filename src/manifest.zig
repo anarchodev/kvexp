@@ -848,16 +848,94 @@ pub const Manifest = struct {
     /// returned snapshot may be read from any thread until `close()`;
     /// writes to the underlying stores do not affect what the
     /// snapshot sees.
+    ///
+    /// The capture is atomic w.r.t. durabilize: `durabilize_lock` is
+    /// held briefly during capture so an in-flight durabilize can't
+    /// move state between the overlay and the tree mid-snapshot.
+    /// Live writes to per-store overlays are allowed during capture;
+    /// the snapshot copies entries under each overlay's own lock, so
+    /// writes before the copy land in the snapshot, writes after do
+    /// not. Per-store atomicity; cross-store interleave is permitted.
     pub fn openSnapshot(self: *Manifest) !Snapshot {
+        self.durabilize_lock.lock();
+        defer self.durabilize_lock.unlock();
+
         self.tree_lock.lock();
         const snap_seq = self.tree.seq;
         const manifest_root = self.tree.root;
         self.tree_lock.unlock();
+
+        var overlays: std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry) = .empty;
+        errdefer {
+            var it = overlays.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.*) |kv| {
+                    self.allocator.free(kv.key);
+                    if (kv.value) |v| self.allocator.free(v);
+                }
+                self.allocator.free(entry.value_ptr.*);
+            }
+            overlays.deinit(self.allocator);
+        }
+
+        for (&self.store_root_shards) |*shard| {
+            // List the (id, overlay) pairs in this shard to copy.
+            const Pair = struct { id: u64, ov: *Overlay };
+            var pairs: std.ArrayListUnmanaged(Pair) = .empty;
+            defer pairs.deinit(self.allocator);
+            shard.lock.lock();
+            var sh_it = shard.overlays.iterator();
+            while (sh_it.next()) |entry| {
+                try pairs.append(self.allocator, .{
+                    .id = entry.key_ptr.*,
+                    .ov = entry.value_ptr.*,
+                });
+            }
+            shard.lock.unlock();
+
+            for (pairs.items) |p| {
+                var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+                errdefer {
+                    for (entries.items) |e| {
+                        self.allocator.free(e.key);
+                        if (e.value) |v| self.allocator.free(v);
+                    }
+                    entries.deinit(self.allocator);
+                }
+                {
+                    p.ov.lock.lock();
+                    defer p.ov.lock.unlock();
+                    if (p.ov.isEmptyLocked()) continue;
+                    var oe_it = p.ov.entries.iterator();
+                    while (oe_it.next()) |oe| {
+                        const k = try self.allocator.dupe(u8, oe.key_ptr.*);
+                        errdefer self.allocator.free(k);
+                        const v: ?[]u8 = switch (oe.value_ptr.*) {
+                            .value => |val| try self.allocator.dupe(u8, val),
+                            .tombstone => null,
+                        };
+                        try entries.append(self.allocator, .{ .key = k, .value = v });
+                    }
+                }
+                std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.entryLessThan);
+                const slice = try entries.toOwnedSlice(self.allocator);
+                errdefer {
+                    for (slice) |e| {
+                        self.allocator.free(e.key);
+                        if (e.value) |v| self.allocator.free(v);
+                    }
+                    self.allocator.free(slice);
+                }
+                try overlays.put(self.allocator, p.id, slice);
+            }
+        }
+
         try self.registerSnapshot(snap_seq);
         return .{
             .manifest = self,
             .snap_seq = snap_seq,
             .manifest_root = manifest_root,
+            .overlays = overlays,
         };
     }
 
@@ -1266,44 +1344,48 @@ pub const Manifest = struct {
     }
 
     fn applyOneOverlay(self: *Manifest, id: u64, ov: *Overlay, initial_root: u64) !void {
-        // Swap: take ownership of the overlay's current entries,
-        // leave a fresh empty map. Workers writing during the apply
-        // land in the fresh map and DON'T race the in-flight apply.
-        var swapped: std.StringHashMapUnmanaged(OverlayEntry) = undefined;
-        {
-            ov.lock.lock();
-            defer ov.lock.unlock();
-            if (ov.isEmptyLocked()) return;
-            swapped = ov.entries;
-            ov.entries = .empty;
-        }
-        defer {
-            var it = swapped.iterator();
-            while (it.next()) |e| {
-                self.allocator.free(e.key_ptr.*);
-                switch (e.value_ptr.*) {
-                    .value => |v| self.allocator.free(v),
-                    .tombstone => {},
-                }
-            }
-            swapped.deinit(self.allocator);
-        }
+        // Hold the overlay lock for the WHOLE apply phase. Workers
+        // calling Store.put/delete for this store block briefly
+        // (apply duration is bounded by overlay size × per-key CoW
+        // cost — typically a few ms). Reads on this store also block
+        // briefly. The trade is: no torn state ever visible to a
+        // reader. A read either sees the overlay entry (before apply)
+        // or sees the tree entry (after apply), never neither.
+        //
+        // This is the conservative Phase-1.5 fix; the fully-async
+        // alternative would register the in-flight entries elsewhere
+        // so reads bypass the lock — extra plumbing, marginal latency
+        // win for typical workloads.
+        ov.lock.lock();
+        defer ov.lock.unlock();
+        if (ov.isEmptyLocked()) return;
 
-        // Build a Tree at the store's current root and apply the
-        // swapped entries.
         var tree = try Tree.init(self.allocator, self.cache, self.file, self.pageAllocator());
         tree.root = initial_root;
         self.tree_lock.lock();
         tree.seq = self.tree.seq;
         self.tree_lock.unlock();
 
-        var it = swapped.iterator();
+        var it = ov.entries.iterator();
         while (it.next()) |e| {
             switch (e.value_ptr.*) {
                 .value => |v| try tree.put(e.key_ptr.*, v),
                 .tombstone => _ = try tree.delete(e.key_ptr.*),
             }
         }
+
+        // All entries applied. Free their bytes and reset the map —
+        // still under the lock so readers either saw the entries or
+        // will see the tree state (now containing them).
+        var cleanup_it = ov.entries.iterator();
+        while (cleanup_it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            switch (e.value_ptr.*) {
+                .value => |v| self.allocator.free(v),
+                .tombstone => {},
+            }
+        }
+        ov.entries.clearRetainingCapacity();
 
         // Publish the new tree.root into the store_root cache
         // (dirty=true so step 0 writes it into the manifest tree).
@@ -1449,8 +1531,23 @@ pub const Snapshot = struct {
     manifest: *Manifest,
     snap_seq: u64,
     manifest_root: u64,
+    /// Per-store overlay snapshot taken at open time. Each value is a
+    /// sorted slice of entries, owned by this snapshot. Empty overlays
+    /// are not stored; lookup returns null which falls through to the
+    /// tree. Mutations to the live overlays after open are invisible
+    /// to this snapshot.
+    overlays: std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry) = .empty,
 
     pub fn close(self: *Snapshot) void {
+        var it = self.overlays.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.*) |kv| {
+                self.manifest.allocator.free(kv.key);
+                if (kv.value) |v| self.manifest.allocator.free(v);
+            }
+            self.manifest.allocator.free(entry.value_ptr.*);
+        }
+        self.overlays.deinit(self.manifest.allocator);
         self.manifest.unregisterSnapshot(self.snap_seq);
         self.* = undefined;
     }
@@ -1472,13 +1569,65 @@ pub const Snapshot = struct {
         store_id: u64,
         key: []const u8,
     ) !?[]u8 {
+        // Captured overlay first.
+        if (self.overlays.get(store_id)) |entries| {
+            if (binarySearchEntry(entries, key)) |idx| {
+                const e = entries[idx];
+                if (e.value) |v| return try allocator.dupe(u8, v);
+                return null; // tombstone
+            }
+        }
         const root = (try self.storeRoot(store_id)) orelse return error.StoreNotFound;
         return try btree.treeGet(self.manifest.cache, root, allocator, key);
     }
 
-    pub fn scanPrefix(self: *Snapshot, store_id: u64, prefix: []const u8) !btree.PrefixCursor {
+    pub fn scanPrefix(self: *Snapshot, store_id: u64, prefix: []const u8) !StorePrefixCursor {
+        // Filter the captured overlay for prefix matches, copying into
+        // a cursor-owned slice (so deinit can free uniformly).
+        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+        errdefer {
+            for (entries.items) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            entries.deinit(self.manifest.allocator);
+        }
+        if (self.overlays.get(store_id)) |captured| {
+            for (captured) |e| {
+                if (!std.mem.startsWith(u8, e.key, prefix)) continue;
+                const k = try self.manifest.allocator.dupe(u8, e.key);
+                errdefer self.manifest.allocator.free(k);
+                const v: ?[]u8 = if (e.value) |val| try self.manifest.allocator.dupe(u8, val) else null;
+                try entries.append(self.manifest.allocator, .{ .key = k, .value = v });
+            }
+        }
+        // Captured entries are already in sorted order.
+        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        errdefer {
+            for (overlay_slice) |e| {
+                self.manifest.allocator.free(e.key);
+                if (e.value) |v| self.manifest.allocator.free(v);
+            }
+            self.manifest.allocator.free(overlay_slice);
+        }
+
         const root = (try self.storeRoot(store_id)) orelse return error.StoreNotFound;
-        return try btree.PrefixCursor.open(self.manifest.cache, root, prefix);
+        var tree_cur = try btree.PrefixCursor.open(self.manifest.cache, root, prefix);
+        errdefer tree_cur.deinit();
+
+        var cur: StorePrefixCursor = .{
+            .allocator = self.manifest.allocator,
+            .tree_cur = tree_cur,
+            .overlay = overlay_slice,
+            .ov_idx = 0,
+            .have_tree = false,
+            .tree_key = &.{},
+            .tree_val = &.{},
+            .out_key = &.{},
+            .out_val = &.{},
+        };
+        try cur.primeTree();
+        return cur;
     }
 
     /// Enumerate every store_id present in the snapshot. Walks the
@@ -1498,6 +1647,22 @@ pub const Snapshot = struct {
         return try list.toOwnedSlice(allocator);
     }
 };
+
+/// Binary search over a sorted Entry slice. Returns the index of the
+/// matching entry, or null if not found.
+fn binarySearchEntry(entries: []const StorePrefixCursor.Entry, key: []const u8) ?usize {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        switch (std.mem.order(u8, entries[mid].key, key)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return mid,
+        }
+    }
+    return null;
+}
 
 // ── State-transfer dump / restore ──────────────────────────────────
 //
@@ -3326,6 +3491,98 @@ test "Freelist: churn workload approaches net-zero growth" {
 }
 
 // ── Phase 10: state-transfer dump / restore round-trips ──────────────
+
+test "Snapshot: captures uncommitted overlay puts" {
+    // Snapshot opened BEFORE durabilize must include the overlay's
+    // pending writes. The README's state-transfer example does this
+    // exact ordering: openSnapshot → dumpSnapshot → durabilize.
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "tree-a");
+    }
+    try h.manifest.durabilize();
+    // Now stage an overlay-only write.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("b", "ov-b");
+    }
+
+    var snap = try h.manifest.openSnapshot();
+    defer snap.close();
+
+    // Snapshot sees both — captured overlay + tree.
+    const ga = (try snap.get(testing.allocator, 1, "a")) orelse return error.MissingKey;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualStrings("tree-a", ga);
+    const gb = (try snap.get(testing.allocator, 1, "b")) orelse return error.MissingKey;
+    defer testing.allocator.free(gb);
+    try testing.expectEqualStrings("ov-b", gb);
+}
+
+test "Snapshot: overlay tombstone shadows tree entry in snapshot view" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("k", "v");
+    }
+    try h.manifest.durabilize();
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        _ = try s.delete("k"); // tombstone in overlay
+    }
+
+    var snap = try h.manifest.openSnapshot();
+    defer snap.close();
+    try testing.expect((try snap.get(testing.allocator, 1, "k")) == null);
+}
+
+test "Snapshot: scanPrefix merges captured overlay with tree" {
+    var h = try Harness.init(64);
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("a", "tree-a");
+        try s.put("c", "tree-c");
+    }
+    try h.manifest.durabilize();
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("b", "ov-b");
+        try s.put("c", "ov-c"); // override
+    }
+
+    var snap = try h.manifest.openSnapshot();
+    defer snap.close();
+
+    var cur = try snap.scanPrefix(1, "");
+    defer cur.deinit();
+    var keys: [3][]const u8 = undefined;
+    var vals: [3][]const u8 = undefined;
+    var n: usize = 0;
+    while (try cur.next()) : (n += 1) {
+        keys[n] = cur.key();
+        vals[n] = cur.value();
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualStrings("a", keys[0]);
+    try testing.expectEqualStrings("tree-a", vals[0]);
+    try testing.expectEqualStrings("b", keys[1]);
+    try testing.expectEqualStrings("ov-b", vals[1]);
+    try testing.expectEqualStrings("c", keys[2]);
+    try testing.expectEqualStrings("ov-c", vals[2]);
+}
 
 test "Snapshot.listStores: enumerates stores at point-in-time" {
     var h = try Harness.init(64);
