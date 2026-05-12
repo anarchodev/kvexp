@@ -192,6 +192,54 @@ const RootSlot = struct {
     dirty: bool,
 };
 
+/// Sharded allocator state. Workers pick a shard via thread-id (cached
+/// in TLS) so distinct workers hit distinct cache lines. The point of
+/// sharding is *not* to shorten the critical section (each was already
+/// nanoseconds) but to remove the cache-line ping-pong on the mutex
+/// itself — a contended mutex on a hot cache line costs ~1µs/op even
+/// when held for 10ns.
+///
+/// Padded with `_pad` so the next shard's `lock` lands on a fresh
+/// 64-byte cache line. Without this, adjacent shards' futex words
+/// false-share and defeat the per-shard split.
+pub const ALLOC_SHARD_COUNT: usize = 8;
+
+const AllocShard = struct {
+    lock: std.Thread.Mutex = .{},
+    reusable: std.ArrayListUnmanaged(u64) = .empty,
+    consumed_keys: std.ArrayListUnmanaged([FREELIST_KEY_LEN]u8) = .empty,
+    pending_free: std.ArrayListUnmanaged(FreedPage) = .empty,
+    _pad: [64]u8 = @splat(0),
+};
+
+/// Sharded store-root cache. Profiled hot lock in multi-tenant
+/// concurrent-write workloads — every `Store.put` hits `storeRoot`
+/// (read) and `setStoreRoot` (write), which made the single
+/// pre-sharding mutex ~150k acq/sec on 4 workers × 8 tenants.
+/// Sharding by `store_id mod N` puts distinct tenants on distinct
+/// mutexes; 16 shards is plenty of slack for the ≤ 32 hot-tenants
+/// case typical of multi-tenant deployments.
+pub const STORE_ROOT_SHARD_COUNT: usize = 16;
+
+const StoreRootShard = struct {
+    lock: std.Thread.Mutex = .{},
+    cache: std.AutoHashMapUnmanaged(u64, RootSlot) = .empty,
+    _pad: [64]u8 = @splat(0),
+};
+
+/// Per-thread cached shard index. Each worker resolves its shard on
+/// first call (`pickAllocShard`) and reuses it for the lifetime of
+/// the thread. Multi-manifest processes share this TLS — fine since
+/// the shard count is a constant.
+threadlocal var tls_alloc_shard_idx: usize = std.math.maxInt(usize);
+
+/// Global round-robin counter for shard assignment. Each new thread
+/// that calls `pickAllocShard` claims the next index mod
+/// ALLOC_SHARD_COUNT. First 8 threads get shards 0..7; thread 9 gets
+/// shard 0; etc. Perfect distribution for ≤ 8 concurrent workers (the
+/// common case), graceful degradation beyond.
+var alloc_shard_assignment_counter = std.atomic.Value(usize).init(0);
+
 pub const Manifest = struct {
     allocator: std.mem.Allocator,
     cache: *PageCache,
@@ -218,14 +266,14 @@ pub const Manifest = struct {
     /// Back-compat alias for active_seq (older code reads `sequence`).
     sequence: u64,
 
-    /// Pages popped from the durable freelist that are eligible for reuse.
-    reusable: std.ArrayListUnmanaged(u64),
-    /// Freelist keys corresponding to `reusable` — queued to delete
-    /// from the durable freelist at the next durabilize.
-    consumed_keys: std.ArrayListUnmanaged([FREELIST_KEY_LEN]u8),
-    /// Pages freed by CoW operations since the last durabilize. Folded
-    /// into the durable freelist at the next durabilize.
-    pending_free: std.ArrayListUnmanaged(FreedPage),
+    /// Per-thread sharded allocator state. Each shard holds its own
+    /// `reusable` (pages popped from the durable freelist, eligible
+    /// for re-allocation), `consumed_keys` (the freelist tree keys
+    /// those came from — queued for deletion at next durabilize), and
+    /// `pending_free` (pages freed by CoW since the last durabilize,
+    /// folded into the durable freelist at next durabilize). See the
+    /// AllocShard doc for the why.
+    alloc_shards: [ALLOC_SHARD_COUNT]AllocShard align(64),
 
     /// Lock ordering (no thread holds an earlier lock while acquiring
     /// a later one):
@@ -235,26 +283,26 @@ pub const Manifest = struct {
     ///   tree_lock                 — manifest tree mutations + reads
     ///   freelist_tree_lock        — freelist tree mutations + reads
     ///                                (only held during durabilize)
-    ///   store_root_cache_lock     — in-memory store_root cache
-    ///                                (hashmap; uncontended for distinct
-    ///                                store_ids in practice)
-    ///   reusable_lock             — `reusable` + `consumed_keys`
-    ///                                (both refilled by refillReusable
-    ///                                and drained by durabilize)
-    ///   pending_free_lock         — `pending_free`
+    ///   store_root_shards[i].lock — per-shard in-memory store_root
+    ///                                cache. Keyed by store_id % N so
+    ///                                writers on different tenants
+    ///                                hit different cache lines.
+    ///   alloc_shards[i].lock      — per-shard reusable + consumed_keys
+    ///                                + pending_free. Workers pick a
+    ///                                shard via TLS-cached hash of
+    ///                                thread-id, so distinct workers
+    ///                                hit distinct cache lines. Never
+    ///                                hold two shard locks
+    ///                                simultaneously except in the
+    ///                                fixed-order drain at durabilize.
     /// `cache.lock` (interior, owned by PageCache) is acquired
     /// briefly *inside* the alloc/free regions.
     ///
-    /// `reusable_lock` and `pending_free_lock` are at the same level
-    /// — neither is held while acquiring the other. Splitting them
-    /// (formerly one `alloc_lock`) lets `allocImpl` and `freeImpl`
-    /// run concurrently across workers on different stores, which was
-    /// the dominant bottleneck at 4+ writers. `PagedFile.growBy` has
-    /// its own internal lock; it's called *outside* both of these.
+    /// `PagedFile.growBy` has its own internal lock and is called
+    /// while holding the local shard's lock (rare — only on shard-
+    /// empty fallback, ~1/32 of allocs with grow-batching).
     tree_lock: std.Thread.Mutex = .{},
     freelist_tree_lock: std.Thread.Mutex = .{},
-    reusable_lock: std.Thread.Mutex = .{},
-    pending_free_lock: std.Thread.Mutex = .{},
     /// Serializes the entire `durabilize` call. Held outermost (above
     /// every other manifest lock) so that two callers can't race on
     /// pending_free drain, foldPendingFree, or the slot write — all of
@@ -271,8 +319,7 @@ pub const Manifest = struct {
     /// after that, every `hasStore` / `storeRoot` is an O(1) hashmap
     /// lookup. Tracks `dirty` so durabilize only writes entries that
     /// changed since the last flush.
-    store_root_cache: std.AutoHashMapUnmanaged(u64, RootSlot),
-    store_root_cache_lock: std.Thread.Mutex = .{},
+    store_root_shards: [STORE_ROOT_SHARD_COUNT]StoreRootShard align(64),
 
     /// Per-store write locks, keyed by store_id. Allocated lazily on
     /// first Store.put for that id; not freed (small overhead per
@@ -313,40 +360,97 @@ pub const Manifest = struct {
         .free = freeImpl,
     };
 
-    /// Number of pages to grow the file by when `reusable` is empty.
-    /// Cutting the growBy-syscall frequency by this factor is the
-    /// dominant win against `reusable_lock` contention — the slow path
-    /// (file extension) was getting hit on every alloc, holding the
-    /// lock for the duration of an ftruncate. With batching, only
-    /// 1/GROW_BATCH of allocs take the slow path; the rest are pure
-    /// in-memory ArrayList pops. Bounded leak per crash: up to
-    /// (GROW_BATCH - 1) pages that were grown but never used end up
-    /// past the durable manifest's reach. ~128KB worst case at 32; a
-    /// future compact-on-deinit could ftruncate them away.
+    /// Number of pages to grow the file by when a shard's `reusable`
+    /// is empty. Cuts ftruncate frequency by GROW_BATCH×. Bounded
+    /// leak per crash: up to (GROW_BATCH - 1) pages per shard end up
+    /// past the durable manifest's reach (~1MB total at 32 pages × 8
+    /// shards). A future compact-on-deinit could ftruncate them away.
     pub const GROW_BATCH: u64 = 32;
+
+    /// Resolve the calling thread's allocator shard. First call from a
+    /// thread claims the next sequential shard index from a global
+    /// atomic counter; every subsequent call is a single TLS read.
+    /// First 8 threads get shards 0..7 (zero contention for ≤ 8
+    /// workers, the common case); thread 9 wraps to shard 0 and
+    /// serializes with thread 1.
+    fn pickAllocShard(self: *Manifest) *AllocShard {
+        if (tls_alloc_shard_idx >= ALLOC_SHARD_COUNT) {
+            const next = alloc_shard_assignment_counter.fetchAdd(1, .monotonic);
+            tls_alloc_shard_idx = next % ALLOC_SHARD_COUNT;
+        }
+        return &self.alloc_shards[tls_alloc_shard_idx];
+    }
+
+    /// Pages a draining shard steals from a sibling in one go. Sized
+    /// to amortize the cross-shard lock acquisition; ~half of
+    /// GROW_BATCH keeps stealing cheap relative to growing.
+    const STEAL_BATCH: usize = 16;
 
     fn allocImpl(ctx: *anyopaque) anyerror!u64 {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
-        self.reusable_lock.lock();
-        defer self.reusable_lock.unlock();
-        if (self.reusable.pop()) |p| return p;
-        // Slow path: grow by a batch, return one, cache the rest.
-        // PagedFile.growBy has its own internal lock so this is safe
-        // to call while holding reusable_lock; with GROW_BATCH=32, this
-        // path fires ~1/32 as often as the old per-alloc growBy(1).
+        const shard = self.pickAllocShard();
+        const my_idx = tls_alloc_shard_idx;
+
+        // Fast path: local shard has a reusable page.
+        {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            if (shard.reusable.pop()) |p| return p;
+        }
+
+        // Local empty. Refill from a sibling shard before paying for
+        // a growBy. Critical for single-threaded workloads where
+        // refillReusable spreads pages across all shards but only one
+        // shard is in use — without stealing, every alloc past the
+        // local exhaustion would growBy and the file would balloon.
+        var stolen: [STEAL_BATCH]u64 = undefined;
+        var n_stolen: usize = 0;
+        var probe: usize = 1;
+        while (probe < ALLOC_SHARD_COUNT) : (probe += 1) {
+            const other_idx = (my_idx + probe) % ALLOC_SHARD_COUNT;
+            const other = &self.alloc_shards[other_idx];
+            other.lock.lock();
+            defer other.lock.unlock();
+            const avail = other.reusable.items.len;
+            if (avail == 0) continue;
+            const take = @min(STEAL_BATCH, (avail + 1) / 2);
+            var k: usize = 0;
+            while (k < take) : (k += 1) {
+                stolen[k] = other.reusable.pop().?;
+            }
+            n_stolen = take;
+            break;
+        }
+
+        if (n_stolen > 0) {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            // Keep one for the return; stash the rest in our local
+            // reusable so subsequent allocs hit the fast path.
+            var k: usize = 0;
+            while (k + 1 < n_stolen) : (k += 1) {
+                try shard.reusable.append(self.allocator, stolen[k]);
+            }
+            return stolen[n_stolen - 1];
+        }
+
+        // All shards empty: grow.
+        shard.lock.lock();
+        defer shard.lock.unlock();
         const first = try self.file.growBy(GROW_BATCH);
         var i: u64 = 1;
         while (i < GROW_BATCH) : (i += 1) {
-            try self.reusable.append(self.allocator, first + i);
+            try shard.reusable.append(self.allocator, first + i);
         }
         return first;
     }
 
     fn freeImpl(ctx: *anyopaque, page_no: u64, freed_at_seq: u64) anyerror!void {
         const self: *Manifest = @ptrCast(@alignCast(ctx));
-        self.pending_free_lock.lock();
-        defer self.pending_free_lock.unlock();
-        try self.pending_free.append(self.allocator, .{
+        const shard = self.pickAllocShard();
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        try shard.pending_free.append(self.allocator, .{
             .page_no = page_no,
             .freed_at_seq = freed_at_seq,
         });
@@ -358,20 +462,15 @@ pub const Manifest = struct {
         self.allocator = allocator;
         self.cache = cache;
         self.file = file;
-        self.reusable = .empty;
-        self.consumed_keys = .empty;
-        self.pending_free = .empty;
+        for (&self.alloc_shards) |*shard| shard.* = .{};
         self.store_locks = .empty;
         self.snapshot_counts = .empty;
-        self.store_root_cache = .empty;
+        for (&self.store_root_shards) |*sh| sh.* = .{};
         self.tree_lock = .{};
         self.freelist_tree_lock = .{};
-        self.reusable_lock = .{};
-        self.pending_free_lock = .{};
         self.durabilize_lock = .{};
         self.store_locks_lock = .{};
         self.snapshots_lock = .{};
-        self.store_root_cache_lock = .{};
         self.poisoned = std.atomic.Value(bool).init(false);
 
         // File-header handling. Three cases:
@@ -480,15 +579,20 @@ pub const Manifest = struct {
         if (self.tree.root == 0) return;
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
         var cursor = try self.tree.scanPrefix("");
         defer cursor.deinit();
         while (try cursor.next()) {
             const id = decodeStoreId(cursor.key());
             const root = decodeRoot(cursor.value());
-            try self.store_root_cache.put(self.allocator, id, .{ .root = root, .dirty = false });
+            const shard = self.pickStoreShard(id);
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            try shard.cache.put(self.allocator, id, .{ .root = root, .dirty = false });
         }
+    }
+
+    fn pickStoreShard(self: *Manifest, id: u64) *StoreRootShard {
+        return &self.store_root_shards[id % STORE_ROOT_SHARD_COUNT];
     }
 
     /// Start a new apply unit. Subsequent mutations tag dirty pages
@@ -556,14 +660,16 @@ pub const Manifest = struct {
     }
 
     pub fn deinit(self: *Manifest) void {
-        self.reusable.deinit(self.allocator);
-        self.consumed_keys.deinit(self.allocator);
-        self.pending_free.deinit(self.allocator);
+        for (&self.alloc_shards) |*shard| {
+            shard.reusable.deinit(self.allocator);
+            shard.consumed_keys.deinit(self.allocator);
+            shard.pending_free.deinit(self.allocator);
+        }
         var it = self.store_locks.valueIterator();
         while (it.next()) |m| self.allocator.destroy(m.*);
         self.store_locks.deinit(self.allocator);
         self.snapshot_counts.deinit(self.allocator);
-        self.store_root_cache.deinit(self.allocator);
+        for (&self.store_root_shards) |*sh| sh.cache.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -662,9 +768,12 @@ pub const Manifest = struct {
             }
         }
 
-        self.reusable_lock.lock();
-        const reusable_pages: u64 = self.reusable.items.len;
-        self.reusable_lock.unlock();
+        var reusable_pages: u64 = 0;
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            reusable_pages += shard.reusable.items.len;
+            shard.lock.unlock();
+        }
 
         const file_pages = self.file.pageCount();
         const fixed_pages: u64 = FIRST_DATA_PAGE; // header + slot A + slot B
@@ -725,9 +834,10 @@ pub const Manifest = struct {
     }
 
     pub fn hasStore(self: *Manifest, id: u64) !bool {
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
-        return self.store_root_cache.contains(id);
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        return shard.cache.contains(id);
     }
 
     /// Compatibility alias — kept for callers that already hold
@@ -738,9 +848,10 @@ pub const Manifest = struct {
     }
 
     pub fn storeRoot(self: *Manifest, id: u64) !?u64 {
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
-        if (self.store_root_cache.get(id)) |slot| return slot.root;
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        if (shard.cache.get(id)) |slot| return slot.root;
         return null;
     }
 
@@ -750,41 +861,44 @@ pub const Manifest = struct {
 
     pub fn createStore(self: *Manifest, id: u64) !void {
         try self.checkAlive();
-        // Acquire tree_lock first (lock-ordering rule), then the
-        // cache lock. createStore is rare — the per-call cost of
-        // taking both locks is fine.
+        // tree_lock guards the manifest tree; the store-root shard
+        // lock guards the in-memory cache. createStore is rare — the
+        // per-call cost of taking both locks is fine.
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
-        if (self.store_root_cache.contains(id)) return error.StoreAlreadyExists;
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        if (shard.cache.contains(id)) return error.StoreAlreadyExists;
         try self.setStoreRootInTreeLocked(id, 0);
-        try self.store_root_cache.put(self.allocator, id, .{ .root = 0, .dirty = false });
+        try shard.cache.put(self.allocator, id, .{ .root = 0, .dirty = false });
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
         try self.checkAlive();
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
-        if (!self.store_root_cache.contains(id)) return false;
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        if (!shard.cache.contains(id)) return false;
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         _ = try self.tree.delete(k);
-        _ = self.store_root_cache.remove(id);
+        _ = shard.cache.remove(id);
         return true;
     }
 
-    /// Hot-path write: O(1) hashmap update. The manifest tree is
-    /// NOT touched here — `durabilize` flushes dirty entries before
-    /// the slot swap. This is the critical-path optimization that
-    /// removes manifest-tree CoW from every put.
+    /// Hot-path write: O(1) hashmap update on the store_id's shard.
+    /// The manifest tree is NOT touched here — `durabilize` flushes
+    /// dirty entries before the slot swap. This is the critical-path
+    /// optimization that removes manifest-tree CoW from every put.
     pub fn setStoreRoot(self: *Manifest, id: u64, root: u64) !void {
         try self.checkAlive();
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
-        try self.store_root_cache.put(self.allocator, id, .{ .root = root, .dirty = true });
+        const shard = self.pickStoreShard(id);
+        shard.lock.lock();
+        defer shard.lock.unlock();
+        try shard.cache.put(self.allocator, id, .{ .root = root, .dirty = true });
     }
 
     /// Write-through variant used by `createStore` and the
@@ -798,14 +912,18 @@ pub const Manifest = struct {
     }
 
     pub fn listStores(self: *Manifest, allocator: std.mem.Allocator) ![]u64 {
-        self.store_root_cache_lock.lock();
-        defer self.store_root_cache_lock.unlock();
         var list: std.ArrayListUnmanaged(u64) = .empty;
         errdefer list.deinit(allocator);
-        try list.ensureTotalCapacity(allocator, self.store_root_cache.count());
-        var it = self.store_root_cache.keyIterator();
-        while (it.next()) |id_ptr| {
-            list.appendAssumeCapacity(id_ptr.*);
+        // Walk shards in order. Hold each shard's lock briefly while
+        // copying its keys; never two simultaneously.
+        for (&self.store_root_shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            try list.ensureUnusedCapacity(allocator, shard.cache.count());
+            var it = shard.cache.keyIterator();
+            while (it.next()) |id_ptr| {
+                list.appendAssumeCapacity(id_ptr.*);
+            }
         }
         // Hashmap iteration is unordered; the tree-scan implementation
         // returned ascending ids and several tests rely on that.
@@ -819,9 +937,42 @@ pub const Manifest = struct {
         return self.file.pageCount();
     }
 
-    /// Number of in-memory free pages immediately available for reuse.
-    pub fn reusableCount(self: *const Manifest) usize {
-        return self.reusable.items.len;
+    /// Number of in-memory free pages immediately available for reuse,
+    /// summed across allocator shards.
+    pub fn reusableCount(self: *Manifest) usize {
+        var total: usize = 0;
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            total += shard.reusable.items.len;
+            shard.lock.unlock();
+        }
+        return total;
+    }
+
+    /// Number of pages awaiting durabilize fold, summed across shards.
+    /// Test introspection — Phase 4 tests assert this is non-zero
+    /// after mutations and small after commit.
+    pub fn pendingFreeCount(self: *Manifest) usize {
+        var total: usize = 0;
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            total += shard.pending_free.items.len;
+            shard.lock.unlock();
+        }
+        return total;
+    }
+
+    /// Number of freelist-tree keys queued for deletion at next
+    /// durabilize, summed across shards. Test introspection — Phase 5
+    /// uses this to verify the freelist-reuse-rule unlocked chunks.
+    pub fn consumedKeysCount(self: *Manifest) usize {
+        var total: usize = 0;
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            total += shard.consumed_keys.items.len;
+            shard.lock.unlock();
+        }
+        return total;
     }
 
     /// Durabilize everything applied so far. After return, the current
@@ -834,8 +985,9 @@ pub const Manifest = struct {
     /// most of durabilize. Specifically: the freelist mutations run
     /// under `freelist_tree_lock`, leaving `tree_lock` free for worker
     /// reads/writes against the manifest tree. The slot write is
-    /// likewise free of `tree_lock`. `reusable_lock` / `pending_free_lock`
-    /// are taken in short bursts only.
+    /// likewise free of `tree_lock`. Allocator shard locks are taken
+    /// in short bursts only — per-shard, so different workers don't
+    /// contend on the same cache line.
     pub fn durabilize(self: *Manifest) !void {
         try self.checkAlive();
         // Serialize the whole call. Concurrent durabilize callers would
@@ -856,26 +1008,24 @@ pub const Manifest = struct {
 
         // Step 0: flush dirty store_root cache entries into the
         // manifest tree. The hot apply path bypasses tree_lock via
-        // the cache; this is the only point where those buffered
-        // writes hit the durable tree. Held under tree_lock so the
-        // tree.put operations use a stable self.tree.seq, and under
-        // cache_lock so concurrent setStoreRoot calls serialize
-        // against the flush.
+        // the per-store-id-sharded cache; this is the only point
+        // where those buffered writes hit the durable tree. Hold
+        // tree_lock throughout so the tree.put operations use a
+        // stable self.tree.seq; hold each shard lock briefly during
+        // its drain so concurrent setStoreRoot calls on OTHER shards
+        // can keep running.
         self.tree_lock.lock();
         {
-            // tree_lock must release on error inside the drain — a
-            // setStoreRootInTreeLocked failure would otherwise leave
-            // tree_lock permanently held, deadlocking every later
-            // operation (including the reads we explicitly permit on a
-            // poisoned manifest).
             errdefer self.tree_lock.unlock();
-            self.store_root_cache_lock.lock();
-            defer self.store_root_cache_lock.unlock();
-            var it = self.store_root_cache.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.dirty) {
-                    try self.setStoreRootInTreeLocked(entry.key_ptr.*, entry.value_ptr.root);
-                    entry.value_ptr.dirty = false;
+            for (&self.store_root_shards) |*shard| {
+                shard.lock.lock();
+                defer shard.lock.unlock();
+                var it = shard.cache.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.dirty) {
+                        try self.setStoreRootInTreeLocked(entry.key_ptr.*, entry.value_ptr.root);
+                        entry.value_ptr.dirty = false;
+                    }
                 }
             }
         }
@@ -883,18 +1033,24 @@ pub const Manifest = struct {
         self.tree_lock.unlock();
         if (K <= self.active_seq) return;
 
-        // 1. Snapshot pending_free + consumed_keys (brief). Each lock
-        //    held only for the duration of its toOwnedSlice — workers
-        //    on the other list can keep running.
-        self.pending_free_lock.lock();
-        const pf = try self.pending_free.toOwnedSlice(self.allocator);
-        self.pending_free_lock.unlock();
-        defer self.allocator.free(pf);
-
-        self.reusable_lock.lock();
-        const ck = try self.consumed_keys.toOwnedSlice(self.allocator);
-        self.reusable_lock.unlock();
-        defer self.allocator.free(ck);
+        // 1. Drain pending_free + consumed_keys from every allocator
+        //    shard into unified buffers. Each shard's lock is held only
+        //    briefly (one appendSlice per shard, then move-out). Lock
+        //    order is shard 0 → shard 7 — never two simultaneously.
+        var pf_list: std.ArrayListUnmanaged(FreedPage) = .empty;
+        defer pf_list.deinit(self.allocator);
+        var ck_list: std.ArrayListUnmanaged([FREELIST_KEY_LEN]u8) = .empty;
+        defer ck_list.deinit(self.allocator);
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            try pf_list.appendSlice(self.allocator, shard.pending_free.items);
+            shard.pending_free.clearRetainingCapacity();
+            try ck_list.appendSlice(self.allocator, shard.consumed_keys.items);
+            shard.consumed_keys.clearRetainingCapacity();
+        }
+        const pf = pf_list.items;
+        const ck = ck_list.items;
 
         // 2. Build initial orphan set from pf.
         var orphans: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -908,10 +1064,10 @@ pub const Manifest = struct {
         // 3. Fold pf into the durable freelist + delete consumed_keys.
         //    freelist_tree_lock guards the freelist tree from concurrent
         //    refillReusable scans. The freelist tree.put/delete calls
-        //    internally take reusable_lock (via allocImpl) and
-        //    pending_free_lock (via freeImpl) — never freelist_tree_lock
-        //    recursively. Hold via defer so an error in foldPendingFree
-        //    or freelist.delete doesn't leak the lock.
+        //    internally take a shard lock (via allocImpl/freeImpl) —
+        //    never freelist_tree_lock recursively. Hold via defer so
+        //    an error in foldPendingFree or freelist.delete doesn't
+        //    leak the lock.
         {
             self.freelist_tree_lock.lock();
             defer self.freelist_tree_lock.unlock();
@@ -920,13 +1076,17 @@ pub const Manifest = struct {
         }
 
         // 4. Extend orphan set with pages freed during fold/delete.
-        self.pending_free_lock.lock();
-        for (self.pending_free.items) |fp| {
-            if (fp.freed_at_seq <= K) {
-                try orphans.put(self.allocator, fp.page_no, {});
+        //    The freelist tree mutations went through freeImpl, landing
+        //    in some shard's pending_free. Scan every shard.
+        for (&self.alloc_shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            for (shard.pending_free.items) |fp| {
+                if (fp.freed_at_seq <= K) {
+                    try orphans.put(self.allocator, fp.page_no, {});
+                }
             }
         }
-        self.pending_free_lock.unlock();
 
         // 5. Flush dirty pages tagged seq <= K, skipping orphans.
         //    fdatasync (not fsync) — kvexp only mutates file size
@@ -1007,14 +1167,28 @@ pub const Manifest = struct {
         const min_snap = self.minLiveSnapSeq();
 
         // freelist_tree_lock serializes against any other freelist tree
-        // mutation (only durabilize mutates it, but defensive). The
-        // reusable_lock guards the reusable + consumed_keys lists.
+        // mutation (only durabilize mutates it, but defensive). Pages
+        // pulled from the freelist are distributed round-robin across
+        // allocator shards so no single shard hogs the whole pool;
+        // workers on different shards each get their fair share.
         self.freelist_tree_lock.lock();
         defer self.freelist_tree_lock.unlock();
-        self.reusable_lock.lock();
-        defer self.reusable_lock.unlock();
 
-        if (self.reusable.items.len >= REUSABLE_BATCH) return;
+        const total_reusable = self.reusableCount();
+        if (total_reusable >= REUSABLE_BATCH) return;
+
+        // Stage into per-shard buffers under no shard lock; do a single
+        // appendSlice + consumed_keys push per shard at the end. This
+        // keeps each shard's lock acquisition bounded to one call
+        // even if refill fills hundreds of pages.
+        var staged_reusable: [ALLOC_SHARD_COUNT]std.ArrayListUnmanaged(u64) = @splat(.empty);
+        defer for (&staged_reusable) |*l| l.deinit(self.allocator);
+        var staged_keys: [ALLOC_SHARD_COUNT]std.ArrayListUnmanaged([FREELIST_KEY_LEN]u8) = @splat(.empty);
+        defer for (&staged_keys) |*l| l.deinit(self.allocator);
+
+        var distribution_idx: usize = 0;
+        var staged_total: usize = total_reusable;
+
         var cursor = try self.freelist.scanPrefix("");
         defer cursor.deinit();
         while (try cursor.next()) {
@@ -1027,14 +1201,31 @@ pub const Manifest = struct {
             if (min_snap) |m| {
                 if (decoded.freed_at_seq >= m) continue;
             }
+            // Pages from this chunk get spread across shards round-robin.
+            // The chunk's key is queued for delete in the SAME shard as
+            // the chunk's first page (arbitrary but stable).
+            const chunk_owner = distribution_idx % ALLOC_SHARD_COUNT;
             var it = ChunkIterator.init(cursor.value());
             while (it.next()) |p| {
-                try self.reusable.append(self.allocator, p);
+                const target = distribution_idx % ALLOC_SHARD_COUNT;
+                try staged_reusable[target].append(self.allocator, p);
+                distribution_idx += 1;
+                staged_total += 1;
             }
             var key_copy: [FREELIST_KEY_LEN]u8 = undefined;
             @memcpy(&key_copy, cursor.key());
-            try self.consumed_keys.append(self.allocator, key_copy);
-            if (self.reusable.items.len >= REUSABLE_BATCH) break;
+            try staged_keys[chunk_owner].append(self.allocator, key_copy);
+            if (staged_total >= REUSABLE_BATCH) break;
+        }
+
+        // Flush staged buffers into shards. One lock acquisition per
+        // shard, regardless of how many pages went into it.
+        for (&self.alloc_shards, 0..) |*shard, i| {
+            if (staged_reusable[i].items.len == 0 and staged_keys[i].items.len == 0) continue;
+            shard.lock.lock();
+            defer shard.lock.unlock();
+            try shard.reusable.appendSlice(self.allocator, staged_reusable[i].items);
+            try shard.consumed_keys.appendSlice(self.allocator, staged_keys[i].items);
         }
     }
 
@@ -1309,10 +1500,11 @@ pub const Store = struct {
         self.manifest.tree_lock.unlock();
         const root = root_opt orelse return error.StoreNotFound;
 
-        // Phase 2: store-tree CoW without manifest locks. allocImpl
-        // takes reusable_lock briefly; freeImpl takes pending_free_lock
-        // briefly; cache takes cache_lock briefly. Writers on different
-        // stores can run this part concurrently.
+        // Phase 2: store-tree CoW without manifest locks. allocImpl /
+        // freeImpl each briefly take this worker's allocator shard
+        // lock (workers on distinct cache lines, by design); cache
+        // takes its shard lock briefly. Writers on different stores
+        // run this part concurrently.
         self.tree.root = root;
         self.tree.seq = seq;
         try self.tree.put(key, value);
@@ -1846,10 +2038,10 @@ test "Freelist: pending_free populated by mutations, drained at commit" {
     try s.put("b", "2");
     _ = h.manifest.nextApply();
     try s.put("c", "3");
-    try testing.expect(h.manifest.pending_free.items.len > 0);
+    try testing.expect(h.manifest.pendingFreeCount() > 0);
 
     try h.manifest.commit();
-    try testing.expect(h.manifest.pending_free.items.len < 10);
+    try testing.expect(h.manifest.pendingFreeCount() < 10);
 }
 
 test "Freelist: reuse after two-commit lag" {
@@ -1874,7 +2066,7 @@ test "Freelist: reuse after two-commit lag" {
 
     // After 2 commits, the first commit's freed pages should be
     // eligible for reuse.
-    try testing.expect(h.manifest.reusable.items.len > 0);
+    try testing.expect(h.manifest.reusableCount() > 0);
 }
 
 test "Freelist: survives reopen" {
@@ -2173,7 +2365,7 @@ test "Phase 7: live snapshot blocks reuse of pages freed at its seq or later" {
     }
     try h.manifest.durabilize();
     try h.manifest.durabilize();
-    try testing.expect(h.manifest.reusable.items.len > 0);
+    try testing.expect(h.manifest.reusableCount() > 0);
 
     // Open a snapshot at this point. Its snap_seq is the next apply
     // seq (a low number; everything freed from here forward becomes
@@ -2219,14 +2411,14 @@ test "Phase 7: live snapshot blocks reuse of pages freed at its seq or later" {
 
     // Close the snapshot. Subsequent refill should pick up the
     // previously-blocked entries.
-    const reusable_before_close = h.manifest.reusable.items.len;
+    const reusable_before_close = h.manifest.reusableCount();
     snap.close();
     try testing.expectEqual(@as(?u64, null), h.manifest.minLiveSnapSeq());
 
     // Trigger another refill (durabilize calls it). After this the
     // reusable list should grow as the blocked chunks become eligible.
     try h.manifest.durabilize();
-    try testing.expect(h.manifest.reusable.items.len > reusable_before_close);
+    try testing.expect(h.manifest.reusableCount() > reusable_before_close);
 }
 
 test "Phase 7: long-running prefix scan sees consistent view during heavy writes" {
@@ -2317,7 +2509,7 @@ test "Hybrid CoW: same-seq puts to one leaf reuse the shadow page" {
             try s.put(k, "x");
         }
     }
-    const orphans_same = h_same.manifest.pending_free.items.len;
+    const orphans_same = h_same.manifest.pendingFreeCount();
     const grew_same = h_same.manifest.fileSizePages() - size_before_same;
 
     var h_per_seq = try Harness.init(128);
@@ -2336,7 +2528,7 @@ test "Hybrid CoW: same-seq puts to one leaf reuse the shadow page" {
             try s.put(k, "x");
         }
     }
-    const orphans_per = h_per_seq.manifest.pending_free.items.len;
+    const orphans_per = h_per_seq.manifest.pendingFreeCount();
     const grew_per = h_per_seq.manifest.fileSizePages() - size_before_per;
 
     // Hybrid path generates strictly fewer orphans and grows the file
@@ -2501,7 +2693,7 @@ test "Phase 5: group commit reuse rule skips inactive_seq + 1" {
     // (their referencing manifest M_1 is still durable in the inactive
     // slot — those pages are NOT reusable yet). No new chunks should
     // have been consumed in d2's refillReusable.
-    const consumed_after_d2 = h.manifest.consumed_keys.items.len;
+    const consumed_after_d2 = h.manifest.consumedKeysCount();
     try testing.expectEqual(@as(usize, 0), consumed_after_d2);
 
     // Apply 3 → durabilize at seq=3. After: active=3, inactive=2.
@@ -2522,7 +2714,7 @@ test "Phase 5: group commit reuse rule skips inactive_seq + 1" {
     // and were pulled into reusable. Less brittle than comparing
     // reusable.items.len, which is inflated by grow-batched pages
     // unrelated to the freelist reuse rule under test.
-    try testing.expect(h.manifest.consumed_keys.items.len > 0);
+    try testing.expect(h.manifest.consumedKeysCount() > 0);
 }
 
 test "Phase 6: N concurrent writers, distinct stores, all data persists" {
@@ -2673,7 +2865,7 @@ test "Freelist: churn workload approaches net-zero growth" {
     try h.manifest.commit();
     try h.manifest.commit();
     try testing.expect(h.manifest.freelist.root != 0);
-    try testing.expect(h.manifest.reusable.items.len > 0);
+    try testing.expect(h.manifest.reusableCount() > 0);
 
     const size_after_populate = h.manifest.fileSizePages();
 

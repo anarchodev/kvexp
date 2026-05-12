@@ -126,8 +126,12 @@ pub const PageCache = struct {
     shards: []Shard,
 
     pub const Options = struct {
-        /// Number of shards. 0 = auto: `clamp(pool.capacity / 4, 1, 16)`.
-        /// Each shard owns at least 1 buffer.
+        /// Number of shards. 0 = auto: `clamp(pool.capacity / 64, 1, 256)`.
+        /// Each shard owns at least 1 buffer. The 256 cap (was 16) was
+        /// raised after profiling showed shard-lock collisions
+        /// dominating multi-tenant concurrent-write workloads at
+        /// pool sizes typical of production deployments (16384+ pages,
+        /// where the old cap left only 1 shard per ~1024 buffers).
         shard_count: u32 = 0,
     };
 
@@ -138,7 +142,7 @@ pub const PageCache = struct {
         options: Options,
     ) !PageCache {
         const requested = if (options.shard_count == 0)
-            std.math.clamp(pool.capacity / 4, 1, 16)
+            std.math.clamp(pool.capacity / 64, 1, 256)
         else
             options.shard_count;
         const sc: u32 = @min(requested, pool.capacity);
@@ -879,17 +883,18 @@ test "PageCache: structurally-invalid page rejected (CRC OK)" {
 }
 
 test "PageCache: auto-shard count scales with pool capacity" {
-    var h64 = try Harness.init(64, 4);
-    defer h64.deinit();
-    try testing.expectEqual(@as(u32, 16), h64.cache.shardCount());
+    // Auto formula: clamp(pool.capacity / 64, 1, 256).
+    var h_small = try Harness.init(64, 4);
+    defer h_small.deinit();
+    try testing.expectEqual(@as(u32, 1), h_small.cache.shardCount());
 
-    var h32 = try Harness.init(32, 4);
-    defer h32.deinit();
-    try testing.expectEqual(@as(u32, 8), h32.cache.shardCount());
+    var h_med = try Harness.init(256, 4);
+    defer h_med.deinit();
+    try testing.expectEqual(@as(u32, 4), h_med.cache.shardCount());
 
-    var h4 = try Harness.init(4, 4);
-    defer h4.deinit();
-    try testing.expectEqual(@as(u32, 1), h4.cache.shardCount());
+    var h_large = try Harness.init(1024, 4);
+    defer h_large.deinit();
+    try testing.expectEqual(@as(u32, 16), h_large.cache.shardCount());
 }
 
 test "PageCache: page_no maps consistently to same shard" {
