@@ -5,3 +5,4 @@ zig-cache/
 *.a
 *.swp
 .DS_Store
+.claude/
