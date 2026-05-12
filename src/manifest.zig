@@ -112,18 +112,13 @@ pub const Manifest = struct {
     overlays_lock: std.Thread.Mutex = .{},
     /// Guards `store_locks`. Brief.
     store_locks_lock: std.Thread.Mutex = .{},
-    /// Guards `apply_seq`, `durable_seq`, `last_applied_raft_idx`,
-    /// `snapshot_counts`. Tiny critical sections.
+    /// Guards `last_applied_raft_idx`. Tiny critical sections.
     meta_lock: std.Thread.Mutex = .{},
     /// Single-caller serialization for durabilize. Held outermost.
     durabilize_lock: std.Thread.Mutex = .{},
 
     last_applied_raft_idx: u64 = 0,
-    apply_seq: u64 = 0,
-    durable_seq: u64 = 0,
     poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    snapshot_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
     pub fn init(
         self: *Manifest,
@@ -199,7 +194,6 @@ pub const Manifest = struct {
         var sl_it = self.store_locks.valueIterator();
         while (sl_it.next()) |m| self.allocator.destroy(m.*);
         self.store_locks.deinit(self.allocator);
-        self.snapshot_counts.deinit(self.allocator);
     }
 
     pub fn deinit(self: *Manifest) void {
@@ -208,24 +202,7 @@ pub const Manifest = struct {
         self.* = undefined;
     }
 
-    // ── apply/durable seq + raft watermark ──────────────────────────
-
-    pub fn nextApply(self: *Manifest) u64 {
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        self.apply_seq += 1;
-        return self.apply_seq;
-    }
-
-    pub fn applySeq(self: *Manifest) u64 {
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        return self.apply_seq;
-    }
-
-    pub fn durableSeq(self: *const Manifest) u64 {
-        return self.durable_seq;
-    }
+    // ── raft watermark ──────────────────────────────────────────────
 
     pub fn lastAppliedRaftIdx(self: *Manifest) u64 {
         self.meta_lock.lock();
@@ -238,6 +215,25 @@ pub const Manifest = struct {
         self.meta_lock.lock();
         defer self.meta_lock.unlock();
         self.last_applied_raft_idx = idx;
+    }
+
+    /// Drop every per-store overlay's contents in-memory. Does NOT
+    /// touch LMDB. Used on leadership loss: the integration calls
+    /// this, then replays raft entries from `last_applied_raft_idx + 1`
+    /// onward, which repopulates the overlays with the confirmed
+    /// (raft-committed) prefix. Speculative-but-uncommitted writes
+    /// vanish along with the overlay — those proposals never made it
+    /// into the raft log, so they never had a durability guarantee.
+    pub fn discardOverlays(self: *Manifest) void {
+        self.overlays_lock.lock();
+        defer self.overlays_lock.unlock();
+        var it = self.overlays.iterator();
+        while (it.next()) |entry| {
+            const ov = entry.value_ptr.*;
+            ov.lock.lock();
+            defer ov.lock.unlock();
+            ov.clear();
+        }
     }
 
     // ── poison ──────────────────────────────────────────────────────
@@ -396,23 +392,6 @@ pub const Manifest = struct {
         return self.overlays.get(id);
     }
 
-    // ── snapshot ref counting (for hooks; LMDB read txns are the real machinery) ──
-
-    fn registerSnapshot(self: *Manifest, seq: u64) !void {
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        const gop = try self.snapshot_counts.getOrPut(self.allocator, seq);
-        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
-    }
-
-    fn unregisterSnapshot(self: *Manifest, seq: u64) void {
-        self.meta_lock.lock();
-        defer self.meta_lock.unlock();
-        const entry = self.snapshot_counts.getPtr(seq) orelse return;
-        entry.* -= 1;
-        if (entry.* == 0) _ = self.snapshot_counts.remove(seq);
-    }
-
     // ── durabilize ──────────────────────────────────────────────────
 
     pub fn durabilize(self: *Manifest) !void {
@@ -539,11 +518,12 @@ pub const Manifest = struct {
             }
         }
 
-        if (idx_to_write != 0) {
-            var buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buf, idx_to_write, .little);
-            try txn.put(self.meta_dbi, META_RAFT_APPLY_KEY, &buf);
-        }
+        // Always write the watermark, even if 0 — keeps LMDB's value
+        // exactly equal to the in-memory value post-commit. A 0 write
+        // is harmless (idempotent on a never-set or already-0 entry).
+        var idx_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &idx_buf, idx_to_write, .little);
+        try txn.put(self.meta_dbi, META_RAFT_APPLY_KEY, &idx_buf);
 
         try txn.commit();
 
@@ -562,10 +542,6 @@ pub const Manifest = struct {
                 _ = self.pending_creates.remove(n.id);
             }
         }
-
-        self.meta_lock.lock();
-        self.durable_seq = self.apply_seq;
-        self.meta_lock.unlock();
     }
 
     const NewDbi = struct { id: u64, dbi: lmdb.Dbi };
@@ -592,12 +568,6 @@ pub const Manifest = struct {
         // moment in which overlays + LMDB state agree.
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
-
-        const seq = blk: {
-            self.meta_lock.lock();
-            defer self.meta_lock.unlock();
-            break :blk self.apply_seq;
-        };
 
         // LMDB read txn — provides the immutable point-in-time view
         // of every store.
@@ -649,10 +619,8 @@ pub const Manifest = struct {
             try ov_capture.put(self.allocator, p.id, slice);
         }
 
-        try self.registerSnapshot(seq);
         return .{
             .manifest = self,
-            .snap_seq = seq,
             .read_txn = read_txn,
             .overlays = ov_capture,
         };
@@ -663,7 +631,6 @@ pub const Manifest = struct {
     pub const VerifyReport = struct {
         store_count: u64,
         last_applied_raft_idx: u64,
-        durable_seq: u64,
     };
 
     pub fn verify(self: *Manifest, allocator: std.mem.Allocator) !VerifyReport {
@@ -673,7 +640,6 @@ pub const Manifest = struct {
         return .{
             .store_count = self.dbis.count(),
             .last_applied_raft_idx = self.last_applied_raft_idx,
-            .durable_seq = self.durable_seq,
         };
     }
 };
@@ -1003,7 +969,6 @@ pub const StorePrefixCursor = struct {
 
 pub const Snapshot = struct {
     manifest: *Manifest,
-    snap_seq: u64,
     read_txn: lmdb.Txn,
     overlays: std.AutoHashMapUnmanaged(u64, []StorePrefixCursor.Entry),
 
@@ -1018,7 +983,6 @@ pub const Snapshot = struct {
         }
         self.overlays.deinit(self.manifest.allocator);
         self.read_txn.abort();
-        self.manifest.unregisterSnapshot(self.snap_seq);
         self.* = undefined;
     }
 
@@ -1249,7 +1213,10 @@ pub const SNAP_TAG_END: u8 = 2;
 pub fn dumpSnapshot(snap: *Snapshot, writer: anytype) !void {
     try writer.writeInt(u32, SNAPSHOT_MAGIC, .little);
     try writer.writeByte(SNAPSHOT_VERSION);
-    try writer.writeInt(u64, snap.snap_seq, .little);
+    // Reserved field (was apply_seq pre-LMDB). Kept as a 0 in the
+    // wire format so future tooling can re-purpose it without bumping
+    // the version. loadSnapshot discards it.
+    try writer.writeInt(u64, 0, .little);
     try writer.writeInt(u64, snap.manifest.lastAppliedRaftIdx(), .little);
 
     const stores = try snap.listStores(snap.manifest.allocator);
@@ -1516,6 +1483,37 @@ test "Manifest: lastAppliedRaftIdx round-trips via durabilize" {
     try h.manifest.commit();
     try h.cycle();
     try testing.expectEqual(@as(u64, 42), h.manifest.lastAppliedRaftIdx());
+}
+
+test "discardOverlays: drops in-flight writes; durable state intact" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("durable", "yes");
+    }
+    try h.manifest.commit(); // "durable" → "yes" lives in LMDB.
+
+    // Stage speculative writes that won't be raft-committed.
+    {
+        var s = try Store.open(h.manifest, 1);
+        defer s.deinit();
+        try s.put("speculative", "maybe");
+        try s.put("durable", "overridden");
+    }
+
+    h.manifest.discardOverlays();
+
+    var s = try Store.open(h.manifest, 1);
+    defer s.deinit();
+    // "speculative" vanished.
+    try testing.expect((try s.get(testing.allocator, "speculative")) == null);
+    // "durable" reverted to its LMDB value.
+    const got = (try s.get(testing.allocator, "durable")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("yes", got);
 }
 
 test "Manifest: poison blocks writes; reopen clears it" {
