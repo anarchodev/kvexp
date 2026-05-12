@@ -181,6 +181,13 @@ pub const SpecificError = error{
 
 const FreedPage = struct { page_no: u64, freed_at_seq: u64 };
 
+const RootSlot = struct {
+    root: u64,
+    /// true = differs from the durable manifest tree (needs flush
+    /// at next durabilize). false = matches the durable tree.
+    dirty: bool,
+};
+
 pub const Manifest = struct {
     allocator: std.mem.Allocator,
     cache: *PageCache,
@@ -218,18 +225,33 @@ pub const Manifest = struct {
 
     /// Lock ordering (no thread holds an earlier lock while acquiring
     /// a later one):
-    ///   store_lock(id)     — held by one writer to that store at a
-    ///                        time; uncontended across distinct stores
-    ///   tree_lock          — manifest tree mutations + reads
-    ///   freelist_tree_lock — freelist tree mutations + reads (only
-    ///                        held during durabilize)
-    ///   alloc_lock         — reusable/pending_free/consumed_keys/
-    ///                        file.growBy
+    ///   store_lock(id)            — held by one writer to that store
+    ///                                at a time; uncontended across
+    ///                                distinct stores
+    ///   tree_lock                 — manifest tree mutations + reads
+    ///   freelist_tree_lock        — freelist tree mutations + reads
+    ///                                (only held during durabilize)
+    ///   store_root_cache_lock     — in-memory store_root cache
+    ///                                (hashmap; uncontended for distinct
+    ///                                store_ids in practice)
+    ///   alloc_lock                — reusable/pending_free/
+    ///                                consumed_keys/file.growBy
     /// `cache.lock` (interior, owned by PageCache) is acquired
     /// briefly *inside* allocImpl/freeImpl-free regions.
     tree_lock: std.Thread.Mutex = .{},
     freelist_tree_lock: std.Thread.Mutex = .{},
     alloc_lock: std.Thread.Mutex = .{},
+
+    /// In-memory cache of store_id → current root. The hot path
+    /// (`setStoreRoot` / `storeRoot`) hits this map directly, never
+    /// touching the manifest tree. `durabilize` step 0 flushes dirty
+    /// entries into the manifest tree before the page-flush phase.
+    /// On `init` the cache is bulk-populated from the durable tree;
+    /// after that, every `hasStore` / `storeRoot` is an O(1) hashmap
+    /// lookup. Tracks `dirty` so durabilize only writes entries that
+    /// changed since the last flush.
+    store_root_cache: std.AutoHashMapUnmanaged(u64, RootSlot),
+    store_root_cache_lock: std.Thread.Mutex = .{},
 
     /// Per-store write locks, keyed by store_id. Allocated lazily on
     /// first Store.put for that id; not freed (small overhead per
@@ -283,11 +305,13 @@ pub const Manifest = struct {
         self.pending_free = .empty;
         self.store_locks = .empty;
         self.snapshot_counts = .empty;
+        self.store_root_cache = .empty;
         self.tree_lock = .{};
         self.freelist_tree_lock = .{};
         self.alloc_lock = .{};
         self.store_locks_lock = .{};
         self.snapshots_lock = .{};
+        self.store_root_cache_lock = .{};
 
         while (file.pageCount() < FIRST_DATA_PAGE) {
             _ = try file.growBy(1);
@@ -355,6 +379,27 @@ pub const Manifest = struct {
         self.freelist.seq = active_seq + 1;
 
         try self.refillReusable();
+        try self.populateStoreRootCache();
+    }
+
+    /// Bulk-load every (store_id, root) from the durable manifest
+    /// tree into the in-memory cache. Called once at `init`. After
+    /// this, every `hasStore` / `storeRoot` is a cache lookup —
+    /// the manifest tree is only re-touched at `durabilize` flush
+    /// time and on `createStore` / `dropStore` (which write through).
+    fn populateStoreRootCache(self: *Manifest) !void {
+        if (self.tree.root == 0) return;
+        self.tree_lock.lock();
+        defer self.tree_lock.unlock();
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        var cursor = try self.tree.scanPrefix("");
+        defer cursor.deinit();
+        while (try cursor.next()) {
+            const id = decodeStoreId(cursor.key());
+            const root = decodeRoot(cursor.value());
+            try self.store_root_cache.put(self.allocator, id, .{ .root = root, .dirty = false });
+        }
     }
 
     /// Start a new apply unit. Subsequent mutations tag dirty pages
@@ -404,6 +449,7 @@ pub const Manifest = struct {
         while (it.next()) |m| self.allocator.destroy(m.*);
         self.store_locks.deinit(self.allocator);
         self.snapshot_counts.deinit(self.allocator);
+        self.store_root_cache.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -552,61 +598,68 @@ pub const Manifest = struct {
     }
 
     pub fn hasStore(self: *Manifest, id: u64) !bool {
-        self.tree_lock.lock();
-        defer self.tree_lock.unlock();
-        return try self.hasStoreLocked(id);
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        return self.store_root_cache.contains(id);
     }
 
+    /// Compatibility alias — kept for callers that already hold
+    /// `tree_lock` and want the in-tree path. The cache is the
+    /// authoritative answer; tree_lock isn't required.
     fn hasStoreLocked(self: *Manifest, id: u64) !bool {
-        var id_buf: [STORE_ID_LEN]u8 = undefined;
-        const k = encodeStoreId(id, &id_buf);
-        const v = try self.tree.get(self.allocator, k);
-        if (v) |bytes| {
-            self.allocator.free(bytes);
-            return true;
-        }
-        return false;
+        return self.hasStore(id);
     }
 
     pub fn storeRoot(self: *Manifest, id: u64) !?u64 {
-        self.tree_lock.lock();
-        defer self.tree_lock.unlock();
-        return try self.storeRootLocked(id);
-    }
-
-    fn storeRootLocked(self: *Manifest, id: u64) !?u64 {
-        var id_buf: [STORE_ID_LEN]u8 = undefined;
-        const k = encodeStoreId(id, &id_buf);
-        const v = try self.tree.get(self.allocator, k);
-        if (v) |bytes| {
-            defer self.allocator.free(bytes);
-            return decodeRoot(bytes);
-        }
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        if (self.store_root_cache.get(id)) |slot| return slot.root;
         return null;
     }
 
+    fn storeRootLocked(self: *Manifest, id: u64) !?u64 {
+        return self.storeRoot(id);
+    }
+
     pub fn createStore(self: *Manifest, id: u64) !void {
+        // Acquire tree_lock first (lock-ordering rule), then the
+        // cache lock. createStore is rare — the per-call cost of
+        // taking both locks is fine.
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
-        if (try self.hasStoreLocked(id)) return error.StoreAlreadyExists;
-        try self.setStoreRootLocked(id, 0);
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        if (self.store_root_cache.contains(id)) return error.StoreAlreadyExists;
+        try self.setStoreRootInTreeLocked(id, 0);
+        try self.store_root_cache.put(self.allocator, id, .{ .root = 0, .dirty = false });
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
         self.tree_lock.lock();
         defer self.tree_lock.unlock();
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        if (!self.store_root_cache.contains(id)) return false;
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
-        return try self.tree.delete(k);
+        _ = try self.tree.delete(k);
+        _ = self.store_root_cache.remove(id);
+        return true;
     }
 
+    /// Hot-path write: O(1) hashmap update. The manifest tree is
+    /// NOT touched here — `durabilize` flushes dirty entries before
+    /// the slot swap. This is the critical-path optimization that
+    /// removes manifest-tree CoW from every put.
     pub fn setStoreRoot(self: *Manifest, id: u64, root: u64) !void {
-        self.tree_lock.lock();
-        defer self.tree_lock.unlock();
-        try self.setStoreRootLocked(id, root);
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
+        try self.store_root_cache.put(self.allocator, id, .{ .root = root, .dirty = true });
     }
 
-    fn setStoreRootLocked(self: *Manifest, id: u64, root: u64) !void {
+    /// Write-through variant used by `createStore` and the
+    /// `durabilize` cache flush. Caller must hold `tree_lock`.
+    fn setStoreRootInTreeLocked(self: *Manifest, id: u64, root: u64) !void {
         var id_buf: [STORE_ID_LEN]u8 = undefined;
         const k = encodeStoreId(id, &id_buf);
         var val_buf: [STORE_VAL_LEN]u8 = undefined;
@@ -615,15 +668,18 @@ pub const Manifest = struct {
     }
 
     pub fn listStores(self: *Manifest, allocator: std.mem.Allocator) ![]u64 {
-        self.tree_lock.lock();
-        defer self.tree_lock.unlock();
+        self.store_root_cache_lock.lock();
+        defer self.store_root_cache_lock.unlock();
         var list: std.ArrayListUnmanaged(u64) = .empty;
         errdefer list.deinit(allocator);
-        var cursor = try self.tree.scanPrefix("");
-        defer cursor.deinit();
-        while (try cursor.next()) {
-            try list.append(allocator, decodeStoreId(cursor.key()));
+        try list.ensureTotalCapacity(allocator, self.store_root_cache.count());
+        var it = self.store_root_cache.keyIterator();
+        while (it.next()) |id_ptr| {
+            list.appendAssumeCapacity(id_ptr.*);
         }
+        // Hashmap iteration is unordered; the tree-scan implementation
+        // returned ascending ids and several tests rely on that.
+        std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
         return try list.toOwnedSlice(allocator);
     }
 
@@ -651,9 +707,25 @@ pub const Manifest = struct {
     /// likewise free of `tree_lock`. `alloc_lock` is taken in short
     /// bursts only.
     pub fn durabilize(self: *Manifest) !void {
-        // Capture K under tree_lock so a concurrent nextApply doesn't
-        // race the read.
+        // Step 0: flush dirty store_root cache entries into the
+        // manifest tree. The hot apply path bypasses tree_lock via
+        // the cache; this is the only point where those buffered
+        // writes hit the durable tree. Held under tree_lock so the
+        // tree.put operations use a stable self.tree.seq, and under
+        // cache_lock so concurrent setStoreRoot calls serialize
+        // against the flush.
         self.tree_lock.lock();
+        {
+            self.store_root_cache_lock.lock();
+            defer self.store_root_cache_lock.unlock();
+            var it = self.store_root_cache.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.dirty) {
+                    try self.setStoreRootInTreeLocked(entry.key_ptr.*, entry.value_ptr.root);
+                    entry.value_ptr.dirty = false;
+                }
+            }
+        }
         const K = self.tree.seq;
         self.tree_lock.unlock();
         if (K <= self.active_seq) return;
