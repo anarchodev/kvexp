@@ -101,6 +101,98 @@ fn decodeStoreIdKey(bytes: []const u8) u64 {
     return std.mem.readInt(u64, bytes[0..8], .big);
 }
 
+// ─── Metrics ────────────────────────────────────────────────────────
+
+/// Atomic counters and gauges for production observability. Each
+/// counter is monotonically increasing; gauges go up and down. Reading
+/// individual fields is lock-free; reading the full snapshot via
+/// `Manifest.metricsSnapshot()` is point-in-time per-field but not
+/// linearized across fields (which is fine for monitoring).
+///
+/// Counter naming follows Prometheus convention: `*_total` for monotonic
+/// counters, no suffix for gauges.
+pub const Metrics = struct {
+    // Lifecycle counters
+    create_store_total: std.atomic.Value(u64) = .init(0),
+    drop_store_total: std.atomic.Value(u64) = .init(0),
+
+    // Dispatch counters
+    acquire_total: std.atomic.Value(u64) = .init(0),
+    try_acquire_total: std.atomic.Value(u64) = .init(0),
+    try_acquire_contended_total: std.atomic.Value(u64) = .init(0),
+
+    // Txn-level counters
+    txn_commit_total: std.atomic.Value(u64) = .init(0),
+    txn_rollback_total: std.atomic.Value(u64) = .init(0),
+    savepoint_commit_total: std.atomic.Value(u64) = .init(0),
+    savepoint_rollback_total: std.atomic.Value(u64) = .init(0),
+    put_total: std.atomic.Value(u64) = .init(0),
+    delete_total: std.atomic.Value(u64) = .init(0),
+    get_total: std.atomic.Value(u64) = .init(0),
+    bytes_put_total: std.atomic.Value(u64) = .init(0),
+
+    // Durability + snapshot counters
+    durabilize_total: std.atomic.Value(u64) = .init(0),
+    durabilize_failed_total: std.atomic.Value(u64) = .init(0),
+    snapshot_open_total: std.atomic.Value(u64) = .init(0),
+
+    // Health
+    poison_total: std.atomic.Value(u64) = .init(0),
+
+    // Gauges (signed so a counting bug shows up as negative rather
+    // than wrapping into an astronomically large number).
+    active_leases: std.atomic.Value(i64) = .init(0),
+    active_snapshots: std.atomic.Value(i64) = .init(0),
+
+    fn snapshot(self: *const Metrics) MetricsSnapshot {
+        return .{
+            .create_store_total = self.create_store_total.load(.acquire),
+            .drop_store_total = self.drop_store_total.load(.acquire),
+            .acquire_total = self.acquire_total.load(.acquire),
+            .try_acquire_total = self.try_acquire_total.load(.acquire),
+            .try_acquire_contended_total = self.try_acquire_contended_total.load(.acquire),
+            .txn_commit_total = self.txn_commit_total.load(.acquire),
+            .txn_rollback_total = self.txn_rollback_total.load(.acquire),
+            .savepoint_commit_total = self.savepoint_commit_total.load(.acquire),
+            .savepoint_rollback_total = self.savepoint_rollback_total.load(.acquire),
+            .put_total = self.put_total.load(.acquire),
+            .delete_total = self.delete_total.load(.acquire),
+            .get_total = self.get_total.load(.acquire),
+            .bytes_put_total = self.bytes_put_total.load(.acquire),
+            .durabilize_total = self.durabilize_total.load(.acquire),
+            .durabilize_failed_total = self.durabilize_failed_total.load(.acquire),
+            .snapshot_open_total = self.snapshot_open_total.load(.acquire),
+            .poison_total = self.poison_total.load(.acquire),
+            .active_leases = self.active_leases.load(.acquire),
+            .active_snapshots = self.active_snapshots.load(.acquire),
+        };
+    }
+};
+
+/// A point-in-time copy of `Metrics`. Plain values, safe to print, log,
+/// or ship to a metrics backend.
+pub const MetricsSnapshot = struct {
+    create_store_total: u64,
+    drop_store_total: u64,
+    acquire_total: u64,
+    try_acquire_total: u64,
+    try_acquire_contended_total: u64,
+    txn_commit_total: u64,
+    txn_rollback_total: u64,
+    savepoint_commit_total: u64,
+    savepoint_rollback_total: u64,
+    put_total: u64,
+    delete_total: u64,
+    get_total: u64,
+    bytes_put_total: u64,
+    durabilize_total: u64,
+    durabilize_failed_total: u64,
+    snapshot_open_total: u64,
+    poison_total: u64,
+    active_leases: i64,
+    active_snapshots: i64,
+};
+
 // ─── Manifest ───────────────────────────────────────────────────────
 
 pub const Manifest = struct {
@@ -123,6 +215,11 @@ pub const Manifest = struct {
     poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Single-caller serializer for durabilize / openSnapshot.
     durabilize_lock: std.Thread.Mutex = .{},
+
+    /// Atomic counters/gauges. Read via `metricsSnapshot()` for a
+    /// consistent point-in-time view; the underlying fields are atomic
+    /// but reading them individually is not coordinated across fields.
+    metrics: Metrics = .{},
 
     pub fn init(
         self: *Manifest,
@@ -206,6 +303,12 @@ pub const Manifest = struct {
         self.* = undefined;
     }
 
+    // ── metrics ─────────────────────────────────────────────────────
+
+    pub fn metricsSnapshot(self: *const Manifest) MetricsSnapshot {
+        return self.metrics.snapshot();
+    }
+
     // ── poison ──────────────────────────────────────────────────────
 
     pub fn isPoisoned(self: *const Manifest) bool {
@@ -214,6 +317,7 @@ pub const Manifest = struct {
 
     fn poison(self: *Manifest) void {
         self.poisoned.store(true, .monotonic);
+        _ = self.metrics.poison_total.fetchAdd(1, .acq_rel);
     }
 
     pub fn _testPoison(self: *Manifest) void {
@@ -233,6 +337,7 @@ pub const Manifest = struct {
         if (self.hasStoreLocked(id)) return error.StoreAlreadyExists;
         self.pending_creates.put(self.allocator, id, {}) catch
             @panic("OOM in createStore.pending_creates.put");
+        _ = self.metrics.create_store_total.fetchAdd(1, .acq_rel);
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
@@ -296,6 +401,7 @@ pub const Manifest = struct {
             ts.chain_tail = null;
             ts.main_overlay.clear();
         }
+        _ = self.metrics.drop_store_total.fetchAdd(1, .acq_rel);
         return true;
     }
 
@@ -380,6 +486,8 @@ pub const Manifest = struct {
         // we must drop that reference.
         errdefer ts.releaseRef(self.allocator);
         ts.dispatch_lock.lock();
+        _ = self.metrics.acquire_total.fetchAdd(1, .acq_rel);
+        _ = self.metrics.active_leases.fetchAdd(1, .acq_rel);
         return .{
             .manifest = self,
             .tenant_id = tenant_id,
@@ -396,8 +504,11 @@ pub const Manifest = struct {
         errdefer ts.releaseRef(self.allocator);
         if (!ts.dispatch_lock.tryLock()) {
             ts.releaseRef(self.allocator);
+            _ = self.metrics.try_acquire_contended_total.fetchAdd(1, .acq_rel);
             return null;
         }
+        _ = self.metrics.try_acquire_total.fetchAdd(1, .acq_rel);
+        _ = self.metrics.active_leases.fetchAdd(1, .acq_rel);
         return StoreLease{
             .manifest = self,
             .tenant_id = tenant_id,
@@ -411,7 +522,10 @@ pub const Manifest = struct {
         try self.checkAlive();
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
-        errdefer self.poison();
+        errdefer {
+            _ = self.metrics.durabilize_failed_total.fetchAdd(1, .acq_rel);
+            self.poison();
+        }
 
         // 1. Snapshot pending creates/drops.
         var creates_to_apply: std.ArrayListUnmanaged(u64) = .empty;
@@ -538,6 +652,7 @@ pub const Manifest = struct {
                 _ = self.pending_creates.remove(n.id);
             }
         }
+        _ = self.metrics.durabilize_total.fetchAdd(1, .acq_rel);
     }
 
     /// Convenience: durabilize without disturbing the raft watermark.
@@ -633,6 +748,8 @@ pub const Manifest = struct {
                 @panic("OOM storing overlay slice in openSnapshot");
         }
 
+        _ = self.metrics.snapshot_open_total.fetchAdd(1, .acq_rel);
+        _ = self.metrics.active_snapshots.fetchAdd(1, .acq_rel);
         return .{
             .manifest = self,
             .read_txn = read_txn,
@@ -703,6 +820,8 @@ pub const Txn = struct {
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
         self.overlay.putLocked(key, value);
+        _ = self.manifest.metrics.put_total.fetchAdd(1, .acq_rel);
+        _ = self.manifest.metrics.bytes_put_total.fetchAdd(key.len + value.len, .acq_rel);
     }
 
     pub fn delete(self: *Txn, key: []const u8) !bool {
@@ -712,6 +831,7 @@ pub const Txn = struct {
         if (self.open_child != null) return error.SavepointStillOpen;
         const existed = try self.keyExistsLocked(key);
         self.overlay.tombstoneLocked(key);
+        _ = self.manifest.metrics.delete_total.fetchAdd(1, .acq_rel);
         return existed;
     }
 
@@ -720,6 +840,7 @@ pub const Txn = struct {
     pub fn get(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
+        _ = self.manifest.metrics.get_total.fetchAdd(1, .acq_rel);
         return self.getLocked(allocator, key);
     }
 
@@ -895,9 +1016,11 @@ pub const Txn = struct {
         // multi-threaded contention the allocator can reuse that slot
         // before the defer runs.
         const ts = self.tenant_state;
+        const manifest = self.manifest;
         ts.lock.lock();
         defer ts.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        const is_savepoint = self.parent != null;
         if (self.parent) |parent| {
             // Savepoint commit.
             Overlay.moveInto(&self.overlay, &parent.overlay);
@@ -915,14 +1038,21 @@ pub const Txn = struct {
             }
         }
         self.overlay.deinit();
-        self.manifest.allocator.destroy(self);
+        manifest.allocator.destroy(self);
+        if (is_savepoint) {
+            _ = manifest.metrics.savepoint_commit_total.fetchAdd(1, .acq_rel);
+        } else {
+            _ = manifest.metrics.txn_commit_total.fetchAdd(1, .acq_rel);
+        }
     }
 
     pub fn rollback(self: *Txn) void {
         // Same hazard as commit: capture tenant_state before freeing self.
         const ts = self.tenant_state;
+        const manifest = self.manifest;
         ts.lock.lock();
         defer ts.lock.unlock();
+        const is_savepoint = self.parent != null;
         if (self.parent == null) {
             // Top-level: detach the tail of the chain at self, then
             // free self + all successors.
@@ -943,6 +1073,11 @@ pub const Txn = struct {
             // Savepoint: detach from parent + free subtree.
             self.parent.?.open_child = null;
             self.freeSubtreeLocked();
+        }
+        if (is_savepoint) {
+            _ = manifest.metrics.savepoint_rollback_total.fetchAdd(1, .acq_rel);
+        } else {
+            _ = manifest.metrics.txn_rollback_total.fetchAdd(1, .acq_rel);
         }
     }
 
@@ -1185,6 +1320,7 @@ pub const StoreLease = struct {
         const ts = self.tenant_state;
         ts.lock.lock();
         defer ts.lock.unlock();
+        _ = self.manifest.metrics.get_total.fetchAdd(1, .acq_rel);
         if (ts.main_overlay.entries.get(key)) |entry| {
             switch (entry) {
                 .value => |v| return try allocator.dupe(u8, v),
@@ -1275,13 +1411,14 @@ pub const StoreLease = struct {
     /// remain in the chain until their own commit / rollback.
     pub fn release(self: *StoreLease) void {
         const ts = self.tenant_state;
-        const allocator = self.manifest.allocator;
+        const manifest = self.manifest;
         ts.dispatch_lock.unlock();
+        _ = manifest.metrics.active_leases.fetchSub(1, .acq_rel);
         // Drop the reference we took in acquire / tryAcquire. If this
         // tenant was dropped (so the tenants map no longer holds a
         // reference) and we were the last lease holder, this frees
         // the TenantState.
-        ts.releaseRef(allocator);
+        ts.releaseRef(manifest.allocator);
         self.* = undefined;
     }
 };
@@ -1317,6 +1454,7 @@ pub const Snapshot = struct {
     overlays: std.AutoHashMapUnmanaged(u64, []SnapshotEntry),
 
     pub fn close(self: *Snapshot) void {
+        _ = self.manifest.metrics.active_snapshots.fetchSub(1, .acq_rel);
         freeSnapshotOverlay(self.manifest.allocator, &self.overlays);
         self.read_txn.abort();
         self.* = undefined;
@@ -1328,6 +1466,7 @@ pub const Snapshot = struct {
         store_id: u64,
         key: []const u8,
     ) !?[]u8 {
+        _ = self.manifest.metrics.get_total.fetchAdd(1, .acq_rel);
         if (self.overlays.get(store_id)) |entries| {
             if (binarySearchEntry(entries, key)) |idx| {
                 const e = entries[idx];
@@ -2478,6 +2617,90 @@ test "Recovery: snapshot install becomes durable through durabilize + reopen" {
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("v", got);
 }
+
+test "Metrics: counters and gauges reflect hot-path activity" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Baseline: nothing happened yet.
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 0), m.create_store_total);
+        try testing.expectEqual(@as(u64, 0), m.acquire_total);
+        try testing.expectEqual(@as(u64, 0), m.put_total);
+        try testing.expectEqual(@as(u64, 0), m.txn_commit_total);
+        try testing.expectEqual(@as(u64, 0), m.durabilize_total);
+        try testing.expectEqual(@as(i64, 0), m.active_leases);
+        try testing.expectEqual(@as(i64, 0), m.active_snapshots);
+    }
+
+    try h.manifest.createStore(1);
+    try h.manifest.createStore(2);
+    try h.manifest.flush(); // counts as one durabilize
+
+    // Two stores created, one durabilize, no leases yet.
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 2), m.create_store_total);
+        try testing.expectEqual(@as(u64, 1), m.durabilize_total);
+        try testing.expectEqual(@as(u64, 0), m.durabilize_failed_total);
+    }
+
+    {
+        var lease = try h.manifest.acquire(1);
+        defer lease.release();
+
+        // active_leases gauge tracks the held lease.
+        try testing.expectEqual(@as(i64, 1), h.manifest.metricsSnapshot().active_leases);
+
+        var t = try lease.beginTxn();
+        try t.put("k", "abc");
+        _ = try t.delete("nonexistent");
+        try t.commit();
+    }
+
+    // After release: active_leases back to 0; counters reflect ops.
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 1), m.acquire_total);
+        try testing.expectEqual(@as(u64, 1), m.put_total);
+        try testing.expectEqual(@as(u64, 1), m.delete_total);
+        try testing.expectEqual(@as(u64, 1), m.txn_commit_total);
+        // "k"=1 byte + "abc"=3 bytes = 4 bytes counted
+        try testing.expectEqual(@as(u64, 4), m.bytes_put_total);
+        try testing.expectEqual(@as(i64, 0), m.active_leases);
+    }
+
+    // Rollback path + savepoint counters.
+    {
+        var lease = try h.manifest.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        var sp = try t.savepoint();
+        try sp.put("x", "y");
+        sp.rollback();
+        t.rollback();
+    }
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 1), m.txn_rollback_total);
+        try testing.expectEqual(@as(u64, 1), m.savepoint_rollback_total);
+    }
+
+    // Snapshot open + close updates gauge.
+    {
+        var snap = try h.manifest.openSnapshot();
+        try testing.expectEqual(@as(i64, 1), h.manifest.metricsSnapshot().active_snapshots);
+        snap.close();
+        try testing.expectEqual(@as(i64, 0), h.manifest.metricsSnapshot().active_snapshots);
+    }
+    try testing.expectEqual(@as(u64, 1), h.manifest.metricsSnapshot().snapshot_open_total);
+
+    // Poison increments its counter.
+    h.manifest._testPoison();
+    try testing.expectEqual(@as(u64, 1), h.manifest.metricsSnapshot().poison_total);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Multi-threaded property test: N workers race on M pre-created tenants
 // while a checkpointer thread periodically durabilizes. Each commit (and
