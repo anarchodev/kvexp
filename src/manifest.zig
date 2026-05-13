@@ -1512,7 +1512,8 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     const KMAX = 256;
     const VMAX = 1 << 20;
     var key_buf: [KMAX]u8 = undefined;
-    var val_buf: [VMAX]u8 = undefined;
+    const val_buf = try manifest.allocator.alloc(u8, VMAX);
+    defer manifest.allocator.free(val_buf);
 
     // One lease + one Txn per tenant. Leases are released at the end;
     // Txns commit at the end. Both maps share the same key set.
@@ -2124,4 +2125,272 @@ fn propRunOne(seed: u64) !void {
             durable_model = model;
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Recovery contract: what survives a crash is exactly what the last
+// successful durabilize wrote. h.cycle() simulates a crash by tearing down
+// the in-memory manifest and reopening the same LMDB file.
+// ───────────────────────────────────────────────────────────────────────────
+
+test "Recovery: committed-but-not-flushed write is lost on crash" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush(); // store is durable; no keys yet
+
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v"); // committed → main_overlay; NOT yet durable
+        try t.commit();
+    }
+
+    try h.cycle();
+
+    try testing.expect(try h.manifest.hasStore(1));
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    try testing.expect((try s.get(testing.allocator, "k")) == null);
+}
+
+test "Recovery: in-flight Txn writes are lost on crash; earlier durable writes survive" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("durable", "yes");
+        try t.commit();
+    }
+    try h.manifest.flush(); // "durable" is now in LMDB
+
+    // Open a Txn that never commits or rolls back before the crash.
+    var inflight = try h.quickTxn(1);
+    try inflight.put("inflight", "no");
+
+    try h.cycle(); // deinit tears down the open Txn; nothing reached LMDB
+
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    const a = (try s.get(testing.allocator, "durable")).?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("yes", a);
+    try testing.expect((try s.get(testing.allocator, "inflight")) == null);
+}
+
+test "Recovery: createStore without flush does not survive crash" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(42);
+    try testing.expect(try h.manifest.hasStore(42)); // pending; visible in-memory
+
+    try h.cycle();
+
+    try testing.expect(!try h.manifest.hasStore(42));
+}
+
+test "Recovery: dropStore without flush does not survive crash; store comes back with data" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit();
+    }
+    try h.manifest.flush(); // store + key durable
+
+    _ = try h.manifest.dropStore(1); // pending drop, not flushed
+    try testing.expect(!try h.manifest.hasStore(1));
+
+    try h.cycle();
+
+    try testing.expect(try h.manifest.hasStore(1));
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
+}
+
+test "Recovery: flushed dropStore removes the tenant on reopen" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(7);
+    {
+        var t = try h.quickTxn(7);
+        try t.put("k", "v");
+        try t.commit();
+    }
+    try h.manifest.flush();
+    _ = try h.manifest.dropStore(7);
+    try h.manifest.flush(); // drop is now durable
+
+    try h.cycle();
+
+    try testing.expect(!try h.manifest.hasStore(7));
+}
+
+test "Recovery: flushed delete tombstone survives crash" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit();
+    }
+    try h.manifest.flush(); // k=v durable
+
+    {
+        var t = try h.quickTxn(1);
+        try testing.expect(try t.delete("k"));
+        try t.commit();
+    }
+    try h.manifest.flush(); // tombstone durable
+
+    try h.cycle();
+
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    try testing.expect((try s.get(testing.allocator, "k")) == null);
+}
+
+test "Recovery: durabilize across multiple tenants is atomic on reopen" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.createStore(2);
+    try h.manifest.createStore(3);
+    inline for (.{ .{ 1, "1-a" }, .{ 2, "2-a" }, .{ 3, "3-a" } }) |c| {
+        var t = try h.quickTxn(c[0]);
+        try t.put("a", c[1]);
+        try t.commit();
+    }
+    try h.manifest.durabilize(100); // one atomic LMDB commit
+
+    try h.cycle();
+
+    try testing.expectEqual(@as(u64, 100), try h.manifest.durableRaftIdx());
+    inline for (.{ .{ 1, "1-a" }, .{ 2, "2-a" }, .{ 3, "3-a" } }) |c| {
+        try testing.expect(try h.manifest.hasStore(c[0]));
+        var s = try h.manifest.acquire(c[0]);
+        defer s.release();
+        const got = (try s.get(testing.allocator, "a")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "Recovery: successive durabilizes — last state wins after reopen" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v1");
+        try t.commit();
+    }
+    try h.manifest.durabilize(10);
+
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v2");
+        try t.commit();
+    }
+    try h.manifest.durabilize(20);
+
+    try h.cycle();
+
+    try testing.expectEqual(@as(u64, 20), try h.manifest.durableRaftIdx());
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v2", got);
+}
+
+test "Recovery: flush() persists data without touching the watermark" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.durabilize(50); // watermark=50
+
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit();
+    }
+    try h.manifest.flush(); // data durable; watermark unchanged
+
+    try h.cycle();
+
+    try testing.expectEqual(@as(u64, 50), try h.manifest.durableRaftIdx());
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
+}
+
+test "Recovery: only committed Txns durabilize; rolled-back siblings don't" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    try t2.put("b", "2");
+    t2.rollback(); // drops t2
+    try t1.commit(); // t1 → main_overlay
+    try h.manifest.flush();
+
+    try h.cycle();
+
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    const ga = (try s.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualStrings("1", ga);
+    try testing.expect((try s.get(testing.allocator, "b")) == null);
+}
+
+test "Recovery: snapshot install becomes durable through durabilize + reopen" {
+    // Build the source state and serialize a snapshot, then tear src down
+    // entirely so dst doesn't share an open LMDB env with anything else.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    {
+        var src = try Harness.init();
+        defer src.deinit();
+        try src.manifest.createStore(5);
+        {
+            var t = try src.quickTxn(5);
+            try t.put("k", "v");
+            try t.commit();
+        }
+        try src.manifest.durabilize(77);
+
+        var snap = try src.manifest.openSnapshot();
+        defer snap.close();
+        var w = buf.writer(testing.allocator);
+        try dumpSnapshot(&snap, &w);
+    }
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var stream = std.io.fixedBufferStream(buf.items);
+    const last = try loadSnapshot(dst.manifest, stream.reader());
+    try dst.manifest.durabilize(last);
+
+    try dst.cycle();
+
+    try testing.expectEqual(@as(u64, 77), try dst.manifest.durableRaftIdx());
+    try testing.expect(try dst.manifest.hasStore(5));
+    var s = try dst.manifest.acquire(5);
+    defer s.release();
+    const got = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
 }
