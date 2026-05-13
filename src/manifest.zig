@@ -2761,3 +2761,168 @@ test "Spec property: lease-released-before-commit + committer + recovery" {
         };
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Concurrent-snapshot property test: workers do random puts/deletes, a
+// snapper thread continuously opens snapshots and reads every (tenant, key)
+// without taking the worker-side rwlock — verifying the README claim that
+// openSnapshot does not contend with lease holders. Each returned value
+// must be a valid 1-byte payload; nulls are allowed (the key may legitimately
+// have been deleted or never written). Final state verified after cycle.
+// ───────────────────────────────────────────────────────────────────────────
+
+const SNAP_NUM_WORKERS: usize = 4;
+const SNAP_OPS_PER_WORKER: u32 = 150;
+
+const SnapCtx = struct {
+    manifest: *Manifest,
+    model_lock: *std.Thread.Mutex,
+    model: *PropModel,
+    seed: u64,
+    err: *std.atomic.Value(usize),
+};
+
+const SnapperCtx = struct {
+    manifest: *Manifest,
+    stop: *std.atomic.Value(bool),
+    err: *std.atomic.Value(usize),
+    snapshot_count: *std.atomic.Value(u32),
+};
+
+fn snapWorker(ctx: *SnapCtx) void {
+    snapWorkerInner(ctx) catch |err| {
+        _ = ctx.err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+    };
+}
+
+fn snapWorkerInner(ctx: *SnapCtx) !void {
+    var rng_state = std.Random.DefaultPrng.init(ctx.seed);
+    const rng = rng_state.random();
+    var i: u32 = 0;
+    while (i < SNAP_OPS_PER_WORKER) : (i += 1) {
+        const tenant_usize = rng.intRangeLessThan(usize, 0, MT_NUM_TENANTS);
+        const tenant: u64 = @intCast(tenant_usize);
+        const key_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+        const choice = rng.intRangeLessThan(u32, 0, 100);
+
+        var lease = try ctx.manifest.acquire(tenant);
+        defer lease.release();
+        var t = try lease.beginTxn();
+
+        var kb: [3]u8 = undefined;
+        const key = keyBuf(&kb, key_usize);
+
+        if (choice < 70) {
+            const v: u8 = rng.int(u8);
+            const vb = [_]u8{v};
+            t.put(key, vb[0..1]) catch |e| {
+                t.rollback();
+                return e;
+            };
+            try t.commit();
+            ctx.model_lock.lock();
+            defer ctx.model_lock.unlock();
+            ctx.model.key_present[tenant_usize][key_usize] = true;
+            ctx.model.values[tenant_usize][key_usize] = v;
+        } else {
+            _ = t.delete(key) catch |e| {
+                t.rollback();
+                return e;
+            };
+            try t.commit();
+            ctx.model_lock.lock();
+            defer ctx.model_lock.unlock();
+            ctx.model.key_present[tenant_usize][key_usize] = false;
+        }
+    }
+}
+
+fn snapper(ctx: *SnapperCtx) void {
+    snapperInner(ctx) catch |err| {
+        _ = ctx.err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+    };
+}
+
+fn snapperInner(ctx: *SnapperCtx) !void {
+    while (!ctx.stop.load(.acquire)) {
+        var snap = try ctx.manifest.openSnapshot();
+        defer snap.close();
+        var tid: usize = 0;
+        while (tid < MT_NUM_TENANTS) : (tid += 1) {
+            var kid: usize = 0;
+            while (kid < PROP_NUM_KEYS) : (kid += 1) {
+                var kb: [3]u8 = undefined;
+                const got_opt = try snap.get(testing.allocator, @intCast(tid), keyBuf(&kb, kid));
+                defer if (got_opt) |g| testing.allocator.free(g);
+                if (got_opt) |g| {
+                    if (g.len != 1) return error.InvalidValueLen;
+                }
+            }
+        }
+        _ = ctx.snapshot_count.fetchAdd(1, .acq_rel);
+    }
+}
+
+fn snapRunOne(seed: u64) !void {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    for (0..MT_NUM_TENANTS) |i| try h.manifest.createStore(@intCast(i));
+    try h.manifest.flush();
+
+    var model: PropModel = .{};
+    for (0..MT_NUM_TENANTS) |i| model.store_exists[i] = true;
+
+    var model_lock: std.Thread.Mutex = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    var err = std.atomic.Value(usize).init(0);
+    var snapshot_count = std.atomic.Value(u32).init(0);
+
+    var ctxs: [SNAP_NUM_WORKERS]SnapCtx = undefined;
+    var threads: [SNAP_NUM_WORKERS]std.Thread = undefined;
+    for (0..SNAP_NUM_WORKERS) |i| {
+        ctxs[i] = .{
+            .manifest = h.manifest,
+            .model_lock = &model_lock,
+            .model = &model,
+            .seed = seed *% 41 +% @as(u64, i),
+            .err = &err,
+        };
+        threads[i] = try std.Thread.spawn(.{}, snapWorker, .{&ctxs[i]});
+    }
+
+    var snapper_ctx: SnapperCtx = .{
+        .manifest = h.manifest,
+        .stop = &stop,
+        .err = &err,
+        .snapshot_count = &snapshot_count,
+    };
+    const snapper_thread = try std.Thread.spawn(.{}, snapper, .{&snapper_ctx});
+
+    for (threads) |th| th.join();
+    stop.store(true, .release);
+    snapper_thread.join();
+
+    const code = err.load(.acquire);
+    if (code != 0) {
+        std.debug.print("Snap worker/snapper errored: code {}\n", .{code});
+        return error.SnapErrored;
+    }
+
+    if (snapshot_count.load(.acquire) == 0) return error.SnapperStarved;
+
+    try h.manifest.flush();
+    try h.cycle();
+    try verifyAgainstModel(h.manifest, &model);
+}
+
+test "Snap property: workers + concurrent snapper + crash recovers state" {
+    const seeds: u64 = 3;
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        snapRunOne(seed) catch |e| {
+            std.debug.print("\n*** Snap property failed at seed {}: {}\n", .{ seed, e });
+            return e;
+        };
+    }
+}
