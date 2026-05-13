@@ -200,17 +200,38 @@ pub const HistogramSnapshot = struct {
 /// (put / delete / get / bytes_put). Less-frequent counters (txn
 /// commit/rollback, lifecycle, durabilize, gauges) live unsharded on
 /// `Metrics` directly — sharding them would just waste memory.
+///
+/// Note: `active_leases` and `active_snapshots` aren't stored as
+/// gauges; they're derived from `leases_acquired - leases_released`
+/// (and similarly for snapshots) at snapshot time. Two monotonic
+/// counters shard cleanly; a fetchSub-style gauge does not.
 pub const HotShard = extern struct {
     put: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
     bytes_put: std.atomic.Value(u64) = .init(0),
     get: std.atomic.Value(u64) = .init(0),
     delete: std.atomic.Value(u64) = .init(0),
-    _pad: [std.atomic.cache_line - 4 * @sizeOf(u64)]u8 = @splat(0),
+    acquire: std.atomic.Value(u64) = .init(0),
+    try_acquire: std.atomic.Value(u64) = .init(0),
+    try_acquire_contended: std.atomic.Value(u64) = .init(0),
+    leases_acquired: std.atomic.Value(u64) = .init(0),
+    leases_released: std.atomic.Value(u64) = .init(0),
+    txn_commit: std.atomic.Value(u64) = .init(0),
+    txn_rollback: std.atomic.Value(u64) = .init(0),
+    savepoint_commit: std.atomic.Value(u64) = .init(0),
+    savepoint_rollback: std.atomic.Value(u64) = .init(0),
+    _pad: [hot_shard_padding]u8 = @splat(0),
+
+    const counter_bytes = 13 * @sizeOf(u64);
+    const total_size = std.mem.alignForward(usize, counter_bytes, std.atomic.cache_line);
+    const hot_shard_padding = total_size - counter_bytes;
 };
 
 comptime {
-    if (@sizeOf(HotShard) != std.atomic.cache_line) {
-        @compileError("HotShard must occupy exactly one cache line");
+    if (@sizeOf(HotShard) != HotShard.total_size) {
+        @compileError("HotShard size mismatch");
+    }
+    if (@sizeOf(HotShard) % std.atomic.cache_line != 0) {
+        @compileError("HotShard must be a multiple of cache_line");
     }
 }
 
@@ -245,37 +266,19 @@ inline fn currentHotShardIdx() usize {
 /// Counter naming follows Prometheus convention: `*_total` for monotonic
 /// counters, no suffix for gauges.
 pub const Metrics = struct {
-    // Hot (sharded across cache lines): per-API-op counters.
+    // Hot (sharded across cache lines): per-API-op and per-lease-cycle
+    // counters. See HotShard for the full set.
     hot_shards: [HOT_SHARDS]HotShard align(std.atomic.cache_line) = @splat(.{}),
 
-    // Lifecycle counters
+    // Cold (single atomic): lifecycle, durability, snapshot opens,
+    // poison. These fire at "every checkpoint" frequency or rarer.
     create_store_total: std.atomic.Value(u64) = .init(0),
     drop_store_total: std.atomic.Value(u64) = .init(0),
-
-    // Dispatch counters
-    acquire_total: std.atomic.Value(u64) = .init(0),
-    try_acquire_total: std.atomic.Value(u64) = .init(0),
-    try_acquire_contended_total: std.atomic.Value(u64) = .init(0),
-
-    // Txn-level counters (one increment per Txn commit/rollback, much
-    // less frequent than per-op counters above — not worth sharding).
-    txn_commit_total: std.atomic.Value(u64) = .init(0),
-    txn_rollback_total: std.atomic.Value(u64) = .init(0),
-    savepoint_commit_total: std.atomic.Value(u64) = .init(0),
-    savepoint_rollback_total: std.atomic.Value(u64) = .init(0),
-
-    // Durability + snapshot counters
     durabilize_total: std.atomic.Value(u64) = .init(0),
     durabilize_failed_total: std.atomic.Value(u64) = .init(0),
     snapshot_open_total: std.atomic.Value(u64) = .init(0),
-
-    // Health
+    snapshot_close_total: std.atomic.Value(u64) = .init(0),
     poison_total: std.atomic.Value(u64) = .init(0),
-
-    // Gauges (signed so a counting bug shows up as negative rather
-    // than wrapping into an astronomically large number).
-    active_leases: std.atomic.Value(i64) = .init(0),
-    active_snapshots: std.atomic.Value(i64) = .init(0),
 
     // Duration distributions. durabilize is the main one (one fsync
     // boundary per checkpoint); snapshot_open captures every
@@ -303,37 +306,99 @@ pub const Metrics = struct {
         _ = self.currentShard().get.fetchAdd(1, .monotonic);
     }
 
+    pub inline fn recordAcquire(self: *Metrics) void {
+        const s = self.currentShard();
+        _ = s.acquire.fetchAdd(1, .monotonic);
+        _ = s.leases_acquired.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordTryAcquire(self: *Metrics) void {
+        const s = self.currentShard();
+        _ = s.try_acquire.fetchAdd(1, .monotonic);
+        _ = s.leases_acquired.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordTryAcquireContended(self: *Metrics) void {
+        _ = self.currentShard().try_acquire_contended.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordRelease(self: *Metrics) void {
+        _ = self.currentShard().leases_released.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordTxnCommit(self: *Metrics) void {
+        _ = self.currentShard().txn_commit.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordTxnRollback(self: *Metrics) void {
+        _ = self.currentShard().txn_rollback.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordSavepointCommit(self: *Metrics) void {
+        _ = self.currentShard().savepoint_commit.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn recordSavepointRollback(self: *Metrics) void {
+        _ = self.currentShard().savepoint_rollback.fetchAdd(1, .monotonic);
+    }
+
     fn snapshot(self: *const Metrics) MetricsSnapshot {
         var put_total: u64 = 0;
         var bytes_put_total: u64 = 0;
         var get_total: u64 = 0;
         var delete_total: u64 = 0;
+        var acquire_total: u64 = 0;
+        var try_acquire_total: u64 = 0;
+        var try_acquire_contended_total: u64 = 0;
+        var leases_acquired: u64 = 0;
+        var leases_released: u64 = 0;
+        var txn_commit_total: u64 = 0;
+        var txn_rollback_total: u64 = 0;
+        var savepoint_commit_total: u64 = 0;
+        var savepoint_rollback_total: u64 = 0;
         for (&self.hot_shards) |*s| {
             put_total += s.put.load(.monotonic);
             bytes_put_total += s.bytes_put.load(.monotonic);
             get_total += s.get.load(.monotonic);
             delete_total += s.delete.load(.monotonic);
+            acquire_total += s.acquire.load(.monotonic);
+            try_acquire_total += s.try_acquire.load(.monotonic);
+            try_acquire_contended_total += s.try_acquire_contended.load(.monotonic);
+            leases_acquired += s.leases_acquired.load(.monotonic);
+            leases_released += s.leases_released.load(.monotonic);
+            txn_commit_total += s.txn_commit.load(.monotonic);
+            txn_rollback_total += s.txn_rollback.load(.monotonic);
+            savepoint_commit_total += s.savepoint_commit.load(.monotonic);
+            savepoint_rollback_total += s.savepoint_rollback.load(.monotonic);
         }
+        const open = self.snapshot_open_total.load(.monotonic);
+        const closed = self.snapshot_close_total.load(.monotonic);
         return .{
             .create_store_total = self.create_store_total.load(.monotonic),
             .drop_store_total = self.drop_store_total.load(.monotonic),
-            .acquire_total = self.acquire_total.load(.monotonic),
-            .try_acquire_total = self.try_acquire_total.load(.monotonic),
-            .try_acquire_contended_total = self.try_acquire_contended_total.load(.monotonic),
-            .txn_commit_total = self.txn_commit_total.load(.monotonic),
-            .txn_rollback_total = self.txn_rollback_total.load(.monotonic),
-            .savepoint_commit_total = self.savepoint_commit_total.load(.monotonic),
-            .savepoint_rollback_total = self.savepoint_rollback_total.load(.monotonic),
+            .acquire_total = acquire_total,
+            .try_acquire_total = try_acquire_total,
+            .try_acquire_contended_total = try_acquire_contended_total,
+            .txn_commit_total = txn_commit_total,
+            .txn_rollback_total = txn_rollback_total,
+            .savepoint_commit_total = savepoint_commit_total,
+            .savepoint_rollback_total = savepoint_rollback_total,
             .put_total = put_total,
             .delete_total = delete_total,
             .get_total = get_total,
             .bytes_put_total = bytes_put_total,
             .durabilize_total = self.durabilize_total.load(.monotonic),
             .durabilize_failed_total = self.durabilize_failed_total.load(.monotonic),
-            .snapshot_open_total = self.snapshot_open_total.load(.monotonic),
+            .snapshot_open_total = open,
             .poison_total = self.poison_total.load(.monotonic),
-            .active_leases = self.active_leases.load(.monotonic),
-            .active_snapshots = self.active_snapshots.load(.monotonic),
+            // Gauges derived from monotonic counters: subtract released
+            // from acquired. Atomic per-shard reads aren't linearized,
+            // so under heavy contention this can momentarily go
+            // negative for a few ns. Acceptable for monitoring.
+            .active_leases = @as(i64, @intCast(leases_acquired)) -
+                @as(i64, @intCast(leases_released)),
+            .active_snapshots = @as(i64, @intCast(open)) -
+                @as(i64, @intCast(closed)),
             .durabilize_duration = self.durabilize_duration.snapshot(),
             .snapshot_open_duration = self.snapshot_open_duration.snapshot(),
         };
@@ -663,8 +728,7 @@ pub const Manifest = struct {
         // we must drop that reference.
         errdefer ts.releaseRef(self.allocator);
         ts.dispatch_lock.lock();
-        _ = self.metrics.acquire_total.fetchAdd(1, .monotonic);
-        _ = self.metrics.active_leases.fetchAdd(1, .monotonic);
+        self.metrics.recordAcquire();
         return .{
             .manifest = self,
             .tenant_id = tenant_id,
@@ -681,11 +745,10 @@ pub const Manifest = struct {
         errdefer ts.releaseRef(self.allocator);
         if (!ts.dispatch_lock.tryLock()) {
             ts.releaseRef(self.allocator);
-            _ = self.metrics.try_acquire_contended_total.fetchAdd(1, .monotonic);
+            self.metrics.recordTryAcquireContended();
             return null;
         }
-        _ = self.metrics.try_acquire_total.fetchAdd(1, .monotonic);
-        _ = self.metrics.active_leases.fetchAdd(1, .monotonic);
+        self.metrics.recordTryAcquire();
         return StoreLease{
             .manifest = self,
             .tenant_id = tenant_id,
@@ -939,7 +1002,6 @@ pub const Manifest = struct {
             } else |_| {}
         }
         _ = self.metrics.snapshot_open_total.fetchAdd(1, .monotonic);
-        _ = self.metrics.active_snapshots.fetchAdd(1, .monotonic);
         return .{
             .manifest = self,
             .read_txn = read_txn,
@@ -1246,9 +1308,9 @@ pub const Txn = struct {
         self.overlay.deinit();
         manifest.allocator.destroy(self);
         if (is_savepoint) {
-            _ = manifest.metrics.savepoint_commit_total.fetchAdd(1, .monotonic);
+            manifest.metrics.recordSavepointCommit();
         } else {
-            _ = manifest.metrics.txn_commit_total.fetchAdd(1, .monotonic);
+            manifest.metrics.recordTxnCommit();
         }
     }
 
@@ -1281,9 +1343,9 @@ pub const Txn = struct {
             self.freeSubtreeLocked();
         }
         if (is_savepoint) {
-            _ = manifest.metrics.savepoint_rollback_total.fetchAdd(1, .monotonic);
+            manifest.metrics.recordSavepointRollback();
         } else {
-            _ = manifest.metrics.txn_rollback_total.fetchAdd(1, .monotonic);
+            manifest.metrics.recordTxnRollback();
         }
     }
 
@@ -1619,7 +1681,7 @@ pub const StoreLease = struct {
         const ts = self.tenant_state;
         const manifest = self.manifest;
         ts.dispatch_lock.unlock();
-        _ = manifest.metrics.active_leases.fetchSub(1, .monotonic);
+        manifest.metrics.recordRelease();
         // Drop the reference we took in acquire / tryAcquire. If this
         // tenant was dropped (so the tenants map no longer holds a
         // reference) and we were the last lease holder, this frees
@@ -1660,7 +1722,7 @@ pub const Snapshot = struct {
     overlays: std.AutoHashMapUnmanaged(u64, []SnapshotEntry),
 
     pub fn close(self: *Snapshot) void {
-        _ = self.manifest.metrics.active_snapshots.fetchSub(1, .monotonic);
+        _ = self.manifest.metrics.snapshot_close_total.fetchAdd(1, .monotonic);
         freeSnapshotOverlay(self.manifest.allocator, &self.overlays);
         self.read_txn.abort();
         self.* = undefined;
