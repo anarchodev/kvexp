@@ -25,4 +25,30 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = kvexp_mod });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+
+    // Benchmark executable. Always built with ReleaseFast so unrelated
+    // debug-mode safety checks don't distort the numbers — we want to
+    // know how kvexp performs in production, not in safe mode.
+    const bench_kvexp = b.addModule("kvexp_bench", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_kvexp.linkSystemLibrary("lmdb", .{});
+    bench_kvexp.link_libc = true;
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("kvexp", bench_kvexp);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run kvexp benchmarks (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
