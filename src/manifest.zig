@@ -103,6 +103,73 @@ fn decodeStoreIdKey(bytes: []const u8) u64 {
 
 // ─── Metrics ────────────────────────────────────────────────────────
 
+/// Lock-free duration histogram. Bucket boundaries match Prometheus's
+/// default `prometheus.DefBuckets` (5 ms .. 10 s, in seconds) translated
+/// to nanoseconds. Counts are stored non-cumulatively for cheap
+/// observation; `snapshot()` returns cumulative counts so the result
+/// drops directly into Prometheus's `_bucket{le="..."}` lines.
+pub const Histogram = struct {
+    /// Upper bounds of each non-+Inf bucket, in nanoseconds. The
+    /// implicit +Inf bucket at index `bucket_bounds_nanos.len` catches
+    /// every observation that exceeds the largest bound.
+    pub const bucket_bounds_nanos = [_]u64{
+        5_000_000, //    5 ms
+        10_000_000, //   10 ms
+        25_000_000, //   25 ms
+        50_000_000, //   50 ms
+        100_000_000, //  100 ms
+        250_000_000, //  250 ms
+        500_000_000, //  500 ms
+        1_000_000_000, //  1 s
+        2_500_000_000, //  2.5 s
+        5_000_000_000, //  5 s
+        10_000_000_000, // 10 s
+    };
+    pub const bucket_count = bucket_bounds_nanos.len + 1; // includes +Inf
+
+    buckets: [bucket_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    sum_nanos: std.atomic.Value(u64) = .init(0),
+
+    pub fn observe(self: *Histogram, nanos: u64) void {
+        var bucket_idx: usize = bucket_bounds_nanos.len; // +Inf default
+        var i: usize = 0;
+        while (i < bucket_bounds_nanos.len) : (i += 1) {
+            if (nanos <= bucket_bounds_nanos[i]) {
+                bucket_idx = i;
+                break;
+            }
+        }
+        _ = self.buckets[bucket_idx].fetchAdd(1, .acq_rel);
+        _ = self.sum_nanos.fetchAdd(nanos, .acq_rel);
+    }
+
+    fn snapshot(self: *const Histogram) HistogramSnapshot {
+        var snap: HistogramSnapshot = .{
+            .buckets = undefined,
+            .sum_nanos = self.sum_nanos.load(.acquire),
+            .count = 0,
+        };
+        var cum: u64 = 0;
+        var i: usize = 0;
+        while (i < bucket_count) : (i += 1) {
+            cum += self.buckets[i].load(.acquire);
+            snap.buckets[i] = cum;
+        }
+        snap.count = cum;
+        return snap;
+    }
+};
+
+/// Point-in-time copy of a Histogram. `buckets` is cumulative (matches
+/// Prometheus's bucket convention): `buckets[i]` is the number of
+/// observations whose value was ≤ `Histogram.bucket_bounds_nanos[i]`,
+/// and `buckets[bucket_count - 1]` is the +Inf bucket = total count.
+pub const HistogramSnapshot = struct {
+    buckets: [Histogram.bucket_count]u64,
+    sum_nanos: u64,
+    count: u64,
+};
+
 /// Atomic counters and gauges for production observability. Each
 /// counter is monotonically increasing; gauges go up and down. Reading
 /// individual fields is lock-free; reading the full snapshot via
@@ -144,6 +211,12 @@ pub const Metrics = struct {
     active_leases: std.atomic.Value(i64) = .init(0),
     active_snapshots: std.atomic.Value(i64) = .init(0),
 
+    // Duration distributions. durabilize is the main one (one fsync
+    // boundary per checkpoint); snapshot_open captures every
+    // openSnapshot, useful for tracking state-transfer overhead.
+    durabilize_duration: Histogram = .{},
+    snapshot_open_duration: Histogram = .{},
+
     fn snapshot(self: *const Metrics) MetricsSnapshot {
         return .{
             .create_store_total = self.create_store_total.load(.acquire),
@@ -165,6 +238,8 @@ pub const Metrics = struct {
             .poison_total = self.poison_total.load(.acquire),
             .active_leases = self.active_leases.load(.acquire),
             .active_snapshots = self.active_snapshots.load(.acquire),
+            .durabilize_duration = self.durabilize_duration.snapshot(),
+            .snapshot_open_duration = self.snapshot_open_duration.snapshot(),
         };
     }
 };
@@ -191,6 +266,8 @@ pub const MetricsSnapshot = struct {
     poison_total: u64,
     active_leases: i64,
     active_snapshots: i64,
+    durabilize_duration: HistogramSnapshot,
+    snapshot_open_duration: HistogramSnapshot,
 };
 
 // ─── Manifest ───────────────────────────────────────────────────────
@@ -526,6 +603,7 @@ pub const Manifest = struct {
             _ = self.metrics.durabilize_failed_total.fetchAdd(1, .acq_rel);
             self.poison();
         }
+        const start = std.time.Instant.now() catch null;
 
         // 1. Snapshot pending creates/drops.
         var creates_to_apply: std.ArrayListUnmanaged(u64) = .empty;
@@ -652,6 +730,11 @@ pub const Manifest = struct {
                 _ = self.pending_creates.remove(n.id);
             }
         }
+        if (start) |s| {
+            if (std.time.Instant.now()) |now| {
+                self.metrics.durabilize_duration.observe(now.since(s));
+            } else |_| {}
+        }
         _ = self.metrics.durabilize_total.fetchAdd(1, .acq_rel);
     }
 
@@ -691,6 +774,7 @@ pub const Manifest = struct {
         // Serialize against durabilize so we get a coherent moment.
         self.durabilize_lock.lock();
         defer self.durabilize_lock.unlock();
+        const start = std.time.Instant.now() catch null;
 
         var read_txn = try lmdb.Txn.beginRead(&self.env);
         errdefer read_txn.abort();
@@ -748,6 +832,11 @@ pub const Manifest = struct {
                 @panic("OOM storing overlay slice in openSnapshot");
         }
 
+        if (start) |s| {
+            if (std.time.Instant.now()) |now| {
+                self.metrics.snapshot_open_duration.observe(now.since(s));
+            } else |_| {}
+        }
         _ = self.metrics.snapshot_open_total.fetchAdd(1, .acq_rel);
         _ = self.metrics.active_snapshots.fetchAdd(1, .acq_rel);
         return .{
@@ -2699,6 +2788,69 @@ test "Metrics: counters and gauges reflect hot-path activity" {
     // Poison increments its counter.
     h.manifest._testPoison();
     try testing.expectEqual(@as(u64, 1), h.manifest.metricsSnapshot().poison_total);
+}
+
+test "Metrics: duration histograms record durabilize and snapshot timing" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit();
+    }
+    // One real durabilize + one openSnapshot/close pair.
+    try h.manifest.durabilize(7);
+    var snap = try h.manifest.openSnapshot();
+    snap.close();
+
+    const m = h.manifest.metricsSnapshot();
+
+    // Durabilize histogram: one observation, bounded by +Inf, sum > 0.
+    try testing.expectEqual(@as(u64, 1), m.durabilize_duration.count);
+    try testing.expect(m.durabilize_duration.sum_nanos > 0);
+    // The +Inf bucket (cumulative) sees every observation.
+    try testing.expectEqual(
+        @as(u64, 1),
+        m.durabilize_duration.buckets[Histogram.bucket_count - 1],
+    );
+    // Cumulative: each bucket count is >= the previous.
+    var i: usize = 1;
+    while (i < Histogram.bucket_count) : (i += 1) {
+        try testing.expect(m.durabilize_duration.buckets[i] >= m.durabilize_duration.buckets[i - 1]);
+    }
+
+    // Snapshot-open histogram: same shape.
+    try testing.expectEqual(@as(u64, 1), m.snapshot_open_duration.count);
+    try testing.expect(m.snapshot_open_duration.sum_nanos > 0);
+    try testing.expectEqual(
+        @as(u64, 1),
+        m.snapshot_open_duration.buckets[Histogram.bucket_count - 1],
+    );
+}
+
+test "Histogram.observe puts values in the right bucket" {
+    var hist: Histogram = .{};
+    // Force a known set of observations: one in each boundary range.
+    hist.observe(1_000_000); //   1 ms → bucket 0 (≤ 5ms)
+    hist.observe(7_000_000); //   7 ms → bucket 1 (≤ 10ms)
+    hist.observe(20_000_000); //  20 ms → bucket 2 (≤ 25ms)
+    hist.observe(20_000_000_000); // 20 s → +Inf bucket
+
+    const snap = hist.snapshot();
+    // Cumulative: ≤5ms = 1, ≤10ms = 2, ≤25ms = 3, all the way through
+    // and the +Inf bucket picks up the 20s one for a total of 4.
+    try testing.expectEqual(@as(u64, 1), snap.buckets[0]);
+    try testing.expectEqual(@as(u64, 2), snap.buckets[1]);
+    try testing.expectEqual(@as(u64, 3), snap.buckets[2]);
+    try testing.expectEqual(@as(u64, 3), snap.buckets[Histogram.bucket_count - 2]); // last finite bound
+    try testing.expectEqual(@as(u64, 4), snap.buckets[Histogram.bucket_count - 1]); // +Inf
+    try testing.expectEqual(@as(u64, 4), snap.count);
+    try testing.expectEqual(
+        @as(u64, 1_000_000 + 7_000_000 + 20_000_000 + 20_000_000_000),
+        snap.sum_nanos,
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
