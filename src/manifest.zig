@@ -1519,8 +1519,7 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     const KMAX = 256;
     const VMAX = 1 << 20;
     var key_buf: [KMAX]u8 = undefined;
-    const val_buf = try manifest.allocator.alloc(u8, VMAX);
-    defer manifest.allocator.free(val_buf);
+    var val_buf: [VMAX]u8 = undefined;
 
     // One lease + one Txn per tenant. Leases are released at the end;
     // Txns commit at the end. Both maps share the same key set.
@@ -1580,35 +1579,36 @@ const testing = std.testing;
 
 const Harness = struct {
     tmp: std.testing.TmpDir,
-    path_buf: [std.fs.max_path_bytes:0]u8,
-    path: [:0]const u8,
+    // Heap-allocated so the path pointer is stable across Harness moves.
+    // Earlier versions stored path as a slice into an in-struct array;
+    // since `init()` returns by value, the slice's pointer kept pointing
+    // at init's stack-local copy of that array — silently corrupted by
+    // any later caller whose stack happened to overwrite that slot.
+    path: [:0]u8,
     manifest: *Manifest,
 
     fn init() !Harness {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        var self: Harness = .{
-            .tmp = tmp,
-            .path_buf = undefined,
-            .path = undefined,
-            .manifest = undefined,
-        };
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_path = try tmp.dir.realpath(".", &dir_buf);
-        const p = try std.fmt.bufPrintZ(&self.path_buf, "{s}/kvexp-test.mdb", .{dir_path});
-        self.path = p;
-        self.manifest = try testing.allocator.create(Manifest);
-        errdefer testing.allocator.destroy(self.manifest);
-        try self.manifest.init(testing.allocator, self.path, .{
+        const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/kvexp-test.mdb", .{dir_path});
+        defer testing.allocator.free(tmp_path);
+        const path = try testing.allocator.dupeZ(u8, tmp_path);
+        errdefer testing.allocator.free(path);
+        const manifest = try testing.allocator.create(Manifest);
+        errdefer testing.allocator.destroy(manifest);
+        try manifest.init(testing.allocator, path, .{
             .max_map_size = 32 * 1024 * 1024,
             .max_stores = 256,
         });
-        return self;
+        return .{ .tmp = tmp, .path = path, .manifest = manifest };
     }
 
     fn deinit(self: *Harness) void {
         self.manifest.deinit();
         testing.allocator.destroy(self.manifest);
+        testing.allocator.free(self.path);
         self.tmp.cleanup();
     }
 
