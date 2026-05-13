@@ -290,28 +290,31 @@ const testing = std.testing;
 const TestEnv = struct {
     tmp: std.testing.TmpDir,
     env: Env,
-    path: [:0]const u8,
-    path_buf: [std.fs.max_path_bytes:0]u8,
+    // Heap-allocated so the path pointer is stable across the
+    // struct-by-value return from `init`. (Earlier this was a slice
+    // into an in-struct array; the slice's pointer kept pointing at
+    // init's stack-local copy of the array even after return, and
+    // any caller that wrote to that stack region — e.g. a function
+    // with a sizeable stack frame — silently corrupted the path.
+    // Same bug previously hit the manifest.zig Harness.)
+    path: [:0]u8,
 
     fn init() !TestEnv {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        var self: TestEnv = .{
-            .tmp = tmp,
-            .env = undefined,
-            .path = undefined,
-            .path_buf = undefined,
-        };
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_path = try tmp.dir.realpath(".", &dir_buf);
-        const printed = try std.fmt.bufPrintZ(&self.path_buf, "{s}/lmdb-test.mdb", .{dir_path});
-        self.path = printed;
-        self.env = try Env.open(self.path, .{ .max_map_size = 16 * 1024 * 1024 });
-        return self;
+        const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/lmdb-test.mdb", .{dir_path});
+        defer testing.allocator.free(tmp_path);
+        const path = try testing.allocator.dupeZ(u8, tmp_path);
+        errdefer testing.allocator.free(path);
+        const env = try Env.open(path, .{ .max_map_size = 16 * 1024 * 1024 });
+        return .{ .tmp = tmp, .env = env, .path = path };
     }
 
     fn deinit(self: *TestEnv) void {
         self.env.close();
+        testing.allocator.free(self.path);
         self.tmp.cleanup();
     }
 };
