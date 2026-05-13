@@ -2936,7 +2936,94 @@ test "Histogram.observe puts values in the right bucket" {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Multi-threaded property test: N workers race on M pre-created tenants
+// Failure injection: trigger a real LMDB error mid-durabilize (MapFull,
+// from a deliberately tiny mmap), verify poison fires and recovery works.
+// This exercises the `errdefer self.poison()` path with an actual LMDB
+// error rather than _testPoison's fake one.
+// ───────────────────────────────────────────────────────────────────────────
+
+test "Failure: durabilize MapFull poisons manifest; reopen recovers durable prefix" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/fail.mdb", .{dir_path});
+    defer testing.allocator.free(tmp_path);
+    const path = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(path);
+
+    // 256 KiB map. Big enough for the durable anchor below, too small
+    // to swallow ~200 KiB of additional 1 KiB values plus B-tree
+    // overhead — so the second durabilize commits will be rejected
+    // with MapFull.
+    const tiny_map: usize = 256 * 1024;
+
+    var mf: Manifest = undefined;
+    try mf.init(testing.allocator, path, .{ .max_map_size = tiny_map, .max_stores = 16 });
+    var deinit_owed = true;
+    defer if (deinit_owed) mf.deinit();
+
+    try mf.createStore(1);
+
+    // Land an anchor in durable storage at raft_idx = 10.
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        try t.put("anchor", "durable");
+        try t.commit();
+    }
+    try mf.durabilize(10);
+    try testing.expectEqual(@as(u64, 10), try mf.durableRaftIdx());
+
+    // Now stuff main_overlay with more bytes than the LMDB map can fit.
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        const big_val = [_]u8{0xAB} ** 1024;
+        var key_buf: [16]u8 = undefined;
+        var i: u32 = 0;
+        while (i < 400) : (i += 1) {
+            const key = try std.fmt.bufPrint(&key_buf, "k{d:0>14}", .{i});
+            try t.put(key, &big_val);
+        }
+        try t.commit();
+    }
+
+    // durabilize fails. Don't be picky about the exact error code —
+    // just confirm it errored, poisoned the manifest, and incremented
+    // the failure counter.
+    const result = mf.durabilize(20);
+    try testing.expect(std.meta.isError(result));
+    try testing.expect(mf.isPoisoned());
+    try testing.expectEqual(@as(u64, 1), mf.metricsSnapshot().durabilize_failed_total);
+
+    // Every mutating API call now returns ManifestPoisoned.
+    try testing.expectError(error.ManifestPoisoned, mf.createStore(2));
+    try testing.expectError(error.ManifestPoisoned, mf.durabilize(30));
+    try testing.expectError(error.ManifestPoisoned, mf.acquire(1));
+
+    // Reopen recovers to the last successful durabilize. The 400-key
+    // burst is gone (it was in main_overlay, never reached LMDB); the
+    // anchor is intact; raft_idx is still 10, not 20.
+    mf.deinit();
+    deinit_owed = false;
+    try mf.init(testing.allocator, path, .{ .max_map_size = tiny_map, .max_stores = 16 });
+    deinit_owed = true;
+
+    try testing.expect(!mf.isPoisoned());
+    try testing.expectEqual(@as(u64, 10), try mf.durableRaftIdx());
+
+    var lease = try mf.acquire(1);
+    defer lease.release();
+    const got = (try lease.get(testing.allocator, "anchor")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("durable", got);
+
+    // None of the post-anchor keys made it.
+    try testing.expect((try lease.get(testing.allocator, "k00000000000000")) == null);
+}
 // while a checkpointer thread periodically durabilizes. Each commit (and
 // the checkpointer's "snapshot model" step) is coordinated by an RwLock so
 // the captured durable_model accurately reflects what survives a cycle.
