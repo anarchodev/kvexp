@@ -150,8 +150,9 @@ pub fn flush(self) !void                        // alias: durabilize(0)
 pub fn durableRaftIdx(self) !u64
 pub fn openSnapshot(self) !Snapshot
 
-// Health.
+// Health + observability.
 pub fn isPoisoned(self) bool
+pub fn metricsSnapshot(self) MetricsSnapshot   // counters + gauges + histograms
 
 // StoreLease (returned by acquire / tryAcquire).
 pub fn beginTxn(self) !*Txn        // opens a Txn at chain tail
@@ -485,6 +486,35 @@ briefly for the chain mutation. `durabilize` and `openSnapshot` grab
 each TenantState lock briefly to swap / capture `main_overlay` —
 they do not contend with lease holders.
 
+Under the hood, LMDB is opened with its lock file + reader table
+enabled (no `MDB_NOLOCK`). That's what lets `openSnapshot` keep a
+long-lived read txn alive while `durabilize` runs concurrently —
+the reader table tells LMDB which pages can't be recycled yet.
+Cost: ~ns of overhead per read-txn open (overlay misses); writes
+unaffected.
+
+## Observability
+
+`Manifest.metricsSnapshot()` returns a point-in-time `MetricsSnapshot`
+with atomic counters and gauges plus two duration histograms (one
+each for `durabilize` and `openSnapshot`). Counters cover the
+per-API-op rate (put / delete / get, bytes_put), Txn lifecycle
+(commit / rollback / savepoint variants), dispatch (acquire,
+try-acquire contention), durability (durabilize success vs failed),
+snapshot opens, and poison events. Gauges: active_leases,
+active_snapshots.
+
+The hottest counters (the per-op ones) are sharded across cache
+lines so they don't false-share or true-share under contention —
+threads map to shards via TLS-cached `gettid() & 63`. The snapshot
+aggregates across shards transparently.
+
+The histograms use Prometheus's default bucket boundaries (5 ms .. 10 s,
+plus +Inf) and store cumulative counts in the snapshot, so callers
+can map them straight to Prometheus's `_bucket{le="..."} / _sum /
+_count` wire format. `Histogram.bucket_bounds_nanos` is exposed as a
+`pub const` for the renderer.
+
 ## Failure modes
 
 - **Process crash mid-operation.** LMDB's commit is atomic; if it
@@ -497,6 +527,12 @@ they do not contend with lease holders.
 - **Disk full / mmap exhausted.** LMDB commits fail; `durabilize`
   poisons. Set `max_map_size` large up front (sparse mmap; only
   touched pages cost RAM).
+- **Allocator OOM in internal bookkeeping.** `@panic`. Hard and loud.
+  kvexp sits under a raft log: process recovery is the host's
+  responsibility, and a partially-rolled-back manifest mid-OOM is
+  more dangerous than a crash. The exceptions are allocations that
+  use a *caller-supplied* allocator (`Lease.get`, `Snapshot.get`,
+  `listStores`) — those still propagate `error.OutOfMemory`.
 - **Drop while leased.** `dropStore` blocks on the per-tenant
   dispatch lock; if a worker holds a `StoreLease`, drop waits. Once
   drop returns, the chain has been torn down and subsequent `acquire`
@@ -507,7 +543,18 @@ they do not contend with lease holders.
   released the lease, and another thread dropped the tenant, that
   Txn's memory is freed; using it is undefined. Either keep the lease
   while the Txn is open, or ensure drops happen only when no Txns are
-  outstanding.
+  outstanding. The TenantState itself is refcounted — it stays alive
+  as long as any lease holds it — so a *currently-held* lease against
+  a freshly-dropped tenant won't UAF; writes via that lease will just
+  vanish (the TenantState is no longer in the tenants map, so
+  durabilize doesn't see it).
+- **Multi-process access.** The env file is openable by other
+  processes — LMDB's lock file (`*.mdb-lock` next to the data file)
+  provides multi-process reader/writer coordination at the LMDB
+  layer. But *kvexp's* invariants (per-tenant lease, in-memory chain,
+  main_overlay) are in-process; a second writer process will corrupt
+  state at the kvexp layer. External processes opening read-only is
+  fine and intentional (useful for inspection).
 
 ## Limitations
 
@@ -551,4 +598,5 @@ Then:
 ```
 zig build           # builds libkvexp.a + module
 zig build test      # runs the test suite
+zig build bench     # runs the benchmark suite (ReleaseFast)
 ```
