@@ -332,16 +332,18 @@ pub const Manifest = struct {
     fn getOrCreateTenantState(self: *Manifest, id: u64) !*TenantState {
         self.tenants_lock.lock();
         defer self.tenants_lock.unlock();
-        const gop = try self.tenants.getOrPut(self.allocator, id);
-        if (!gop.found_existing) {
-            const ts = try self.allocator.create(TenantState);
-            errdefer self.allocator.destroy(ts);
-            ts.* = .{
-                .main_overlay = Overlay.init(self.allocator),
-            };
-            gop.value_ptr.* = ts;
-        }
-        return gop.value_ptr.*;
+        if (self.tenants.get(id)) |ts| return ts;
+        // Allocate the TenantState before inserting the map entry so a
+        // mid-create OOM can't leave the map with a slot whose
+        // value_ptr is undefined. (And we crash hard on OOM here
+        // anyway — see CLAUDE.md: kvexp sits under raft, so OOM in
+        // internal bookkeeping means the process is gone, full stop.)
+        const ts = self.allocator.create(TenantState) catch
+            @panic("OOM allocating TenantState");
+        ts.* = .{ .main_overlay = Overlay.init(self.allocator) };
+        self.tenants.put(self.allocator, id, ts) catch
+            @panic("OOM inserting TenantState into tenants map");
+        return ts;
     }
 
     fn lookupTenantState(self: *Manifest, id: u64) ?*TenantState {
