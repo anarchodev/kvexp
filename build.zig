@@ -51,4 +51,24 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run kvexp benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // Real-crash recovery tests. Parent process spawns itself as a
+    // child via std.process.Child, child does scripted kvexp work,
+    // parent SIGKILLs it, parent reopens and verifies. Lives outside
+    // `zig build test` because subprocess control + LMDB file
+    // reopen are heavier than a unit test wants to be.
+    const crash_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/crash_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crash_test_mod.addImport("kvexp", kvexp_mod);
+
+    const crash_test_exe = b.addExecutable(.{
+        .name = "crash-test",
+        .root_module = crash_test_mod,
+    });
+    const run_crash_test = b.addRunArtifact(crash_test_exe);
+    const crash_test_step = b.step("crash-test", "Real-crash recovery tests (parent SIGKILLs child)");
+    crash_test_step.dependOn(&run_crash_test.step);
 }
