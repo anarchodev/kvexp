@@ -2581,3 +2581,183 @@ test "MT property: workers + checkpointer + crash recovers durable prefix" {
         };
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Speculative-apply property test: workers release the lease *before*
+// committing — the production raft pattern. Txns accumulate in per-tenant
+// chains until a single committer thread drains them in raft order (which
+// is queue insertion order, which — because we push while still holding the
+// lease — equals per-tenant chain order). Exercises chain length > 1, the
+// chain-head commit gate, and cross-thread Txn handoff.
+// ───────────────────────────────────────────────────────────────────────────
+
+const SPEC_NUM_WORKERS: usize = 4;
+const SPEC_OPS_PER_WORKER: u32 = 150;
+
+const SpecPending = struct {
+    txn: *Txn,
+    tenant_usize: usize,
+    key_usize: usize,
+    value: u8,
+};
+
+const SpecQueue = struct {
+    mu: std.Thread.Mutex = .{},
+    items: std.ArrayListUnmanaged(SpecPending) = .empty,
+    head: usize = 0,
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) SpecQueue {
+        return .{ .allocator = allocator };
+    }
+    fn deinit(self: *SpecQueue) void {
+        self.items.deinit(self.allocator);
+    }
+    fn push(self: *SpecQueue, p: SpecPending) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.items.append(self.allocator, p);
+    }
+    fn pop(self: *SpecQueue) ?SpecPending {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.head >= self.items.items.len) return null;
+        const item = self.items.items[self.head];
+        self.head += 1;
+        return item;
+    }
+};
+
+const SpecWorkerCtx = struct {
+    manifest: *Manifest,
+    queue: *SpecQueue,
+    seed: u64,
+    err: *std.atomic.Value(usize),
+};
+
+const SpecCommitterCtx = struct {
+    queue: *SpecQueue,
+    stop: *std.atomic.Value(bool),
+    model_lock: *std.Thread.Mutex,
+    model: *PropModel,
+    err: *std.atomic.Value(usize),
+};
+
+fn specWorker(ctx: *SpecWorkerCtx) void {
+    specWorkerInner(ctx) catch |err| {
+        _ = ctx.err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+    };
+}
+
+fn specWorkerInner(ctx: *SpecWorkerCtx) !void {
+    var rng_state = std.Random.DefaultPrng.init(ctx.seed);
+    const rng = rng_state.random();
+    var i: u32 = 0;
+    while (i < SPEC_OPS_PER_WORKER) : (i += 1) {
+        const tenant_usize = rng.intRangeLessThan(usize, 0, MT_NUM_TENANTS);
+        const tenant: u64 = @intCast(tenant_usize);
+        const key_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+        const v: u8 = rng.int(u8);
+
+        var lease = try ctx.manifest.acquire(tenant);
+        // Hold the lease across beginTxn + put + push: per-tenant push
+        // order must equal per-tenant chain order or the committer will
+        // hit NotChainHead.
+        var t = try lease.beginTxn();
+        var kb: [3]u8 = undefined;
+        const vb = [_]u8{v};
+        t.put(keyBuf(&kb, key_usize), vb[0..1]) catch |e| {
+            t.rollback();
+            lease.release();
+            return e;
+        };
+        try ctx.queue.push(.{
+            .txn = t,
+            .tenant_usize = tenant_usize,
+            .key_usize = key_usize,
+            .value = v,
+        });
+        lease.release();
+    }
+}
+
+fn specCommitter(ctx: *SpecCommitterCtx) void {
+    while (true) {
+        if (ctx.queue.pop()) |pending| {
+            pending.txn.commit() catch |e| {
+                _ = ctx.err.cmpxchgStrong(0, @intFromError(e), .acq_rel, .acquire);
+                return;
+            };
+            ctx.model_lock.lock();
+            defer ctx.model_lock.unlock();
+            ctx.model.key_present[pending.tenant_usize][pending.key_usize] = true;
+            ctx.model.values[pending.tenant_usize][pending.key_usize] = pending.value;
+        } else {
+            if (ctx.stop.load(.acquire)) return;
+            std.Thread.yield() catch {};
+        }
+    }
+}
+
+fn specRunOne(seed: u64) !void {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    for (0..MT_NUM_TENANTS) |i| try h.manifest.createStore(@intCast(i));
+    try h.manifest.flush();
+
+    var model: PropModel = .{};
+    for (0..MT_NUM_TENANTS) |i| model.store_exists[i] = true;
+
+    var queue = SpecQueue.init(testing.allocator);
+    defer queue.deinit();
+    var model_lock: std.Thread.Mutex = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    var err = std.atomic.Value(usize).init(0);
+
+    var ctxs: [SPEC_NUM_WORKERS]SpecWorkerCtx = undefined;
+    var threads: [SPEC_NUM_WORKERS]std.Thread = undefined;
+    for (0..SPEC_NUM_WORKERS) |i| {
+        ctxs[i] = .{
+            .manifest = h.manifest,
+            .queue = &queue,
+            .seed = seed *% 37 +% @as(u64, i),
+            .err = &err,
+        };
+        threads[i] = try std.Thread.spawn(.{}, specWorker, .{&ctxs[i]});
+    }
+
+    var committer_ctx: SpecCommitterCtx = .{
+        .queue = &queue,
+        .stop = &stop,
+        .model_lock = &model_lock,
+        .model = &model,
+        .err = &err,
+    };
+    const committer = try std.Thread.spawn(.{}, specCommitter, .{&committer_ctx});
+
+    for (threads) |th| th.join();
+    stop.store(true, .release);
+    committer.join();
+
+    const code = err.load(.acquire);
+    if (code != 0) {
+        std.debug.print("Spec worker/committer errored: code {}\n", .{code});
+        return error.SpecErrored;
+    }
+
+    try h.manifest.flush();
+    try h.cycle();
+    try verifyAgainstModel(h.manifest, &model);
+}
+
+test "Spec property: lease-released-before-commit + committer + recovery" {
+    const seeds: u64 = 3;
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        specRunOne(seed) catch |e| {
+            std.debug.print("\n*** Spec property failed at seed {}: {}\n", .{ seed, e });
+            return e;
+        };
+    }
+}
