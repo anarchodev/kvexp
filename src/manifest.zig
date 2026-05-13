@@ -2401,3 +2401,183 @@ test "Recovery: snapshot install becomes durable through durabilize + reopen" {
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("v", got);
 }
+// ───────────────────────────────────────────────────────────────────────────
+// Multi-threaded property test: N workers race on M pre-created tenants
+// while a checkpointer thread periodically durabilizes. Each commit (and
+// the checkpointer's "snapshot model" step) is coordinated by an RwLock so
+// the captured durable_model accurately reflects what survives a cycle.
+// After workers finish: one final durabilize + cycle + verify.
+// ───────────────────────────────────────────────────────────────────────────
+
+const MT_NUM_WORKERS: usize = 4;
+const MT_NUM_TENANTS: usize = 4;
+const MT_OPS_PER_WORKER: u32 = 200;
+const MT_CHECKPOINT_SLEEP_NS: u64 = 500 * std.time.ns_per_us; // 0.5 ms
+
+const MtCtx = struct {
+    manifest: *Manifest,
+    rwlock: *std.Thread.RwLock,
+    model_lock: *std.Thread.Mutex,
+    model: *PropModel,
+    seed: u64,
+    err: *std.atomic.Value(usize),
+};
+
+const MtCheckpointerCtx = struct {
+    manifest: *Manifest,
+    rwlock: *std.Thread.RwLock,
+    model_lock: *std.Thread.Mutex,
+    model: *PropModel,
+    durable: *PropModel,
+    stop: *std.atomic.Value(bool),
+    err: *std.atomic.Value(usize),
+    durabilize_count: *std.atomic.Value(u32),
+};
+
+fn mtWorker(ctx: *MtCtx) void {
+    mtWorkerInner(ctx) catch |err| {
+        _ = ctx.err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+    };
+}
+
+fn mtWorkerInner(ctx: *MtCtx) !void {
+    var rng_state = std.Random.DefaultPrng.init(ctx.seed);
+    const rng = rng_state.random();
+    var i: u32 = 0;
+    while (i < MT_OPS_PER_WORKER) : (i += 1) {
+        const tenant_usize = rng.intRangeLessThan(usize, 0, MT_NUM_TENANTS);
+        const tenant: u64 = @intCast(tenant_usize);
+        const key_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
+        const choice = rng.intRangeLessThan(u32, 0, 100);
+
+        ctx.rwlock.lockShared();
+        defer ctx.rwlock.unlockShared();
+
+        var lease = try ctx.manifest.acquire(tenant);
+        defer lease.release();
+        var t = try lease.beginTxn();
+
+        var kb: [3]u8 = undefined;
+        const key = keyBuf(&kb, key_usize);
+
+        if (choice < 70) {
+            const v: u8 = rng.int(u8);
+            const vb = [_]u8{v};
+            t.put(key, vb[0..1]) catch |e| {
+                t.rollback();
+                return e;
+            };
+            try t.commit();
+            ctx.model_lock.lock();
+            defer ctx.model_lock.unlock();
+            ctx.model.key_present[tenant_usize][key_usize] = true;
+            ctx.model.values[tenant_usize][key_usize] = v;
+        } else {
+            _ = t.delete(key) catch |e| {
+                t.rollback();
+                return e;
+            };
+            try t.commit();
+            ctx.model_lock.lock();
+            defer ctx.model_lock.unlock();
+            ctx.model.key_present[tenant_usize][key_usize] = false;
+        }
+    }
+}
+
+fn mtCheckpointer(ctx: *MtCheckpointerCtx) void {
+    while (!ctx.stop.load(.acquire)) {
+        std.Thread.sleep(MT_CHECKPOINT_SLEEP_NS);
+        ctx.rwlock.lock();
+        defer ctx.rwlock.unlock();
+        ctx.manifest.flush() catch |err| {
+            _ = ctx.err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+            return;
+        };
+        ctx.model_lock.lock();
+        defer ctx.model_lock.unlock();
+        ctx.durable.* = ctx.model.*;
+        _ = ctx.durabilize_count.fetchAdd(1, .acq_rel);
+    }
+}
+
+fn mtRunOne(seed: u64) !void {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Pre-create all tenants and flush.
+    for (0..MT_NUM_TENANTS) |i| try h.manifest.createStore(@intCast(i));
+    try h.manifest.flush();
+
+    var model: PropModel = .{};
+    for (0..MT_NUM_TENANTS) |i| model.store_exists[i] = true;
+    var durable: PropModel = model;
+
+    var rwlock: std.Thread.RwLock = .{};
+    var model_lock: std.Thread.Mutex = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    var err = std.atomic.Value(usize).init(0);
+    var durabilize_count = std.atomic.Value(u32).init(0);
+
+    var ctxs: [MT_NUM_WORKERS]MtCtx = undefined;
+    var threads: [MT_NUM_WORKERS]std.Thread = undefined;
+    for (0..MT_NUM_WORKERS) |i| {
+        ctxs[i] = .{
+            .manifest = h.manifest,
+            .rwlock = &rwlock,
+            .model_lock = &model_lock,
+            .model = &model,
+            .seed = seed *% 31 +% @as(u64, i),
+            .err = &err,
+        };
+        threads[i] = try std.Thread.spawn(.{}, mtWorker, .{&ctxs[i]});
+    }
+
+    var ckpt_ctx: MtCheckpointerCtx = .{
+        .manifest = h.manifest,
+        .rwlock = &rwlock,
+        .model_lock = &model_lock,
+        .model = &model,
+        .durable = &durable,
+        .stop = &stop,
+        .err = &err,
+        .durabilize_count = &durabilize_count,
+    };
+    const ckpt = try std.Thread.spawn(.{}, mtCheckpointer, .{&ckpt_ctx});
+
+    for (threads) |th| th.join();
+    stop.store(true, .release);
+    ckpt.join();
+
+    const code = err.load(.acquire);
+    if (code != 0) {
+        std.debug.print("MT worker/ckpt errored: code {}\n", .{code});
+        return error.MtWorkerErrored;
+    }
+
+    // Final durabilize + snapshot.
+    rwlock.lock();
+    try h.manifest.flush();
+    durable = model;
+    rwlock.unlock();
+
+    // Crash + verify.
+    try h.cycle();
+    try verifyAgainstModel(h.manifest, &durable);
+
+    // Sanity: the checkpointer should have run at least once during the
+    // workers. If this fires, the test isn't actually exercising the
+    // concurrent durabilize path.
+    if (durabilize_count.load(.acquire) == 0) return error.CheckpointerStarved;
+}
+
+test "MT property: workers + checkpointer + crash recovers durable prefix" {
+    const seeds: u64 = 3;
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        mtRunOne(seed) catch |e| {
+            std.debug.print("\n*** MT property failed at seed {}: {}\n", .{ seed, e });
+            return e;
+        };
+    }
+}
