@@ -132,14 +132,6 @@ pub const Env = struct {
     pub fn sync(self: *Env, force: bool) Error!void {
         try check(c.mdb_env_sync(self.ptr, if (force) 1 else 0));
     }
-
-    /// Copy the env's database to `dest_path` while writers continue.
-    /// Used for raft state transfer. The destination becomes a stand-
-    /// alone LMDB file ready to be opened by a follower.
-    pub fn copyTo(self: *Env, dest_path: [:0]const u8, compact: bool) Error!void {
-        const flags: c_uint = if (compact) c.MDB_CP_COMPACT else 0;
-        try check(c.mdb_env_copy2(self.ptr, dest_path.ptr, flags));
-    }
 };
 
 pub const Txn = struct {
@@ -210,13 +202,6 @@ pub const Txn = struct {
         if (rc == c.MDB_NOTFOUND) return false;
         try check(rc);
         return true;
-    }
-
-    /// True iff `dbi` has at least one entry within this txn.
-    pub fn isEmpty(self: *Txn, dbi: Dbi) Error!bool {
-        var stat: c.MDB_stat = undefined;
-        try check(c.mdb_stat(self.ptr, dbi.handle, &stat));
-        return stat.ms_entries == 0;
     }
 
     pub fn openCursor(self: *Txn, dbi: Dbi) Error!Cursor {

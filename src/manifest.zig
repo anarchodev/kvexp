@@ -17,17 +17,21 @@
 //!              └─ open_child  ← LIFO stack: at most one savepoint open
 //!                                (the savepoint can itself have one open, etc.)
 //!
-//! Writes go through Txns. `Manifest.beginTxn(tenant_id)` opens a new
-//! top-level Txn at the tail of that tenant's chain. `Txn.put` /
+//! Writes go through Txns, which are opened from a `StoreLease`.
+//! `Manifest.acquire(tenant_id)` takes the per-tenant dispatch lock
+//! and returns a `StoreLease`; `lease.beginTxn()` opens a new top-
+//! level Txn at the tail of that tenant's chain. `Txn.put` /
 //! `Txn.delete` land in the txn's own overlay. `Txn.savepoint()`
 //! pushes a child Txn whose parent is this one — savepoints stack
-//! LIFO (single `open_child` slot).
+//! LIFO (single `open_child` slot). The lease may be released as soon
+//! as dispatch is done; the Txn lives in the chain until its own
+//! commit / rollback.
 //!
 //! Reads walk inside-out: savepoint stack → enclosing top-level Txn's
 //! chain backward → tenant's main_overlay → LMDB read txn. Cross-
 //! tenant in-flight state is never visible (each tenant has its own
-//! chain and overlay; `Store` and `Snapshot` see only main_overlay
-//! plus LMDB).
+//! chain and overlay; lease-based reads and `Snapshot` see only
+//! main_overlay plus LMDB).
 //!
 //! Commit:
 //!   - Top-level Txn: must be the chain head (raft-oldest); merges
@@ -112,8 +116,7 @@ pub const Manifest = struct {
     dbis_lock: std.Thread.Mutex = .{},
 
     /// store_id → per-tenant in-memory state (overlay + chain of open
-    /// Txns). Lazily created on first beginTxn or first write
-    /// affecting a tenant.
+    /// Txns). Lazily created on first acquire / lease.beginTxn / write.
     tenants: std.AutoHashMapUnmanaged(u64, *TenantState) = .empty,
     tenants_lock: std.Thread.Mutex = .{},
 
@@ -230,6 +233,19 @@ pub const Manifest = struct {
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
         try self.checkAlive();
+
+        // Block on the per-tenant dispatch lock if a lease holder
+        // is active. Drop happens with that lock held so that we can
+        // tear the chain down safely; subsequent acquire(id) will
+        // see hasStore == false and fail.
+        //
+        // Callers must not hold a lease on `id` from the same thread
+        // (would self-deadlock). Per-thread caveat documented in the
+        // README.
+        const ts_opt = self.lookupTenantState(id);
+        if (ts_opt) |ts| ts.dispatch_lock.lock();
+        defer if (ts_opt) |ts| ts.dispatch_lock.unlock();
+
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
         if (!self.hasStoreLocked(id)) return false;
@@ -335,51 +351,43 @@ pub const Manifest = struct {
         return self.tenants.get(id);
     }
 
-    // ── beginTxn / openStore ────────────────────────────────────────
+    // ── acquire / tryAcquire ────────────────────────────────────────
 
-    /// Open a new top-level Txn at the tail of `tenant_id`'s chain.
-    /// Subsequent puts/deletes through this Txn land in its overlay;
-    /// reads see this Txn's writes + any older chain entries + the
-    /// tenant's main_overlay + LMDB.
+    /// Take exclusive dispatch ownership of `tenant_id`. Blocks until
+    /// any current lease holder releases. The returned `StoreLease` is
+    /// the only handle through which `beginTxn`, `get`, or `scanPrefix`
+    /// can be issued for this tenant.
     ///
-    /// Returns `error.StoreNotFound` if the tenant doesn't exist
-    /// (caller must `createStore` first).
-    pub fn beginTxn(self: *Manifest, tenant_id: u64) !*Txn {
+    /// Returns `error.StoreNotFound` if the tenant doesn't exist.
+    ///
+    /// The lease holder must call `release` to unlock. Other operations
+    /// that touch the tenant (durabilize, openSnapshot, lockless cross-
+    /// tenant reads) run concurrently — the lease only serializes
+    /// dispatch.
+    pub fn acquire(self: *Manifest, tenant_id: u64) !StoreLease {
         try self.checkAlive();
         if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
-
         const ts = try self.getOrCreateTenantState(tenant_id);
-        ts.lock.lock();
-        defer ts.lock.unlock();
-
-        const txn = try self.allocator.create(Txn);
-        errdefer self.allocator.destroy(txn);
-        txn.* = .{
+        ts.dispatch_lock.lock();
+        return .{
             .manifest = self,
             .tenant_id = tenant_id,
             .tenant_state = ts,
-            .parent = null,
-            .chain_prev = ts.chain_tail,
-            .chain_next = null,
-            .overlay = Overlay.init(self.allocator),
-            .open_child = null,
         };
-        if (ts.chain_tail) |tail| {
-            tail.chain_next = txn;
-        } else {
-            ts.chain_head = txn;
-        }
-        ts.chain_tail = txn;
-        return txn;
     }
 
-    /// Open a read-only `Store` handle for callers that aren't in a
-    /// txn. Sees only the tenant's `main_overlay` + LMDB — never any
-    /// in-flight Txn. Returns `error.StoreNotFound` if the tenant
-    /// doesn't exist.
-    pub fn openStore(self: *Manifest, tenant_id: u64) !Store {
+    /// Non-blocking variant of `acquire`. Returns null if another
+    /// holder already owns the lease.
+    pub fn tryAcquire(self: *Manifest, tenant_id: u64) !?StoreLease {
+        try self.checkAlive();
         if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
-        return .{ .manifest = self, .tenant_id = tenant_id };
+        const ts = try self.getOrCreateTenantState(tenant_id);
+        if (!ts.dispatch_lock.tryLock()) return null;
+        return StoreLease{
+            .manifest = self,
+            .tenant_id = tenant_id,
+            .tenant_state = ts,
+        };
     }
 
     // ── durabilize ──────────────────────────────────────────────────
@@ -514,7 +522,9 @@ pub const Manifest = struct {
     }
 
     /// Convenience: durabilize without disturbing the raft watermark.
-    pub fn commit(self: *Manifest) !void {
+    /// Named `flush` (rather than `commit`) to avoid collision with
+    /// `Txn.commit`, which means something completely different.
+    pub fn flush(self: *Manifest) !void {
         return self.durabilize(0);
     }
 
@@ -607,29 +617,18 @@ pub const Manifest = struct {
         };
     }
 
-    // ── verify ──────────────────────────────────────────────────────
-
-    pub const VerifyReport = struct {
-        store_count: u64,
-        durable_raft_idx: u64,
-    };
-
-    pub fn verify(self: *Manifest, allocator: std.mem.Allocator) !VerifyReport {
-        _ = allocator;
-        const idx = try self.durableRaftIdx();
-        self.dbis_lock.lock();
-        defer self.dbis_lock.unlock();
-        return .{
-            .store_count = self.dbis.count(),
-            .durable_raft_idx = idx,
-        };
-    }
 };
 
 // ─── TenantState ────────────────────────────────────────────────────
 
 const TenantState = struct {
+    /// Internal serialization for main_overlay + chain mutations
+    /// (taken briefly inside individual API calls).
     lock: std.Thread.Mutex = .{},
+    /// Application-level dispatch lock: held by a StoreLease holder
+    /// across many API calls. Top of the lock stack; never taken from
+    /// inside kvexp's internal lock paths.
+    dispatch_lock: std.Thread.Mutex = .{},
     main_overlay: Overlay,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
@@ -1069,25 +1068,63 @@ pub const TxnPrefixCursor = struct {
     }
 };
 
-// ─── Store (read-only) ──────────────────────────────────────────────
+// ─── StoreLease ─────────────────────────────────────────────────────
 
-pub const Store = struct {
+/// Exclusive dispatch handle for a tenant. While held, no other thread
+/// can begin Txns for this tenant. Reads through the lease see only
+/// `main_overlay` + LMDB — never an in-flight chain (those are this
+/// lease holder's own; read through the Txn handle for that).
+///
+/// Release is mandatory; the lease drops the dispatch_lock on
+/// `release`. A Txn obtained via `beginTxn` outlives the lease — the
+/// speculative-apply recipe releases the lease as soon as dispatch is
+/// done, while the Txn stays in the chain until raft commits or
+/// rejects.
+pub const StoreLease = struct {
     manifest: *Manifest,
     tenant_id: u64,
+    tenant_state: *TenantState,
 
-    pub fn deinit(self: *Store) void {
-        _ = self;
+    /// Open a new top-level Txn at the tail of this tenant's chain.
+    /// Reads through the Txn see its own writes + older chain entries
+    /// + the tenant's main_overlay + LMDB.
+    pub fn beginTxn(self: *StoreLease) !*Txn {
+        try self.manifest.checkAlive();
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
+
+        const txn = try self.manifest.allocator.create(Txn);
+        errdefer self.manifest.allocator.destroy(txn);
+        txn.* = .{
+            .manifest = self.manifest,
+            .tenant_id = self.tenant_id,
+            .tenant_state = ts,
+            .parent = null,
+            .chain_prev = ts.chain_tail,
+            .chain_next = null,
+            .overlay = Overlay.init(self.manifest.allocator),
+            .open_child = null,
+        };
+        if (ts.chain_tail) |tail| {
+            tail.chain_next = txn;
+        } else {
+            ts.chain_head = txn;
+        }
+        ts.chain_tail = txn;
+        return txn;
     }
 
-    pub fn get(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        if (self.manifest.lookupTenantState(self.tenant_id)) |ts| {
-            ts.lock.lock();
-            defer ts.lock.unlock();
-            if (ts.main_overlay.entries.get(key)) |entry| {
-                switch (entry) {
-                    .value => |v| return try allocator.dupe(u8, v),
-                    .tombstone => return null,
-                }
+    /// Point-read against committed state (main_overlay + LMDB). Does
+    /// NOT see this lease's in-flight Txns.
+    pub fn get(self: *StoreLease, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        if (ts.main_overlay.entries.get(key)) |entry| {
+            switch (entry) {
+                .value => |v| return try allocator.dupe(u8, v),
+                .tombstone => return null,
             }
         }
         const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
@@ -1097,9 +1134,9 @@ pub const Store = struct {
         return null;
     }
 
-    pub fn scanPrefix(self: *Store, prefix: []const u8) !StorePrefixCursor {
-        // Snapshot the main_overlay's prefix-matching entries.
-        var entries: std.ArrayListUnmanaged(StorePrefixCursor.Entry) = .empty;
+    /// Prefix scan over committed state (main_overlay + LMDB).
+    pub fn scanPrefix(self: *StoreLease, prefix: []const u8) !TxnPrefixCursor {
+        var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
         errdefer {
             for (entries.items) |e| {
                 self.manifest.allocator.free(e.key);
@@ -1107,7 +1144,8 @@ pub const Store = struct {
             }
             entries.deinit(self.manifest.allocator);
         }
-        if (self.manifest.lookupTenantState(self.tenant_id)) |ts| {
+        {
+            const ts = self.tenant_state;
             ts.lock.lock();
             defer ts.lock.unlock();
             var it = ts.main_overlay.entries.iterator();
@@ -1123,7 +1161,7 @@ pub const Store = struct {
                 try entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy });
             }
         }
-        std.mem.sort(StorePrefixCursor.Entry, entries.items, {}, StorePrefixCursor.Entry.lessThan);
+        std.mem.sort(TxnPrefixCursor.Entry, entries.items, {}, TxnPrefixCursor.Entry.lessThan);
         const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
         errdefer {
             for (overlay_slice) |e| {
@@ -1147,7 +1185,7 @@ pub const Store = struct {
             read_txn.abort();
         };
 
-        var cur: StorePrefixCursor = .{
+        var cur: TxnPrefixCursor = .{
             .allocator = self.manifest.allocator,
             .read_txn = read_txn,
             .lmdb_cur = lmdb_cur,
@@ -1164,9 +1202,14 @@ pub const Store = struct {
         try cur.primeTree();
         return cur;
     }
-};
 
-pub const StorePrefixCursor = TxnPrefixCursor; // identical merge logic
+    /// Drop the dispatch lock. Required. Any Txns this lease opened
+    /// remain in the chain until their own commit / rollback.
+    pub fn release(self: *StoreLease) void {
+        self.tenant_state.dispatch_lock.unlock();
+        self.* = undefined;
+    }
+};
 
 // ─── Snapshot ───────────────────────────────────────────────────────
 
@@ -1471,7 +1514,14 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     var key_buf: [KMAX]u8 = undefined;
     var val_buf: [VMAX]u8 = undefined;
 
-    // One Txn per tenant; collected here and all committed at the end.
+    // One lease + one Txn per tenant. Leases are released at the end;
+    // Txns commit at the end. Both maps share the same key set.
+    var leases: std.AutoHashMapUnmanaged(u64, StoreLease) = .empty;
+    defer {
+        var lit = leases.iterator();
+        while (lit.next()) |entry| entry.value_ptr.release();
+        leases.deinit(manifest.allocator);
+    }
     var txns: std.AutoHashMapUnmanaged(u64, *Txn) = .empty;
     defer txns.deinit(manifest.allocator);
     errdefer {
@@ -1491,19 +1541,26 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
                 try reader.readNoEof(key_buf[0..klen]);
                 try reader.readNoEof(val_buf[0..vlen]);
                 if (!(try manifest.hasStore(id))) try manifest.createStore(id);
-                const gop = try txns.getOrPut(manifest.allocator, id);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = try manifest.beginTxn(id);
+                const lease_gop = try leases.getOrPut(manifest.allocator, id);
+                if (!lease_gop.found_existing) {
+                    lease_gop.value_ptr.* = try manifest.acquire(id);
                 }
-                try gop.value_ptr.*.put(key_buf[0..klen], val_buf[0..vlen]);
+                const txn_gop = try txns.getOrPut(manifest.allocator, id);
+                if (!txn_gop.found_existing) {
+                    txn_gop.value_ptr.* = try lease_gop.value_ptr.beginTxn();
+                }
+                try txn_gop.value_ptr.*.put(key_buf[0..klen], val_buf[0..vlen]);
             },
             else => return error.InvalidSnapshotFormat,
         }
     }
-    // Commit all txns. Each tenant has exactly one open chain entry
-    // (we created it at first put), so each commit is the chain head.
+    // Commit all txns. Each tenant's chain has exactly one entry (we
+    // created it at first put for that tenant), so each commit is the
+    // chain head. After this, the txns map holds dangling pointers
+    // — clear it so the errdefer above doesn't double-free.
     var it = txns.iterator();
     while (it.next()) |entry| try entry.value_ptr.*.commit();
+    txns.clearRetainingCapacity();
     return last_applied;
 }
 
@@ -1554,13 +1611,23 @@ const Harness = struct {
             .max_stores = 256,
         });
     }
+
+    /// Test helper: acquire the lease, begin a Txn, release the lease.
+    /// Mirrors the speculative-apply pattern where the lease is held
+    /// only for dispatch and the Txn outlives it. Caller is responsible
+    /// for committing or rolling back the returned Txn.
+    fn quickTxn(self: *Harness, tenant_id: u64) !*Txn {
+        var lease = try self.manifest.acquire(tenant_id);
+        defer lease.release();
+        return try lease.beginTxn();
+    }
 };
 
 test "Manifest: create + reopen survives" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(7);
-    try h.manifest.commit();
+    try h.manifest.flush();
     try h.cycle();
     try testing.expect(try h.manifest.hasStore(7));
 }
@@ -1569,14 +1636,14 @@ test "Txn: simple put then commit lands in main_overlay, reads see it" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var txn = try h.manifest.beginTxn(1);
+    var txn = try h.quickTxn(1);
     try txn.put("k", "v");
     try txn.commit();
 
-    var s = try h.manifest.openStore(1);
-    defer s.deinit();
+    var s = try h.manifest.acquire(1);
+    defer s.release();
     const got = (try s.get(testing.allocator, "k")).?;
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("v", got);
@@ -1586,14 +1653,14 @@ test "Txn: rollback drops writes; main_overlay untouched" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var txn = try h.manifest.beginTxn(1);
+    var txn = try h.quickTxn(1);
     try txn.put("k", "v");
     txn.rollback();
 
-    var s = try h.manifest.openStore(1);
-    defer s.deinit();
+    var s = try h.manifest.acquire(1);
+    defer s.release();
     try testing.expect((try s.get(testing.allocator, "k")) == null);
 }
 
@@ -1601,9 +1668,9 @@ test "Txn: reads see its own writes before commit" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var txn = try h.manifest.beginTxn(1);
+    var txn = try h.quickTxn(1);
     defer txn.rollback();
     try txn.put("k", "v");
     const got = (try txn.get(testing.allocator, "k")).?;
@@ -1615,11 +1682,11 @@ test "Txn: chain reads see earlier txns' writes" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t1 = try h.manifest.beginTxn(1);
+    var t1 = try h.quickTxn(1);
     try t1.put("a", "1");
-    var t2 = try h.manifest.beginTxn(1);
+    var t2 = try h.quickTxn(1);
     // t2 should see t1's writes (chain reads backward).
     const got = (try t2.get(testing.allocator, "a")).?;
     defer testing.allocator.free(got);
@@ -1633,13 +1700,13 @@ test "Txn: top-level rollback cascades to successors" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t1 = try h.manifest.beginTxn(1);
+    var t1 = try h.quickTxn(1);
     try t1.put("a", "1");
-    var t2 = try h.manifest.beginTxn(1);
+    var t2 = try h.quickTxn(1);
     try t2.put("b", "2");
-    var t3 = try h.manifest.beginTxn(1);
+    var t3 = try h.quickTxn(1);
     try t3.put("c", "3");
 
     // Rollback t2 → t2 and t3 are dropped.
@@ -1651,8 +1718,8 @@ test "Txn: top-level rollback cascades to successors" {
 
     try t1.commit();
 
-    var s = try h.manifest.openStore(1);
-    defer s.deinit();
+    var s = try h.manifest.acquire(1);
+    defer s.release();
     const got = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("1", got);
@@ -1664,10 +1731,10 @@ test "Txn: commit must be chain head" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t1 = try h.manifest.beginTxn(1);
-    var t2 = try h.manifest.beginTxn(1);
+    var t1 = try h.quickTxn(1);
+    var t2 = try h.quickTxn(1);
     try testing.expectError(error.NotChainHead, t2.commit());
     t2.rollback();
     try t1.commit();
@@ -1677,9 +1744,9 @@ test "Savepoint: commit merges into parent overlay" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t = try h.manifest.beginTxn(1);
+    var t = try h.quickTxn(1);
     defer t.rollback();
     try t.put("a", "1");
     var sp = try t.savepoint();
@@ -1695,9 +1762,9 @@ test "Savepoint: rollback drops only the savepoint's writes" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t = try h.manifest.beginTxn(1);
+    var t = try h.quickTxn(1);
     defer t.rollback();
     try t.put("a", "1");
     var sp = try t.savepoint();
@@ -1714,9 +1781,9 @@ test "Savepoint: nested savepoints LIFO" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t = try h.manifest.beginTxn(1);
+    var t = try h.quickTxn(1);
     defer t.rollback();
     var sp1 = try t.savepoint();
     try sp1.put("a", "1");
@@ -1737,9 +1804,9 @@ test "Savepoint: commit/rollback while inner savepoint open errors" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t = try h.manifest.beginTxn(1);
+    var t = try h.quickTxn(1);
     defer t.rollback();
     var sp = try t.savepoint();
     try testing.expectError(error.SavepointStillOpen, t.commit());
@@ -1752,16 +1819,16 @@ test "durabilize: drains main_overlay; in-flight txn stays" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t1 = try h.manifest.beginTxn(1);
+    var t1 = try h.quickTxn(1);
     try t1.put("durable", "yes");
     try t1.commit(); // → main_overlay
 
-    var t2 = try h.manifest.beginTxn(1);
+    var t2 = try h.quickTxn(1);
     try t2.put("inflight", "maybe");
 
-    try h.manifest.commit();    // drains main_overlay; t2 untouched
+    try h.manifest.flush();    // drains main_overlay; t2 untouched
 
     // After commit, t2 still sees its own write.
     const got = (try t2.get(testing.allocator, "inflight")).?;
@@ -1769,8 +1836,8 @@ test "durabilize: drains main_overlay; in-flight txn stays" {
     try testing.expectEqualStrings("maybe", got);
 
     // A fresh Store sees the durable value, not t2's in-flight one.
-    var s = try h.manifest.openStore(1);
-    defer s.deinit();
+    var s = try h.manifest.acquire(1);
+    defer s.release();
     const dg = (try s.get(testing.allocator, "durable")).?;
     defer testing.allocator.free(dg);
     try testing.expectEqualStrings("yes", dg);
@@ -1784,17 +1851,17 @@ test "Txn.scanPrefix: merges chain + main + LMDB in order" {
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var t = try h.manifest.beginTxn(1);
+        var t = try h.quickTxn(1);
         try t.put("a", "lmdb-a");
         try t.put("c", "lmdb-c");
         try t.commit();
     }
-    try h.manifest.commit(); // a, c are in LMDB now
+    try h.manifest.flush(); // a, c are in LMDB now
 
-    var t1 = try h.manifest.beginTxn(1);
+    var t1 = try h.quickTxn(1);
     defer t1.rollback();
     try t1.put("b", "t1-b");
-    var t2 = try h.manifest.beginTxn(1);
+    var t2 = try h.quickTxn(1);
     defer t2.rollback();
     try t2.put("d", "t2-d");
     try t2.put("a", "t2-a"); // override LMDB's a
@@ -1822,13 +1889,13 @@ test "Txn: delete tombstone shadows everything below" {
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var t = try h.manifest.beginTxn(1);
+        var t = try h.quickTxn(1);
         try t.put("k", "lmdb");
         try t.commit();
     }
-    try h.manifest.commit();
+    try h.manifest.flush();
 
-    var t = try h.manifest.beginTxn(1);
+    var t = try h.quickTxn(1);
     defer t.rollback();
     try testing.expect(try t.delete("k"));
     try testing.expect((try t.get(testing.allocator, "k")) == null);
@@ -1843,7 +1910,7 @@ test "durableRaftIdx: durabilize(idx) stamps; survives reopen" {
     try h.cycle();
     try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
     // commit() preserves the watermark.
-    try h.manifest.commit();
+    try h.manifest.flush();
     try testing.expectEqual(@as(u64, 42), try h.manifest.durableRaftIdx());
 }
 
@@ -1851,13 +1918,13 @@ test "poison blocks writes; reopen clears" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
     h.manifest._testPoison();
     try testing.expect(h.manifest.isPoisoned());
     try testing.expectError(error.ManifestPoisoned, h.manifest.durabilize(0));
     try testing.expectError(error.ManifestPoisoned, h.manifest.createStore(2));
-    try testing.expectError(error.ManifestPoisoned, h.manifest.beginTxn(1));
+    try testing.expectError(error.ManifestPoisoned, h.quickTxn(1));
 
     try h.cycle();
     try testing.expect(!h.manifest.isPoisoned());
@@ -1869,20 +1936,20 @@ test "Snapshot: sees main_overlay + LMDB; not in-flight Txn" {
     defer h.deinit();
     try h.manifest.createStore(1);
     {
-        var t = try h.manifest.beginTxn(1);
+        var t = try h.quickTxn(1);
         try t.put("durable", "yes");
         try t.commit();
     }
-    try h.manifest.commit();
+    try h.manifest.flush();
 
     // Now a committed-but-not-durabilized write:
     {
-        var t = try h.manifest.beginTxn(1);
+        var t = try h.quickTxn(1);
         try t.put("commitnotdurable", "yes");
         try t.commit();
     }
     // And an open Txn:
-    var inflight = try h.manifest.beginTxn(1);
+    var inflight = try h.quickTxn(1);
     defer inflight.rollback();
     try inflight.put("inflight", "no");
 
@@ -1903,7 +1970,7 @@ test "dumpSnapshot / loadSnapshot round-trip" {
     defer src.deinit();
     try src.manifest.createStore(10);
     {
-        var t = try src.manifest.beginTxn(10);
+        var t = try src.quickTxn(10);
         try t.put("a", "1");
         try t.put("b", "2");
         try t.commit();
@@ -1926,8 +1993,8 @@ test "dumpSnapshot / loadSnapshot round-trip" {
     try dst.manifest.durabilize(last);
     try testing.expectEqual(@as(u64, 99), try dst.manifest.durableRaftIdx());
 
-    var s = try dst.manifest.openStore(10);
-    defer s.deinit();
+    var s = try dst.manifest.acquire(10);
+    defer s.release();
     const ga = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(ga);
     try testing.expectEqualStrings("1", ga);
@@ -1937,14 +2004,14 @@ test "dropStore: while txns open, drops everything cleanly" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
 
     // Open a txn, then drop the store. The txn's memory is freed.
-    _ = try h.manifest.beginTxn(1);
+    _ = try h.quickTxn(1);
     // Don't keep a handle past dropStore — that's the "explicit
     // drop-from-under-you" caveat.
     _ = try h.manifest.dropStore(1);
-    try h.manifest.commit();
+    try h.manifest.flush();
     try testing.expect(!try h.manifest.hasStore(1));
 }
 
@@ -1981,8 +2048,8 @@ fn verifyAgainstModel(manifest: *Manifest, model: *const PropModel) !void {
         const exists = try manifest.hasStore(sid);
         if (exists != model.store_exists[sid_usize]) return error.StoreExistenceMismatch;
         if (!exists) continue;
-        var s = try manifest.openStore(sid);
-        defer s.deinit();
+        var s = try manifest.acquire(sid);
+        defer s.release();
         for (0..PROP_NUM_KEYS) |kid| {
             var kb: [3]u8 = undefined;
             const k = keyBuf(&kb, kid);
@@ -2023,7 +2090,7 @@ fn propRunOne(seed: u64) !void {
             if (!model.store_exists[sid_usize]) continue;
             const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
             const v = rng.int(u8);
-            var t = try h.manifest.beginTxn(@intCast(sid_usize));
+            var t = try h.quickTxn(@intCast(sid_usize));
             var kb: [3]u8 = undefined;
             var vb: [1]u8 = .{v};
             try t.put(keyBuf(&kb, kid), vb[0..1]);
@@ -2034,7 +2101,7 @@ fn propRunOne(seed: u64) !void {
             const sid_usize = rng.intRangeLessThan(usize, 0, PROP_NUM_STORES);
             if (!model.store_exists[sid_usize]) continue;
             const kid = rng.intRangeLessThan(usize, 0, PROP_NUM_KEYS);
-            var t = try h.manifest.beginTxn(@intCast(sid_usize));
+            var t = try h.quickTxn(@intCast(sid_usize));
             var kb: [3]u8 = undefined;
             const existed = try t.delete(keyBuf(&kb, kid));
             try t.commit();
@@ -2053,7 +2120,7 @@ fn propRunOne(seed: u64) !void {
             model.store_exists[sid_usize] = false;
             for (0..PROP_NUM_KEYS) |k| model.key_present[sid_usize][k] = false;
         } else {
-            try h.manifest.commit();
+            try h.manifest.flush();
             durable_model = model;
         }
     }

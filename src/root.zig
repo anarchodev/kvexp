@@ -8,11 +8,10 @@ pub const lmdb = @import("lmdb.zig");
 pub const manifest = @import("manifest.zig");
 
 pub const Manifest = manifest.Manifest;
+pub const StoreLease = manifest.StoreLease;
 pub const Txn = manifest.Txn;
-pub const Store = manifest.Store;
 pub const Snapshot = manifest.Snapshot;
 pub const TxnPrefixCursor = manifest.TxnPrefixCursor;
-pub const StorePrefixCursor = manifest.StorePrefixCursor;
 pub const SnapshotPrefixCursor = manifest.SnapshotPrefixCursor;
 pub const InitOptions = manifest.InitOptions;
 pub const dumpSnapshot = manifest.dumpSnapshot;

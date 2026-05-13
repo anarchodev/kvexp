@@ -6,13 +6,15 @@ has its own key space and atomic durability boundary. The raft log is
 the write-ahead log; kvexp is a periodically-checkpointed materialization
 of the applied prefix.
 
-Writes go through **per-tenant chains of nested transactions**.
-`Manifest.beginTxn(tenant_id)` opens a top-level Txn at the tail of
-that tenant's chain. `Txn.savepoint()` pushes a LIFO save point. The
-model cleanly supports raft-driven speculative writes: open a Txn per
-proposal, continue to the next proposal without waiting, commit when
-raft accepts, rollback on rejection — the chain handles ordering and
-cascade-rollback naturally.
+Writes go through **per-tenant chains of nested transactions**, gated
+by a **per-tenant dispatch lease**. `Manifest.acquire(tenant_id)`
+takes the lease; `lease.beginTxn()` opens a top-level Txn at the tail
+of that tenant's chain; `lease.release()` drops the lease (the Txn
+lives on in the chain until raft commits or rejects). `Txn.savepoint()`
+pushes a LIFO save point. The model cleanly supports raft-driven
+speculative writes: acquire, open a Txn, release; on raft commit, the
+Txn commits and merges into `main_overlay`; on raft reject, rollback
+cascades to every later open Txn for that tenant.
 
 ## Architecture
 
@@ -25,6 +27,7 @@ cascade-rollback naturally.
               │    └─ "s_<hex>" sub-DBI per tenant               │
               │                                                  │
               │  per-tenant TenantState (in memory, lazy)        │
+              │    ├─ dispatch_lock  ← held by current StoreLease│
               │    ├─ main_overlay   ← committed but not durable │
               │    └─ chain of open top-level Txns               │
               │           (raft propose order)                   │
@@ -33,7 +36,12 @@ cascade-rollback naturally.
               │           └─ open_child  ← single LIFO savepoint │
               └──────────────────────────────────────────────────┘
 
-  beginTxn(tenant)        →  new Txn at chain tail
+  acquire(tenant)         →  blocks on dispatch_lock; returns Lease
+  tryAcquire(tenant)      →  null if held; else Lease
+  Lease.beginTxn          →  new Txn at chain tail
+  Lease.get / .scanPrefix →  main_overlay + LMDB (no chain reads)
+  Lease.release           →  drops dispatch_lock; Txns survive
+
   Txn.put / .delete       →  into Txn.overlay (no I/O)
   Txn.get / .scanPrefix   →  walks savepoint stack → chain backward
                               → main_overlay → LMDB
@@ -51,7 +59,8 @@ cascade-rollback naturally.
                               hit main_overlay when the Txn commits)
   openSnapshot()          →  LMDB read txn + captured main_overlay
                              (in-flight Txns NOT visible)
-  openStore(tenant_id)    →  read-only handle: main_overlay + LMDB
+  dropStore(id)           →  blocks on dispatch_lock; safely tears
+                             down chain before queueing pending_drop
 ```
 
 **Crucial invariants:**
@@ -77,9 +86,11 @@ past a few thousand tenants:
 - **No fsync amortization** across tenants — each commits its own WAL.
 
 kvexp gives every tenant its own ordered key space backed by an LMDB
-sub-DBI inside one shared env. Workers absorb writes into per-Txn
-overlays (free of any I/O). A periodic `durabilize` drains every
-tenant's `main_overlay` plus the raft watermark in one LMDB commit.
+sub-DBI inside one shared env. Workers acquire a per-tenant lease for
+dispatch (one in-flight dispatcher per tenant), absorb writes into
+per-Txn overlays (free of any I/O), and release. A periodic
+`durabilize` drains every tenant's `main_overlay` plus the raft
+watermark in one LMDB commit.
 
 ## Quick start
 
@@ -97,21 +108,21 @@ defer manifest.deinit();
 try manifest.createStore(42);
 const exists = try manifest.hasStore(42);
 
-// Writes go through a transaction.
-var txn = try manifest.beginTxn(42);
+// Acquire the per-tenant lease; open a Txn under it.
+var lease = try manifest.acquire(42);
+defer lease.release();
+var txn = try lease.beginTxn();
 try txn.put("key", "value");
 const v = try txn.get(allocator, "key");      // sees its own write
 defer if (v) |b| allocator.free(b);
 try txn.commit();                              // merge into main_overlay
 
-// Read-only access (sees main_overlay + LMDB; no in-flight txns).
-var store = try manifest.openStore(42);
-defer store.deinit();
-const v2 = try store.get(allocator, "key");
+// Reads through the lease see main_overlay + LMDB (no in-flight Txns).
+const v2 = try lease.get(allocator, "key");
 
 // Make everything durable, stamping the raft watermark atomically.
 try manifest.durabilize(current_raft_idx);
-// `commit()` is the alias for `durabilize(0)` — flushes without
+// `flush()` is the alias for `durabilize(0)` — flushes without
 // disturbing the watermark.
 ```
 
@@ -122,27 +133,33 @@ try manifest.durabilize(current_raft_idx);
 pub fn init(self, allocator, path: [:0]const u8, options: InitOptions) !void
 pub fn deinit(self) void
 
-// Stores (buffered lifecycle).
+// Stores (buffered lifecycle). dropStore blocks on the dispatch_lock
+// while any lease is held for that tenant.
 pub fn createStore(self, id) !void
 pub fn dropStore(self, id) !bool
 pub fn hasStore(self, id) !bool
 pub fn listStores(self, allocator) ![]u64
 
-// Writes: go through a Txn. Reads-only: openStore.
-pub fn beginTxn(self, tenant_id) !*Txn
-pub fn openStore(self, tenant_id) !Store
+// Per-tenant dispatch lease — exclusive holder for writes + reads.
+pub fn acquire(self, tenant_id) !StoreLease       // blocks
+pub fn tryAcquire(self, tenant_id) !?StoreLease   // null if held
 
 // Commit + recovery.
 pub fn durabilize(self, raft_idx: u64) !void   // raft_idx=0 ↦ don't touch watermark
-pub fn commit(self) !void                       // alias: durabilize(0)
+pub fn flush(self) !void                        // alias: durabilize(0)
 pub fn durableRaftIdx(self) !u64
 pub fn openSnapshot(self) !Snapshot
 
-// Health / admin.
+// Health.
 pub fn isPoisoned(self) bool
-pub fn verify(self, allocator) !VerifyReport
 
-// Txn (returned by beginTxn or by .savepoint()).
+// StoreLease (returned by acquire / tryAcquire).
+pub fn beginTxn(self) !*Txn        // opens a Txn at chain tail
+pub fn get(self, allocator, key) !?[]u8           // main_overlay + LMDB
+pub fn scanPrefix(self, prefix) !TxnPrefixCursor  // main_overlay + LMDB
+pub fn release(self) void          // drops dispatch_lock; Txns survive
+
+// Txn (returned by lease.beginTxn or by .savepoint()).
 pub fn put(self, key, value) !void
 pub fn delete(self, key) !bool
 pub fn get(self, allocator, key) !?[]u8
@@ -152,10 +169,6 @@ pub fn commit(self) !void          // top-level must be chain head;
                                    // savepoint merges into parent
 pub fn rollback(self) void         // top-level cascades to successors;
                                    // savepoint drops self + nested
-
-// Store (read-only).
-pub fn get(self, allocator, key) !?[]u8
-pub fn scanPrefix(self, prefix) !StorePrefixCursor
 
 // Snapshot (point-in-time read txn + captured main_overlay).
 pub fn close(self) void
@@ -190,10 +203,11 @@ The recipes below walk a raft integration end-to-end:
 
 ### 1. Leader speculative apply (optimistic per-tenant writes)
 
-Open a Txn per request. Don't wait for raft — continue to the next
-request, opening a new Txn at the tail of the chain. Responses gate
-on raft commit; commits gate on raft commit; rollback drops on raft
-reject. Workers on different tenants run completely independently.
+Acquire the per-tenant lease, open a Txn under it, dispatch, release.
+The lease serializes dispatchers per tenant; different tenants run
+fully in parallel. Don't wait for raft — release the lease and pick up
+the next request. The Txn stays in the chain until raft commits or
+rejects it.
 
 ```zig
 const Pending = struct {
@@ -206,12 +220,15 @@ var pending: std.fifo.LinearFifo(Pending, .Dynamic) =
     std.fifo.LinearFifo(Pending, .Dynamic).init(allocator);
 var latest_committed: u64 = 0;
 
-/// Per-tenant worker loop. One worker per tenant at a time; different
-/// tenants in parallel.
-fn workerLoop(manifest: *kvexp.Manifest, tenant_id: u64) !void {
+/// Workers pull off a shared request queue; the lease enforces
+/// per-tenant serialization at acquire time.
+fn workerLoop(manifest: *kvexp.Manifest) !void {
     while (true) {
-        const request = try requestQueue(tenant_id).pop();
-        var txn = try manifest.beginTxn(tenant_id);
+        const request = try requestQueue.pop();    // any tenant
+
+        var lease = try manifest.acquire(request.tenant_id);
+        defer lease.release();
+        var txn = try lease.beginTxn();
         errdefer txn.rollback();
         try runHandler(txn, request);    // handler reads its own writes
         const raft_idx = try raft.propose(request.payload);
@@ -220,6 +237,7 @@ fn workerLoop(manifest: *kvexp.Manifest, tenant_id: u64) !void {
             .raft_idx = raft_idx,
             .request = request,
         });
+        // lease released here; Txn lives on until onRaftCommit
     }
 }
 
@@ -262,12 +280,14 @@ fn runHandler(txn: *kvexp.Txn, request: Request) !void {
 Key invariants:
 
 - A response only releases after `onRaftCommit` for its `raft_idx`.
-- Each Txn's writes are **invisible to siblings** — when worker pulls
-  request K+1, that handler opens its own Txn, but it does see K's
-  writes (chain reads backward to K). What it does NOT see is its own
-  later writes or any other tenant's Txns.
-- `Txn.commit` is gated to chain head; if a worker forgets to call
-  `onRaftCommit` in order, commits return `error.NotChainHead`.
+- Each Txn's writes are **invisible to siblings** — when a worker
+  picks up request K+1 and opens its own Txn, it sees K's writes
+  (chain reads backward to K). It does NOT see its own later writes
+  or any other tenant's Txns.
+- `Txn.commit` is gated to chain head; with the lease in place this
+  is impossible to hit through normal dispatch (the lease serializes
+  acquires). `error.NotChainHead` is a defensive check for out-of-
+  order callers.
 
 ### 2. Leader switch (rollback after losing leadership)
 
@@ -398,7 +418,9 @@ fn applyEntry(manifest: *kvexp.Manifest, entry: RaftEntry) !void {
         .create_store => { try manifest.createStore(ws.tenant_id); },
         .drop_store   => { _ = try manifest.dropStore(ws.tenant_id); },
         .writeset     => {
-            var txn = try manifest.beginTxn(ws.tenant_id);
+            var lease = try manifest.acquire(ws.tenant_id);
+            defer lease.release();
+            var txn = try lease.beginTxn();
             errdefer txn.rollback();
             for (ws.ops) |op| switch (op.kind) {
                 .put    => try txn.put(op.key, op.value),
@@ -446,14 +468,22 @@ fn shutdown(manifest: *kvexp.Manifest) !void {
 
 | Lock | Purpose |
 |---|---|
+| `TenantState.dispatch_lock` (per-tenant) | application-level lease; held by the current `StoreLease` holder across many calls |
 | `Manifest.dbis_lock` | durable lifecycle: dbis + pending_creates + pending_drops |
 | `Manifest.tenants_lock` | tenants map (top-level lookup only; per-tenant work uses the tenant's own lock) |
 | `TenantState.lock` (per-tenant) | this tenant's main_overlay + open Txn chain + savepoint substructure |
 | `Manifest.durabilize_lock` | single-caller for durabilize + openSnapshot |
 
+Lock order: **dispatch_lock → durabilize_lock → dbis_lock →
+tenants_lock → TenantState.lock**. The dispatch lock sits at the top
+because the application holds it across many kvexp calls; internal
+locks are taken below it and released before returning.
+
 Writers on different tenants share no lock. Per-tenant Txn operations
-serialize through that tenant's lock. `durabilize` iterates tenants
-and grabs each TenantState lock briefly to swap its main_overlay.
+serialize through the lease (acquire) and then take TenantState.lock
+briefly for the chain mutation. `durabilize` and `openSnapshot` grab
+each TenantState lock briefly to swap / capture `main_overlay` —
+they do not contend with lease holders.
 
 ## Failure modes
 
@@ -467,11 +497,17 @@ and grabs each TenantState lock briefly to swap its main_overlay.
 - **Disk full / mmap exhausted.** LMDB commits fail; `durabilize`
   poisons. Set `max_map_size` large up front (sparse mmap; only
   touched pages cost RAM).
-- **Use-after-drop**: calling `Txn.put` (or anything) on a Txn whose
-  tenant was just dropped is undefined. `dropStore` proactively frees
-  open Txn memory for that tenant; the caller is expected to drop its
-  handles to those Txns. Don't drop a tenant while another thread
-  holds a Txn into it.
+- **Drop while leased.** `dropStore` blocks on the per-tenant
+  dispatch lock; if a worker holds a `StoreLease`, drop waits. Once
+  drop returns, the chain has been torn down and subsequent `acquire`
+  on that id returns `error.StoreNotFound`. Caveat: a single thread
+  must not call `dropStore` on a tenant whose lease it currently holds
+  (would self-deadlock — release the lease first).
+- **Use-after-drop on stale Txn pointers.** If you obtained a Txn,
+  released the lease, and another thread dropped the tenant, that
+  Txn's memory is freed; using it is undefined. Either keep the lease
+  while the Txn is open, or ensure drops happen only when no Txns are
+  outstanding.
 
 ## Limitations
 
@@ -493,8 +529,8 @@ and grabs each TenantState lock briefly to swap its main_overlay.
 src/
   lmdb.zig          Thin Zig wrapper over the LMDB C API.
   overlay.zig       Per-Txn / per-tenant write buffer (memtable).
-  manifest.zig      Manifest, Txn, Store, Snapshot, prefix cursors,
-                    dumpSnapshot / loadSnapshot.
+  manifest.zig      Manifest, StoreLease, Txn, Snapshot, prefix
+                    cursors, dumpSnapshot / loadSnapshot.
   root.zig          Public re-exports.
 ```
 
