@@ -3024,6 +3024,114 @@ test "Failure: durabilize MapFull poisons manifest; reopen recovers durable pref
     // None of the post-anchor keys made it.
     try testing.expect((try lease.get(testing.allocator, "k00000000000000")) == null);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Fuzz tests for loadSnapshot. Snapshots arrive over the network from
+// other raft nodes, so the parser is in untrusted-input territory.
+// Goal: any byte sequence must either parse cleanly or return a
+// well-defined error — never panic, never UAF, never infinite-loop.
+// ───────────────────────────────────────────────────────────────────────────
+
+test "Fuzz: loadSnapshot handles random bytes without panicking" {
+    var rng_state = std.Random.DefaultPrng.init(0xfa11f00d);
+    const rng = rng_state.random();
+    var iter: usize = 0;
+    while (iter < 200) : (iter += 1) {
+        var h = try Harness.init();
+        defer h.deinit();
+        const len = rng.intRangeAtMost(usize, 0, 1024);
+        const data = try testing.allocator.alloc(u8, len);
+        defer testing.allocator.free(data);
+        rng.bytes(data);
+        var stream = std.io.fixedBufferStream(data);
+        _ = loadSnapshot(h.manifest, stream.reader()) catch {};
+    }
+}
+
+test "Fuzz: loadSnapshot handles perturbed valid snapshots without panicking" {
+    // Build one valid snapshot, then mutate small numbers of random
+    // bytes in copies of it. This is far more likely to get past the
+    // magic + version check and exercise the inner per-KV parsing
+    // paths than fully random bytes.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    {
+        var src = try Harness.init();
+        defer src.deinit();
+        try src.manifest.createStore(1);
+        try src.manifest.createStore(2);
+        {
+            var t = try src.quickTxn(1);
+            try t.put("alpha", "one");
+            try t.put("bravo", "two");
+            try t.commit();
+        }
+        {
+            var t = try src.quickTxn(2);
+            try t.put("xray", "X");
+            try t.commit();
+        }
+        try src.manifest.durabilize(99);
+        var snap = try src.manifest.openSnapshot();
+        defer snap.close();
+        var w = buf.writer(testing.allocator);
+        try dumpSnapshot(&snap, &w);
+    }
+
+    var rng_state = std.Random.DefaultPrng.init(0xb16b00b5);
+    const rng = rng_state.random();
+    var iter: usize = 0;
+    while (iter < 300) : (iter += 1) {
+        const data = try testing.allocator.dupe(u8, buf.items);
+        defer testing.allocator.free(data);
+        // Flip 1–8 random bytes.
+        const n_perturb = rng.intRangeAtMost(usize, 1, 8);
+        var p: usize = 0;
+        while (p < n_perturb) : (p += 1) {
+            const idx = rng.intRangeLessThan(usize, 0, data.len);
+            data[idx] = rng.int(u8);
+        }
+        var h = try Harness.init();
+        defer h.deinit();
+        var stream = std.io.fixedBufferStream(data);
+        _ = loadSnapshot(h.manifest, stream.reader()) catch {};
+    }
+}
+
+test "Fuzz: loadSnapshot handles truncated snapshots without panicking" {
+    // Build a valid snapshot, then feed every possible prefix length.
+    // Catches off-by-one mistakes in the parser's bounds checking
+    // (e.g. reading klen but not the key bytes).
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    {
+        var src = try Harness.init();
+        defer src.deinit();
+        try src.manifest.createStore(1);
+        {
+            var t = try src.quickTxn(1);
+            try t.put("k", "v");
+            try t.put("key2", "longer-value");
+            try t.commit();
+        }
+        try src.manifest.durabilize(7);
+        var snap = try src.manifest.openSnapshot();
+        defer snap.close();
+        var w = buf.writer(testing.allocator);
+        try dumpSnapshot(&snap, &w);
+    }
+
+    var trunc: usize = 0;
+    while (trunc <= buf.items.len) : (trunc += 1) {
+        var h = try Harness.init();
+        defer h.deinit();
+        var stream = std.io.fixedBufferStream(buf.items[0..trunc]);
+        _ = loadSnapshot(h.manifest, stream.reader()) catch {};
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Multi-threaded property test: N workers race on M pre-created tenants
 // while a checkpointer thread periodically durabilizes. Each commit (and
 // the checkpointer's "snapshot model" step) is coordinated by an RwLock so
 // the captured durable_model accurately reflects what survives a cycle.
