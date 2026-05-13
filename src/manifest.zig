@@ -179,19 +179,22 @@ pub const Manifest = struct {
         self.dbis.deinit(self.allocator);
         self.pending_creates.deinit(self.allocator);
         self.pending_drops.deinit(self.allocator);
-        // Free every tenant's state including any open chain / overlays.
+        // Drop every tenant's chain (Txns) and then drop the map's
+        // reference to each TenantState. If a caller leaked a lease
+        // past deinit, the TenantState lingers (refcount > 1) — that's
+        // a caller bug; we prefer the leak to a UAF.
         var it = self.tenants.iterator();
         while (it.next()) |entry| {
             const ts = entry.value_ptr.*;
-            // Free all txns in the chain (and their savepoint subtrees).
             var cur = ts.chain_head;
             while (cur) |c| {
                 const next = c.chain_next;
                 c.freeSubtreeLocked();
                 cur = next;
             }
-            ts.main_overlay.deinit();
-            self.allocator.destroy(ts);
+            ts.chain_head = null;
+            ts.chain_tail = null;
+            ts.releaseRef(self.allocator);
         }
         self.tenants.deinit(self.allocator);
     }
@@ -233,17 +236,28 @@ pub const Manifest = struct {
     pub fn dropStore(self: *Manifest, id: u64) !bool {
         try self.checkAlive();
 
-        // Block on the per-tenant dispatch lock if a lease holder
-        // is active. Drop happens with that lock held so that we can
-        // tear the chain down safely; subsequent acquire(id) will
-        // see hasStore == false and fail.
+        // Remove the tenants-map entry up front so concurrent acquires
+        // start fresh TenantStates (and so we can free this one once
+        // every outstanding lease releases). We hold a transient
+        // reference to the removed ts via `ts_for_drop`; the defer at
+        // the bottom drops that reference, and if no lease holder is
+        // outstanding, the TenantState is freed there.
+        const ts_for_drop: ?*TenantState = blk: {
+            self.tenants_lock.lock();
+            defer self.tenants_lock.unlock();
+            const kv = self.tenants.fetchRemove(id) orelse break :blk null;
+            break :blk kv.value;
+        };
+        defer if (ts_for_drop) |ts| ts.releaseRef(self.allocator);
+
+        // Wait for any active lease holder. After this lock, no other
+        // dispatch path can be operating on this ts.
         //
         // Callers must not hold a lease on `id` from the same thread
         // (would self-deadlock). Per-thread caveat documented in the
         // README.
-        const ts_opt = self.lookupTenantState(id);
-        if (ts_opt) |ts| ts.dispatch_lock.lock();
-        defer if (ts_opt) |ts| ts.dispatch_lock.unlock();
+        if (ts_for_drop) |ts| ts.dispatch_lock.lock();
+        defer if (ts_for_drop) |ts| ts.dispatch_lock.unlock();
 
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
@@ -251,45 +265,34 @@ pub const Manifest = struct {
 
         // Cancel a pending_create that hasn't been durabilized yet.
         if (self.pending_creates.remove(id)) {
-            try self.clearTenantStateLocked(id);
             // If the store is also durable (a drop-recreate-drop cycle
             // on the same id), the underlying durable DBI also needs
             // emptying at next durabilize.
             if (self.dbis.contains(id)) {
                 try self.pending_drops.put(self.allocator, id, {});
             }
-            return true;
+        } else {
+            // Durable store: queue the drop.
+            try self.pending_drops.put(self.allocator, id, {});
         }
 
-        // Durable store: queue the drop.
-        try self.pending_drops.put(self.allocator, id, {});
-        try self.clearTenantStateLocked(id);
+        // Tear down the chain + clear main_overlay. Callers holding
+        // pointers to these Txns now hold dangling pointers — the
+        // explicit-drop-from-under-you case documented in the README.
+        if (ts_for_drop) |ts| {
+            ts.lock.lock();
+            defer ts.lock.unlock();
+            var cur = ts.chain_head;
+            while (cur) |c| {
+                const next = c.chain_next;
+                c.freeSubtreeLocked();
+                cur = next;
+            }
+            ts.chain_head = null;
+            ts.chain_tail = null;
+            ts.main_overlay.clear();
+        }
         return true;
-    }
-
-    /// Called from dropStore. Walks the tenant's open chain (rolling
-    /// back each Txn) and clears its main_overlay. Caller holds
-    /// dbis_lock; we take tenants_lock + tenant_state lock briefly.
-    fn clearTenantStateLocked(self: *Manifest, id: u64) !void {
-        self.tenants_lock.lock();
-        defer self.tenants_lock.unlock();
-        const ts = self.tenants.get(id) orelse return;
-        ts.lock.lock();
-        defer ts.lock.unlock();
-
-        // Drop every open Txn (and their savepoint subtrees). Callers
-        // holding pointers to these Txns now hold dangling pointers
-        // — they should have been the ones to roll back. This is the
-        // explicit-drop-from-under-you case for dropStore.
-        var cur = ts.chain_head;
-        while (cur) |c| {
-            const next = c.chain_next;
-            c.freeSubtreeLocked();
-            cur = next;
-        }
-        ts.chain_head = null;
-        ts.chain_tail = null;
-        ts.main_overlay.clear();
     }
 
     pub fn hasStore(self: *Manifest, id: u64) !bool {
@@ -332,7 +335,10 @@ pub const Manifest = struct {
     fn getOrCreateTenantState(self: *Manifest, id: u64) !*TenantState {
         self.tenants_lock.lock();
         defer self.tenants_lock.unlock();
-        if (self.tenants.get(id)) |ts| return ts;
+        if (self.tenants.get(id)) |ts| {
+            ts.retain();
+            return ts;
+        }
         // Allocate the TenantState before inserting the map entry so a
         // mid-create OOM can't leave the map with a slot whose
         // value_ptr is undefined. (And we crash hard on OOM here
@@ -341,15 +347,12 @@ pub const Manifest = struct {
         const ts = self.allocator.create(TenantState) catch
             @panic("OOM allocating TenantState");
         ts.* = .{ .main_overlay = Overlay.init(self.allocator) };
+        // refcount initialized to 1 (the map's reference); retain once
+        // more for the caller.
+        ts.retain();
         self.tenants.put(self.allocator, id, ts) catch
             @panic("OOM inserting TenantState into tenants map");
         return ts;
-    }
-
-    fn lookupTenantState(self: *Manifest, id: u64) ?*TenantState {
-        self.tenants_lock.lock();
-        defer self.tenants_lock.unlock();
-        return self.tenants.get(id);
     }
 
     // ── acquire / tryAcquire ────────────────────────────────────────
@@ -369,6 +372,9 @@ pub const Manifest = struct {
         try self.checkAlive();
         if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
         const ts = try self.getOrCreateTenantState(tenant_id);
+        // ts is retained for us; if we exit without producing a lease,
+        // we must drop that reference.
+        errdefer ts.releaseRef(self.allocator);
         ts.dispatch_lock.lock();
         return .{
             .manifest = self,
@@ -383,7 +389,11 @@ pub const Manifest = struct {
         try self.checkAlive();
         if (!try self.hasStore(tenant_id)) return error.StoreNotFound;
         const ts = try self.getOrCreateTenantState(tenant_id);
-        if (!ts.dispatch_lock.tryLock()) return null;
+        errdefer ts.releaseRef(self.allocator);
+        if (!ts.dispatch_lock.tryLock()) {
+            ts.releaseRef(self.allocator);
+            return null;
+        }
         return StoreLease{
             .manifest = self,
             .tenant_id = tenant_id,
@@ -633,6 +643,27 @@ const TenantState = struct {
     main_overlay: Overlay,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
+
+    /// Refcount = (1 if still in Manifest.tenants) + (1 per outstanding
+    /// StoreLease). dropStore removes the map entry and drops the
+    /// map's reference; the last lease holder's release() then frees.
+    /// This is what lets dropStore reclaim memory without UAFing
+    /// concurrent acquires that are between getOrCreateTenantState
+    /// and dispatch_lock.lock().
+    refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    fn retain(self: *TenantState) void {
+        _ = self.refcount.fetchAdd(1, .acq_rel);
+    }
+
+    /// Drop a reference. If we were the last, free the TenantState.
+    /// Caller must not be holding any of this TenantState's locks.
+    fn releaseRef(self: *TenantState, allocator: std.mem.Allocator) void {
+        if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+            self.main_overlay.deinit();
+            allocator.destroy(self);
+        }
+    }
 };
 
 // ─── Txn ────────────────────────────────────────────────────────────
@@ -1224,7 +1255,14 @@ pub const StoreLease = struct {
     /// Drop the dispatch lock. Required. Any Txns this lease opened
     /// remain in the chain until their own commit / rollback.
     pub fn release(self: *StoreLease) void {
-        self.tenant_state.dispatch_lock.unlock();
+        const ts = self.tenant_state;
+        const allocator = self.manifest.allocator;
+        ts.dispatch_lock.unlock();
+        // Drop the reference we took in acquire / tryAcquire. If this
+        // tenant was dropped (so the tenants map no longer holds a
+        // reference) and we were the last lease holder, this frees
+        // the TenantState.
+        ts.releaseRef(allocator);
         self.* = undefined;
     }
 };
