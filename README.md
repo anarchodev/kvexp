@@ -189,7 +189,14 @@ error.NotChainHead            // commit a non-head top-level Txn
 error.SavepointStillOpen      // commit/write a Txn with an open child
 error.InvalidSnapshotFormat
 error.UnsupportedSnapshotVersion
+error.OverlayCapExceeded      // put would exceed max_overlay_bytes_per_store
 ```
+
+`InitOptions.max_overlay_bytes_per_store` (default 0 = unlimited)
+puts a per-tenant ceiling on the combined `main_overlay + active-Txn
+overlay` size. When a `Txn.put` would push the tenant over the cap, it
+returns `error.OverlayCapExceeded` without mutating state — backpressure
+becomes the host's call (typically rollback → `durabilize` → retry).
 
 ## Recipes
 

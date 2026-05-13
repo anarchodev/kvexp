@@ -54,6 +54,14 @@ pub const Overlay = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMapUnmanaged(OverlayEntry) = .empty,
     lock: std.Thread.Mutex = .{},
+    /// Sum of `key.len + value.len` for every `.value` entry, plus
+    /// `key.len` for every `.tombstone`. Tombstones don't count value
+    /// bytes (they don't store any) but they do count their key
+    /// allocation. Maintained inline by put/tombstone/clear/moveInto;
+    /// callers reach for this via `Manifest.max_overlay_bytes_per_store`
+    /// to back-pressure tenants that would otherwise grow the overlay
+    /// unboundedly between durabilizes.
+    bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Overlay {
         return .{ .allocator = allocator };
@@ -77,6 +85,7 @@ pub const Overlay = struct {
             }
         }
         self.entries.clearRetainingCapacity();
+        self.bytes = 0;
     }
 
     /// Insert or replace `key → value`. Both slices are cloned into
@@ -92,16 +101,21 @@ pub const Overlay = struct {
             @panic("OOM in Overlay.putLocked.getOrPut");
         if (gop.found_existing) {
             switch (gop.value_ptr.*) {
-                .value => |old| self.allocator.free(old),
+                .value => |old| {
+                    self.bytes -= old.len;
+                    self.allocator.free(old);
+                },
                 .tombstone => {},
             }
         } else {
             // New key: clone the bytes so the hashmap owns them.
             gop.key_ptr.* = self.allocator.dupe(u8, key) catch
                 @panic("OOM in Overlay.putLocked duping key");
+            self.bytes += key.len;
         }
         gop.value_ptr.* = .{ .value = self.allocator.dupe(u8, value) catch
             @panic("OOM in Overlay.putLocked duping value") };
+        self.bytes += value.len;
     }
 
     /// Mark `key` deleted. Frees any prior value bytes; keeps the key
@@ -111,12 +125,16 @@ pub const Overlay = struct {
             @panic("OOM in Overlay.tombstoneLocked.getOrPut");
         if (gop.found_existing) {
             switch (gop.value_ptr.*) {
-                .value => |old| self.allocator.free(old),
+                .value => |old| {
+                    self.bytes -= old.len;
+                    self.allocator.free(old);
+                },
                 .tombstone => {},
             }
         } else {
             gop.key_ptr.* = self.allocator.dupe(u8, key) catch
                 @panic("OOM in Overlay.tombstoneLocked duping key");
+            self.bytes += key.len;
         }
         gop.value_ptr.* = .tombstone;
     }
@@ -144,6 +162,10 @@ pub const Overlay = struct {
         while (it.next()) |e| {
             const k = e.key_ptr.*;
             const v = e.value_ptr.*;
+            const src_v_bytes: usize = switch (v) {
+                .value => |val| val.len,
+                .tombstone => 0,
+            };
             const gop = dest.entries.getOrPut(dest.allocator, k) catch
                 @panic("OOM in Overlay.moveInto.getOrPut");
             if (gop.found_existing) {
@@ -152,17 +174,23 @@ pub const Overlay = struct {
                 // our value.
                 src.allocator.free(k);
                 switch (gop.value_ptr.*) {
-                    .value => |old| dest.allocator.free(old),
+                    .value => |old| {
+                        dest.bytes -= old.len;
+                        dest.allocator.free(old);
+                    },
                     .tombstone => {},
                 }
+                dest.bytes += src_v_bytes;
                 gop.value_ptr.* = v;
             } else {
                 // Transfer src's key and value into dest verbatim.
                 gop.key_ptr.* = k;
                 gop.value_ptr.* = v;
+                dest.bytes += k.len + src_v_bytes;
             }
         }
         src.entries.clearRetainingCapacity();
+        src.bytes = 0;
     }
 
     /// True iff the overlay has no entries (use to skip durabilize-time

@@ -68,6 +68,22 @@ pub const InitOptions = struct {
     max_map_size: usize = 16 * 1024 * 1024 * 1024,
     no_meta_sync: bool = false,
     no_sync: bool = false,
+    /// Per-store cap on the *combined* size, in bytes, of the durable
+    /// store's `main_overlay` plus the current writer's `Txn.overlay`.
+    /// 0 = unlimited (default; pre-cap behavior).
+    ///
+    /// Enforced at `Txn.put`: if adding this key+value would push the
+    /// (main_overlay.bytes + this_txn.overlay.bytes) sum over the cap,
+    /// the put returns `error.OverlayCapExceeded` *without* mutating
+    /// state. Host policy then chooses the response — typically
+    /// rollback this Txn, run a durabilize to drain main_overlay, and
+    /// retry. Backpressure becomes the application's call.
+    ///
+    /// Conservative: doesn't account for in-flight *sibling* Txns on
+    /// the same tenant (the chain), and doesn't account for dedup
+    /// against existing entries (overwrites are counted as additions
+    /// against the cap). Tighten in a follow-up if needed.
+    max_overlay_bytes_per_store: usize = 0,
 };
 
 pub const SpecificError = error{
@@ -81,6 +97,10 @@ pub const SpecificError = error{
     /// Tried to commit/rollback a Txn that has an open savepoint
     /// child. Close the inner one first (LIFO).
     SavepointStillOpen,
+    /// Put would push this tenant's in-memory overlay over the
+    /// configured `max_overlay_bytes_per_store`. Caller should
+    /// rollback + durabilize + retry, or drop the request.
+    OverlayCapExceeded,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
@@ -374,6 +394,9 @@ pub const Manifest = struct {
     /// but reading them individually is not coordinated across fields.
     metrics: Metrics = .{},
 
+    /// See `InitOptions.max_overlay_bytes_per_store`. 0 = unlimited.
+    max_overlay_bytes_per_store: usize = 0,
+
     pub fn init(
         self: *Manifest,
         allocator: std.mem.Allocator,
@@ -385,6 +408,7 @@ pub const Manifest = struct {
             .env = undefined,
             .meta_dbi = undefined,
             .stores_dbi = undefined,
+            .max_overlay_bytes_per_store = options.max_overlay_bytes_per_store,
         };
         self.env = try lmdb.Env.open(path, .{
             .max_dbs = options.max_stores + 2,
@@ -744,6 +768,7 @@ pub const Manifest = struct {
             }
             const taken = t.ts.main_overlay.entries;
             t.ts.main_overlay.entries = .empty;
+            t.ts.main_overlay.bytes = 0; // bytes lived in `entries`, now in `taken`
             t.ts.lock.unlock();
             swapped_list.append(self.allocator, .{
                 .id = t.id,
@@ -991,6 +1016,16 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        // Per-store memory cap. Conservative — counts main_overlay +
+        // this Txn's overlay + the new bytes, no dedup credit. The
+        // check has to happen *before* putLocked mutates the overlay
+        // so the caller's state is untouched on rejection.
+        const cap = self.manifest.max_overlay_bytes_per_store;
+        if (cap != 0) {
+            const projected = self.tenant_state.main_overlay.bytes +
+                self.overlay.bytes + key.len + value.len;
+            if (projected > cap) return error.OverlayCapExceeded;
+        }
         self.overlay.putLocked(key, value);
         self.manifest.metrics.recordPut(key.len + value.len);
     }
@@ -3130,7 +3165,116 @@ test "Fuzz: loadSnapshot handles truncated snapshots without panicking" {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
+test "OverlayCap: put rejected past the cap; durabilize drains and unblocks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/cap.mdb", .{dir_path});
+    defer testing.allocator.free(tmp_path);
+    const path = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(path);
+
+    // Tight per-store cap. With ~100 B values + 4 B keys, that's
+    // headroom for ~9 entries before the 10th is rejected.
+    const cap: usize = 1024;
+
+    var mf: Manifest = undefined;
+    try mf.init(testing.allocator, path, .{
+        .max_map_size = 4 * 1024 * 1024,
+        .max_stores = 16,
+        .max_overlay_bytes_per_store = cap,
+    });
+    defer mf.deinit();
+    try mf.createStore(1);
+    try mf.flush();
+
+    // Fill up close to but under the cap; commits land in main_overlay.
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        const value = [_]u8{0xAB} ** 100;
+        var key_buf: [4]u8 = undefined;
+        var i: u32 = 0;
+        // 9 entries × (4 + 100) = 936 bytes ≤ 1024 cap.
+        while (i < 9) : (i += 1) {
+            var t = try lease.beginTxn();
+            const key = try std.fmt.bufPrint(&key_buf, "{x:0>4}", .{i});
+            try t.put(key, &value);
+            try t.commit();
+        }
+    }
+
+    // Next put would push us to 1040 > 1024. Expect rejection.
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        defer t.rollback();
+        const value = [_]u8{0xAB} ** 100;
+        const result = t.put("ffff", &value);
+        try testing.expectError(error.OverlayCapExceeded, result);
+    }
+
+    // Durabilize drains main_overlay → 0 bytes used. Next put succeeds.
+    try mf.flush();
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        const value = [_]u8{0xAB} ** 100;
+        try t.put("ffff", &value);
+        try t.commit();
+    }
+}
+
+test "OverlayCap: cap counts main_overlay + this txn's overlay together" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/cap.mdb", .{dir_path});
+    defer testing.allocator.free(tmp_path);
+    const path = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(path);
+
+    var mf: Manifest = undefined;
+    try mf.init(testing.allocator, path, .{
+        .max_map_size = 4 * 1024 * 1024,
+        .max_stores = 16,
+        .max_overlay_bytes_per_store = 512,
+    });
+    defer mf.deinit();
+    try mf.createStore(1);
+    try mf.flush();
+
+    // Land 400 bytes in main_overlay (4 keys × 100B values + 4B keys = 416B).
+    {
+        var lease = try mf.acquire(1);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        const value = [_]u8{0xAB} ** 100;
+        var i: u32 = 0;
+        while (i < 4) : (i += 1) {
+            var key_buf: [4]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "{x:0>4}", .{i});
+            try t.put(key, &value);
+        }
+        try t.commit();
+    }
+
+    // Now open a Txn. main_overlay = 416 B, cap = 512 B → 96 B headroom.
+    // One more 104-byte put would put us at 520 > 512. Reject.
+    var lease = try mf.acquire(1);
+    defer lease.release();
+    var t = try lease.beginTxn();
+    defer t.rollback();
+    const value = [_]u8{0xAB} ** 100;
+    try testing.expectError(error.OverlayCapExceeded, t.put("0099", &value));
+
+    // A much smaller put fits: 4B key + 1B value = 5B. 416 + 5 = 421 ≤ 512.
+    try t.put("xx99", "z");
+}
 // Multi-threaded property test: N workers race on M pre-created tenants
 // while a checkpointer thread periodically durabilizes. Each commit (and
 // the checkpointer's "snapshot model" step) is coordinated by an RwLock so
