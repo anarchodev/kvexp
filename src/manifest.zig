@@ -169,7 +169,8 @@ pub const Manifest = struct {
                 var name_buf: [19]u8 = undefined;
                 const name = storeDbiName(id, &name_buf);
                 const dbi = try txn.openDbi(name, false);
-                try self.dbis.put(self.allocator, id, dbi);
+                self.dbis.put(self.allocator, id, dbi) catch
+                    @panic("OOM populating dbis map at init");
             }
             try txn.commit();
         }
@@ -230,7 +231,8 @@ pub const Manifest = struct {
         self.dbis_lock.lock();
         defer self.dbis_lock.unlock();
         if (self.hasStoreLocked(id)) return error.StoreAlreadyExists;
-        try self.pending_creates.put(self.allocator, id, {});
+        self.pending_creates.put(self.allocator, id, {}) catch
+            @panic("OOM in createStore.pending_creates.put");
     }
 
     pub fn dropStore(self: *Manifest, id: u64) !bool {
@@ -269,11 +271,13 @@ pub const Manifest = struct {
             // on the same id), the underlying durable DBI also needs
             // emptying at next durabilize.
             if (self.dbis.contains(id)) {
-                try self.pending_drops.put(self.allocator, id, {});
+                self.pending_drops.put(self.allocator, id, {}) catch
+                    @panic("OOM in dropStore.pending_drops.put");
             }
         } else {
             // Durable store: queue the drop.
-            try self.pending_drops.put(self.allocator, id, {});
+            self.pending_drops.put(self.allocator, id, {}) catch
+                @panic("OOM in dropStore.pending_drops.put");
         }
 
         // Tear down the chain + clear main_overlay. Callers holding
@@ -418,11 +422,13 @@ pub const Manifest = struct {
             self.dbis_lock.lock();
             defer self.dbis_lock.unlock();
             var pc_it = self.pending_creates.keyIterator();
-            while (pc_it.next()) |id_ptr| try creates_to_apply.append(self.allocator, id_ptr.*);
+            while (pc_it.next()) |id_ptr| creates_to_apply.append(self.allocator, id_ptr.*) catch
+                @panic("OOM building creates_to_apply in durabilize");
             var pd_it = self.pending_drops.keyIterator();
             while (pd_it.next()) |id_ptr| {
                 const dbi = self.dbis.get(id_ptr.*) orelse continue;
-                try drops_to_apply.append(self.allocator, .{ .id = id_ptr.*, .dbi = dbi });
+                drops_to_apply.append(self.allocator, .{ .id = id_ptr.*, .dbi = dbi }) catch
+                    @panic("OOM building drops_to_apply in durabilize");
             }
         }
 
@@ -435,10 +441,10 @@ pub const Manifest = struct {
             defer self.tenants_lock.unlock();
             var it = self.tenants.iterator();
             while (it.next()) |entry| {
-                try tenant_pairs.append(self.allocator, .{
+                tenant_pairs.append(self.allocator, .{
                     .id = entry.key_ptr.*,
                     .ts = entry.value_ptr.*,
-                });
+                }) catch @panic("OOM building tenant_pairs in durabilize");
             }
         }
 
@@ -471,10 +477,10 @@ pub const Manifest = struct {
             const taken = t.ts.main_overlay.entries;
             t.ts.main_overlay.entries = .empty;
             t.ts.lock.unlock();
-            try swapped_list.append(self.allocator, .{
+            swapped_list.append(self.allocator, .{
                 .id = t.id,
                 .entries = taken,
-            });
+            }) catch @panic("OOM building swapped_list in durabilize");
         }
 
         // 4. Apply everything in one LMDB write txn.
@@ -495,7 +501,8 @@ pub const Manifest = struct {
             const dbi = try txn.openDbi(name, true);
             var id_key_buf: [8]u8 = undefined;
             try txn.put(self.stores_dbi, encodeStoreIdKey(id, &id_key_buf), &.{});
-            try new_dbis.append(self.allocator, .{ .id = id, .dbi = dbi });
+            new_dbis.append(self.allocator, .{ .id = id, .dbi = dbi }) catch
+                @panic("OOM building new_dbis in durabilize");
         }
 
         for (swapped_list.items) |s| {
@@ -526,7 +533,8 @@ pub const Manifest = struct {
                 _ = self.pending_drops.remove(d.id);
             }
             for (new_dbis.items) |n| {
-                try self.dbis.put(self.allocator, n.id, n.dbi);
+                self.dbis.put(self.allocator, n.id, n.dbi) catch
+                    @panic("OOM in durabilize bookkeeping dbis.put");
                 _ = self.pending_creates.remove(n.id);
             }
         }
@@ -586,10 +594,10 @@ pub const Manifest = struct {
             defer self.tenants_lock.unlock();
             var it = self.tenants.iterator();
             while (it.next()) |entry| {
-                try pairs.append(self.allocator, .{
+                pairs.append(self.allocator, .{
                     .id = entry.key_ptr.*,
                     .ts = entry.value_ptr.*,
-                });
+                }) catch @panic("OOM building tenant pairs in openSnapshot");
             }
         }
         for (pairs.items) |p| {
@@ -607,18 +615,22 @@ pub const Manifest = struct {
                 if (p.ts.main_overlay.entries.count() == 0) continue;
                 var oe_it = p.ts.main_overlay.entries.iterator();
                 while (oe_it.next()) |oe| {
-                    const k = try self.allocator.dupe(u8, oe.key_ptr.*);
-                    errdefer self.allocator.free(k);
+                    const k = self.allocator.dupe(u8, oe.key_ptr.*) catch
+                        @panic("OOM duping overlay key in openSnapshot");
                     const v: ?[]u8 = switch (oe.value_ptr.*) {
-                        .value => |val| try self.allocator.dupe(u8, val),
+                        .value => |val| self.allocator.dupe(u8, val) catch
+                            @panic("OOM duping overlay value in openSnapshot"),
                         .tombstone => null,
                     };
-                    try entries.append(self.allocator, .{ .key = k, .value = v });
+                    entries.append(self.allocator, .{ .key = k, .value = v }) catch
+                        @panic("OOM appending overlay entry in openSnapshot");
                 }
             }
             std.mem.sort(SnapshotEntry, entries.items, {}, SnapshotEntry.lessThan);
-            const slice = try entries.toOwnedSlice(self.allocator);
-            try ov_capture.put(self.allocator, p.id, slice);
+            const slice = entries.toOwnedSlice(self.allocator) catch
+                @panic("OOM materializing overlay slice in openSnapshot");
+            ov_capture.put(self.allocator, p.id, slice) catch
+                @panic("OOM storing overlay slice in openSnapshot");
         }
 
         return .{
@@ -690,7 +702,7 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
-        try self.overlay.putLocked(key, value);
+        self.overlay.putLocked(key, value);
     }
 
     pub fn delete(self: *Txn, key: []const u8) !bool {
@@ -699,7 +711,7 @@ pub const Txn = struct {
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
         const existed = try self.keyExistsLocked(key);
-        try self.overlay.tombstoneLocked(key);
+        self.overlay.tombstoneLocked(key);
         return existed;
     }
 
@@ -798,13 +810,15 @@ pub const Txn = struct {
             }
             entries.deinit(self.manifest.allocator);
         }
-        try entries.ensureTotalCapacity(self.manifest.allocator, ordered_keys.items.len);
+        entries.ensureTotalCapacity(self.manifest.allocator, ordered_keys.items.len) catch
+            @panic("OOM reserving cursor entries");
         for (ordered_keys.items) |k| {
             const v = dedup.get(k).?;
             entries.appendAssumeCapacity(.{ .key = k, .value = v });
         }
         std.mem.sort(TxnPrefixCursor.Entry, entries.items, {}, TxnPrefixCursor.Entry.lessThan);
-        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        const overlay_slice = entries.toOwnedSlice(self.manifest.allocator) catch
+            @panic("OOM materializing cursor overlay slice");
         errdefer {
             for (overlay_slice) |e| {
                 self.manifest.allocator.free(e.key);
@@ -835,7 +849,8 @@ pub const Txn = struct {
             .read_txn = read_txn,
             .lmdb_cur = lmdb_cur,
             .has_lmdb = has_lmdb,
-            .prefix = try self.manifest.allocator.dupe(u8, prefix),
+            .prefix = self.manifest.allocator.dupe(u8, prefix) catch
+                @panic("OOM duping cursor prefix"),
             .have_tree = false,
             .tree_key = &.{},
             .tree_val = &.{},
@@ -857,8 +872,8 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
-        const child = try self.manifest.allocator.create(Txn);
-        errdefer self.manifest.allocator.destroy(child);
+        const child = self.manifest.allocator.create(Txn) catch
+            @panic("OOM allocating savepoint Txn");
         child.* = .{
             .manifest = self.manifest,
             .tenant_id = self.tenant_id,
@@ -885,12 +900,12 @@ pub const Txn = struct {
         if (self.open_child != null) return error.SavepointStillOpen;
         if (self.parent) |parent| {
             // Savepoint commit.
-            try Overlay.moveInto(&self.overlay, &parent.overlay);
+            Overlay.moveInto(&self.overlay, &parent.overlay);
             parent.open_child = null;
         } else {
             // Top-level commit: must be chain head.
             if (ts.chain_head != self) return error.NotChainHead;
-            try Overlay.moveInto(&self.overlay, &ts.main_overlay);
+            Overlay.moveInto(&self.overlay, &ts.main_overlay);
             if (self.chain_next) |next| {
                 next.chain_prev = null;
                 ts.chain_head = next;
@@ -1143,8 +1158,8 @@ pub const StoreLease = struct {
         ts.lock.lock();
         defer ts.lock.unlock();
 
-        const txn = try self.manifest.allocator.create(Txn);
-        errdefer self.manifest.allocator.destroy(txn);
+        const txn = self.manifest.allocator.create(Txn) catch
+            @panic("OOM allocating Txn in beginTxn");
         txn.* = .{
             .manifest = self.manifest,
             .tenant_id = self.tenant_id,
@@ -1201,17 +1216,20 @@ pub const StoreLease = struct {
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
                 if (!std.mem.startsWith(u8, k, prefix)) continue;
-                const k_copy = try self.manifest.allocator.dupe(u8, k);
-                errdefer self.manifest.allocator.free(k_copy);
+                const k_copy = self.manifest.allocator.dupe(u8, k) catch
+                    @panic("OOM duping key in StoreLease.scanPrefix");
                 const v_copy: ?[]u8 = switch (e.value_ptr.*) {
-                    .value => |v| try self.manifest.allocator.dupe(u8, v),
+                    .value => |v| self.manifest.allocator.dupe(u8, v) catch
+                        @panic("OOM duping value in StoreLease.scanPrefix"),
                     .tombstone => null,
                 };
-                try entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy });
+                entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy }) catch
+                    @panic("OOM appending entry in StoreLease.scanPrefix");
             }
         }
         std.mem.sort(TxnPrefixCursor.Entry, entries.items, {}, TxnPrefixCursor.Entry.lessThan);
-        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        const overlay_slice = entries.toOwnedSlice(self.manifest.allocator) catch
+            @panic("OOM materializing slice in StoreLease.scanPrefix");
         errdefer {
             for (overlay_slice) |e| {
                 self.manifest.allocator.free(e.key);
@@ -1239,7 +1257,8 @@ pub const StoreLease = struct {
             .read_txn = read_txn,
             .lmdb_cur = lmdb_cur,
             .has_lmdb = has_lmdb,
-            .prefix = try self.manifest.allocator.dupe(u8, prefix),
+            .prefix = self.manifest.allocator.dupe(u8, prefix) catch
+                @panic("OOM duping prefix in StoreLease.scanPrefix"),
             .overlay = overlay_slice,
             .ov_idx = 0,
             .have_tree = false,
@@ -1333,13 +1352,19 @@ pub const Snapshot = struct {
         if (self.overlays.get(store_id)) |captured| {
             for (captured) |e| {
                 if (!std.mem.startsWith(u8, e.key, prefix)) continue;
-                const k_copy = try self.manifest.allocator.dupe(u8, e.key);
-                errdefer self.manifest.allocator.free(k_copy);
-                const v_copy: ?[]u8 = if (e.value) |v| try self.manifest.allocator.dupe(u8, v) else null;
-                try entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy });
+                const k_copy = self.manifest.allocator.dupe(u8, e.key) catch
+                    @panic("OOM duping key in Snapshot.scanPrefix");
+                const v_copy: ?[]u8 = if (e.value) |v|
+                    (self.manifest.allocator.dupe(u8, v) catch
+                        @panic("OOM duping value in Snapshot.scanPrefix"))
+                else
+                    null;
+                entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy }) catch
+                    @panic("OOM appending entry in Snapshot.scanPrefix");
             }
         }
-        const overlay_slice = try entries.toOwnedSlice(self.manifest.allocator);
+        const overlay_slice = entries.toOwnedSlice(self.manifest.allocator) catch
+            @panic("OOM materializing slice in Snapshot.scanPrefix");
         errdefer {
             for (overlay_slice) |e| {
                 self.manifest.allocator.free(e.key);
@@ -1360,7 +1385,8 @@ pub const Snapshot = struct {
             .allocator = self.manifest.allocator,
             .lmdb_cur = lmdb_cur,
             .has_lmdb = has_lmdb,
-            .prefix = try self.manifest.allocator.dupe(u8, prefix),
+            .prefix = self.manifest.allocator.dupe(u8, prefix) catch
+                @panic("OOM duping prefix in Snapshot.scanPrefix"),
             .overlay = overlay_slice,
             .ov_idx = 0,
             .have_tree = false,
@@ -1597,11 +1623,13 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
                 try reader.readNoEof(key_buf[0..klen]);
                 try reader.readNoEof(val_buf[0..vlen]);
                 if (!(try manifest.hasStore(id))) try manifest.createStore(id);
-                const lease_gop = try leases.getOrPut(manifest.allocator, id);
+                const lease_gop = leases.getOrPut(manifest.allocator, id) catch
+                    @panic("OOM in loadSnapshot.leases.getOrPut");
                 if (!lease_gop.found_existing) {
                     lease_gop.value_ptr.* = try manifest.acquire(id);
                 }
-                const txn_gop = try txns.getOrPut(manifest.allocator, id);
+                const txn_gop = txns.getOrPut(manifest.allocator, id) catch
+                    @panic("OOM in loadSnapshot.txns.getOrPut");
                 if (!txn_gop.found_existing) {
                     txn_gop.value_ptr.* = try lease_gop.value_ptr.beginTxn();
                 }
