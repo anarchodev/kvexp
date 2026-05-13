@@ -753,10 +753,10 @@ pub const Txn = struct {
 
         var cur: ?*Txn = self;
         while (cur) |t| {
-            try absorbOverlayLocked(self.manifest.allocator, &t.overlay, prefix, &dedup, &ordered_keys);
+            absorbOverlayLocked(self.manifest.allocator, &t.overlay, prefix, &dedup, &ordered_keys);
             cur = if (t.parent) |p| p else t.chain_prev;
         }
-        try absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
+        absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
 
         // Materialize sorted slice.
         var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
@@ -921,22 +921,32 @@ fn absorbOverlayLocked(
     prefix: []const u8,
     dedup: *std.StringHashMapUnmanaged(?[]u8),
     ordered_keys: *std.ArrayListUnmanaged([]u8),
-) !void {
+) void {
+    // Internal bookkeeping: panic on OOM rather than propagate. The
+    // caller's `defer dedup.deinit(...)` only frees map storage, not
+    // duped values — and an error path with N-1 successful dupes plus
+    // 1 failure would leak those values. Sidestep the whole class of
+    // problems: kvexp's recovery story is "process dies → raft
+    // replays from durable watermark," so OOM in scan setup means we
+    // crash hard and the host restarts.
     var it = ov.entries.iterator();
     while (it.next()) |e| {
         const k = e.key_ptr.*;
         if (!std.mem.startsWith(u8, k, prefix)) continue;
-        const gop = try dedup.getOrPut(allocator, k);
+        const gop = dedup.getOrPut(allocator, k) catch
+            @panic("OOM in absorbOverlayLocked.getOrPut");
         if (gop.found_existing) continue;
-        const key_copy = try allocator.dupe(u8, k);
-        errdefer allocator.free(key_copy);
+        const key_copy = allocator.dupe(u8, k) catch
+            @panic("OOM duping key in absorbOverlayLocked");
         const val_copy: ?[]u8 = switch (e.value_ptr.*) {
-            .value => |v| try allocator.dupe(u8, v),
+            .value => |v| allocator.dupe(u8, v) catch
+                @panic("OOM duping value in absorbOverlayLocked"),
             .tombstone => null,
         };
         gop.key_ptr.* = key_copy;
         gop.value_ptr.* = val_copy;
-        try ordered_keys.append(allocator, key_copy);
+        ordered_keys.append(allocator, key_copy) catch
+            @panic("OOM appending to ordered_keys in absorbOverlayLocked");
     }
 }
 
