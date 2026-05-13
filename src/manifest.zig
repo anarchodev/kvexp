@@ -843,8 +843,13 @@ pub const Txn = struct {
 
     pub fn commit(self: *Txn) !void {
         try self.manifest.checkAlive();
-        self.tenant_state.lock.lock();
-        defer self.tenant_state.lock.unlock();
+        // Capture tenant_state up front so the deferred unlock doesn't
+        // dereference `self` after destroy(self) has freed it — under
+        // multi-threaded contention the allocator can reuse that slot
+        // before the defer runs.
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
         if (self.parent) |parent| {
             // Savepoint commit.
@@ -852,14 +857,14 @@ pub const Txn = struct {
             parent.open_child = null;
         } else {
             // Top-level commit: must be chain head.
-            if (self.tenant_state.chain_head != self) return error.NotChainHead;
-            try Overlay.moveInto(&self.overlay, &self.tenant_state.main_overlay);
+            if (ts.chain_head != self) return error.NotChainHead;
+            try Overlay.moveInto(&self.overlay, &ts.main_overlay);
             if (self.chain_next) |next| {
                 next.chain_prev = null;
-                self.tenant_state.chain_head = next;
+                ts.chain_head = next;
             } else {
-                self.tenant_state.chain_head = null;
-                self.tenant_state.chain_tail = null;
+                ts.chain_head = null;
+                ts.chain_tail = null;
             }
         }
         self.overlay.deinit();
@@ -867,17 +872,19 @@ pub const Txn = struct {
     }
 
     pub fn rollback(self: *Txn) void {
-        self.tenant_state.lock.lock();
-        defer self.tenant_state.lock.unlock();
+        // Same hazard as commit: capture tenant_state before freeing self.
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
         if (self.parent == null) {
             // Top-level: detach the tail of the chain at self, then
             // free self + all successors.
             if (self.chain_prev) |prev| {
                 prev.chain_next = null;
-                self.tenant_state.chain_tail = prev;
+                ts.chain_tail = prev;
             } else {
-                self.tenant_state.chain_head = null;
-                self.tenant_state.chain_tail = null;
+                ts.chain_head = null;
+                ts.chain_tail = null;
             }
             var cur: ?*Txn = self;
             while (cur) |c| {
