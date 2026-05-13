@@ -141,7 +141,6 @@ pub const Manifest = struct {
             .max_map_size = options.max_map_size,
             .no_meta_sync = options.no_meta_sync,
             .no_sync = options.no_sync,
-            .no_lock = true,
         });
         errdefer self.env.close();
 

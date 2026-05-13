@@ -96,9 +96,24 @@ pub const Env = struct {
         /// `MDB_NOSYNC`: skip ALL fsync. Don't enable unless you
         /// understand the risk; mostly useful in tests.
         no_sync: bool = false,
-        /// `MDB_NOLOCK`: skip the reader-table file lock. Single
-        /// process only. We always run single-process.
-        no_lock: bool = true,
+        /// `MDB_NOLOCK`: skip LMDB's lock file + reader table.
+        ///
+        /// Default OFF. Even though kvexp is single-process, we run
+        /// many threads through the env: writers commit, readers (Txn
+        /// chain misses, StoreLease.get, openSnapshot) open read txns
+        /// concurrently. LMDB's reader table is what tells writers
+        /// "this page is still being read, don't recycle it." Without
+        /// it, a durabilize that lands while a snapshot is alive can
+        /// recycle pages the snapshot's read txn is pointing at —
+        /// undefined behavior per LMDB docs.
+        no_lock: bool = false,
+        /// `MDB_NOTLS`: tie reader-table slots to the MDB_txn object
+        /// rather than to TLS. Required for us because the snapshot
+        /// path holds a long-lived read txn while other code paths
+        /// (dumpSnapshot calls durableRaftIdx; Txn.get does a chain
+        /// miss; etc.) open additional read txns on the same thread.
+        /// Without NOTLS, LMDB allows at most one read txn per thread.
+        no_tls: bool = true,
         /// Mode for create.
         mode: c.mdb_mode_t = 0o600,
     };
@@ -116,6 +131,7 @@ pub const Env = struct {
         if (options.no_meta_sync) flags |= c.MDB_NOMETASYNC;
         if (options.no_sync) flags |= c.MDB_NOSYNC;
         if (options.no_lock) flags |= c.MDB_NOLOCK;
+        if (options.no_tls) flags |= c.MDB_NOTLS;
 
         try check(c.mdb_env_open(env, path.ptr, flags, options.mode));
         return .{ .ptr = env };
