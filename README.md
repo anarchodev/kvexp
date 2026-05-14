@@ -166,7 +166,12 @@ pub fn delete(self, key) !bool
 pub fn get(self, allocator, key) !?[]u8
 pub fn scanPrefix(self, prefix) !TxnPrefixCursor
 pub fn savepoint(self) !*Txn       // pushes onto open_child slot
-pub fn commit(self) !void          // top-level must be chain head;
+pub fn canSkipRaftPropose(self) bool  // true: empty overlay + no chain-
+                                      // predecessor reads → caller can
+                                      // respond without raft propose
+pub fn commit(self) !void          // top-level: chain head — or fast
+                                   // path if canSkipRaftPropose() is
+                                   // true (splices out in place);
                                    // savepoint merges into parent
 pub fn rollback(self) void         // top-level cascades to successors;
                                    // savepoint drops self + nested
@@ -296,6 +301,14 @@ Key invariants:
   is impossible to hit through normal dispatch (the lease serializes
   acquires). `error.NotChainHead` is a defensive check for out-of-
   order callers.
+- Read-only fast path: if a Txn writes nothing AND never reads from a
+  chain predecessor's overlay, `canSkipRaftPropose()` returns true and
+  `commit()` splices it out of the chain in place — no chain-head
+  requirement, no main_overlay deposit, no raft propose required. The
+  application can respond to its client as soon as it sees the predicate
+  is true, without queueing the Txn into the `pending` FIFO. Useful for
+  pure reads under contention behind a slow writer; the Txn produced
+  no state that anyone else depends on, so the chain is unaffected.
 
 ### 2. Leader switch (rollback after losing leadership)
 

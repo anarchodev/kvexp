@@ -36,6 +36,14 @@
 //! Commit:
 //!   - Top-level Txn: must be the chain head (raft-oldest); merges
 //!     into tenant.main_overlay; unlinks from chain.
+//!     EXCEPTION — read-only + speculation-free fast path: if the
+//!     Txn's overlay is empty AND no read in this Txn (or any of its
+//!     savepoints) resolved against a chain predecessor's overlay,
+//!     commit() splices the Txn out of the chain in place, with no
+//!     chain-head requirement. The application can ask up-front with
+//!     `Txn.canSkipRaftPropose()` and skip the raft propose entirely
+//!     for such Txns — a pure read whose result was independent of
+//!     any not-yet-committed earlier Txn.
 //!   - Savepoint: merges into parent.overlay; pops the parent's
 //!     open_child slot.
 //!
@@ -43,7 +51,10 @@
 //!   - Top-level Txn: drops self AND every successor in the chain.
 //!     Matches raft's tail-rejection semantics; on leadership loss
 //!     the integration calls rollback on the oldest pending txn and
-//!     everything past it falls.
+//!     everything past it falls. NOTE: a Txn that already took the
+//!     read-only fast-path commit is no longer in the chain, and so
+//!     is not reached by a cascade. That is intentional — its result
+//!     was speculation-free, so a tail rollback cannot invalidate it.
 //!   - Savepoint: drops self and any nested sub-savepoint.
 //!
 //! Durabilize:
@@ -1070,6 +1081,20 @@ pub const Txn = struct {
     overlay: Overlay,
     /// The currently-open savepoint child, if any. LIFO: at most one.
     open_child: ?*Txn,
+    /// Set when any read in this Txn (or in one of its savepoints)
+    /// resolved against a chain-predecessor's overlay — i.e. saw
+    /// speculative state from a Txn that hasn't yet committed. Only
+    /// meaningful on the top-level Txn; savepoints propagate by
+    /// calling markSawSpeculation() which walks up the parent chain.
+    /// main_overlay / LMDB hits do NOT set this flag — those layers
+    /// are raft-applied (or durable) and safe to depend on.
+    ///
+    /// Used by canSkipRaftPropose() and by commit()'s short-circuit:
+    /// a top-level Txn with an empty overlay and saw_speculation=false
+    /// can be detached from anywhere in the chain (no chain-head
+    /// requirement) and the application can respond to its client
+    /// without going through raft.
+    saw_speculation: bool = false,
 
     // ── writes ──────────────────────────────────────────────────────
 
@@ -1105,6 +1130,15 @@ pub const Txn = struct {
 
     // ── reads ───────────────────────────────────────────────────────
 
+    /// Mark this Txn (or its enclosing top-level Txn, if self is a
+    /// savepoint) as having observed speculative state from a chain
+    /// predecessor. Caller must hold `tenant_state.lock`.
+    fn markSawSpeculationLocked(self: *Txn) void {
+        var t: *Txn = self;
+        while (t.parent) |p| t = p;
+        t.saw_speculation = true;
+    }
+
     pub fn get(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
@@ -1115,15 +1149,26 @@ pub const Txn = struct {
     fn getLocked(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         // Walk savepoint stack: self → parent → parent.parent → ...
         // After top-level, walk chain backward.
+        // `in_predecessor` flips true once we cross from this Txn's own
+        // savepoint/parent chain into the chain-predecessor portion: a
+        // hit from then on is speculation (depends on a not-yet-
+        // committed earlier Txn).
         var cur: ?*Txn = self;
+        var in_predecessor = false;
         while (cur) |t| {
             if (t.overlay.entries.get(key)) |entry| {
+                if (in_predecessor) self.markSawSpeculationLocked();
                 switch (entry) {
                     .value => |v| return try allocator.dupe(u8, v),
                     .tombstone => return null,
                 }
             }
-            cur = if (t.parent) |p| p else t.chain_prev;
+            if (t.parent) |p| {
+                cur = p;
+            } else {
+                cur = t.chain_prev;
+                in_predecessor = true;
+            }
         }
         // main_overlay.
         if (self.tenant_state.main_overlay.entries.get(key)) |entry| {
@@ -1147,14 +1192,21 @@ pub const Txn = struct {
     /// compute the return bool without allocating.
     fn keyExistsLocked(self: *Txn, key: []const u8) !bool {
         var cur: ?*Txn = self;
+        var in_predecessor = false;
         while (cur) |t| {
             if (t.overlay.entries.get(key)) |entry| {
+                if (in_predecessor) self.markSawSpeculationLocked();
                 return switch (entry) {
                     .value => true,
                     .tombstone => false,
                 };
             }
-            cur = if (t.parent) |p| p else t.chain_prev;
+            if (t.parent) |p| {
+                cur = p;
+            } else {
+                cur = t.chain_prev;
+                in_predecessor = true;
+            }
         }
         if (self.tenant_state.main_overlay.entries.get(key)) |entry| {
             return switch (entry) {
@@ -1184,11 +1236,18 @@ pub const Txn = struct {
         defer ordered_keys.deinit(self.manifest.allocator);
 
         var cur: ?*Txn = self;
+        var in_predecessor = false;
         while (cur) |t| {
-            absorbOverlayLocked(self.manifest.allocator, &t.overlay, prefix, &dedup, &ordered_keys);
-            cur = if (t.parent) |p| p else t.chain_prev;
+            const inserted = absorbOverlayLocked(self.manifest.allocator, &t.overlay, prefix, &dedup, &ordered_keys);
+            if (in_predecessor and inserted) self.markSawSpeculationLocked();
+            if (t.parent) |p| {
+                cur = p;
+            } else {
+                cur = t.chain_prev;
+                in_predecessor = true;
+            }
         }
-        absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
+        _ = absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
 
         // Materialize sorted slice.
         var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
@@ -1250,6 +1309,27 @@ pub const Txn = struct {
         return cursor;
     }
 
+    // ── short-circuit predicate ─────────────────────────────────────
+
+    /// True iff this top-level Txn did no writes and observed no
+    /// speculative (chain-predecessor) state. The caller may respond
+    /// to its client immediately — there is nothing for raft to do.
+    /// The caller still must invoke `commit()` (which will take the
+    /// fast path) to detach this Txn from the chain.
+    ///
+    /// Always false for savepoints; speculation flags are recorded on
+    /// the enclosing top-level Txn, but writes-or-not is asked of the
+    /// top-level too. If you want to short-circuit a Txn that is
+    /// currently inside a savepoint, close (commit or rollback) the
+    /// savepoint first and then ask the top-level.
+    pub fn canSkipRaftPropose(self: *Txn) bool {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.parent != null) return false;
+        if (self.open_child != null) return false;
+        return self.overlay.entries.count() == 0 and !self.saw_speculation;
+    }
+
     // ── savepoint / commit / rollback ──────────────────────────────
 
     /// Push a new savepoint onto this Txn (or onto an existing chain
@@ -1272,6 +1352,7 @@ pub const Txn = struct {
             .chain_next = null,
             .overlay = Overlay.init(self.manifest.allocator),
             .open_child = null,
+            .saw_speculation = false,
         };
         self.open_child = child;
         return child;
@@ -1294,15 +1375,35 @@ pub const Txn = struct {
             Overlay.moveInto(&self.overlay, &parent.overlay);
             parent.open_child = null;
         } else {
-            // Top-level commit: must be chain head.
-            if (ts.chain_head != self) return error.NotChainHead;
-            Overlay.moveInto(&self.overlay, &ts.main_overlay);
-            if (self.chain_next) |next| {
-                next.chain_prev = null;
-                ts.chain_head = next;
+            // Top-level commit. Two paths:
+            //
+            // Fast path — read-only AND speculation-free: nothing in
+            // our overlay, no read ever resolved to a chain predecessor.
+            // Predecessors don't depend on us (we wrote nothing) and
+            // successors don't depend on us (we observed no speculation,
+            // so nothing they may have read could have come from us).
+            // Splice ourselves out of the chain wherever we sit — no
+            // chain-head requirement. The application can short-circuit
+            // raft propose for this Txn entirely.
+            //
+            // Slow path — normal commit: must be chain head, drain
+            // overlay into main_overlay, advance head.
+            const fast_path = self.overlay.entries.count() == 0 and !self.saw_speculation;
+            if (fast_path) {
+                if (self.chain_prev) |prev| prev.chain_next = self.chain_next;
+                if (self.chain_next) |next| next.chain_prev = self.chain_prev;
+                if (ts.chain_head == self) ts.chain_head = self.chain_next;
+                if (ts.chain_tail == self) ts.chain_tail = self.chain_prev;
             } else {
-                ts.chain_head = null;
-                ts.chain_tail = null;
+                if (ts.chain_head != self) return error.NotChainHead;
+                Overlay.moveInto(&self.overlay, &ts.main_overlay);
+                if (self.chain_next) |next| {
+                    next.chain_prev = null;
+                    ts.chain_head = next;
+                } else {
+                    ts.chain_head = null;
+                    ts.chain_tail = null;
+                }
             }
         }
         self.overlay.deinit();
@@ -1363,14 +1464,17 @@ pub const Txn = struct {
 /// ownership of newly-cloned key bytes into `ordered_keys`. Caller
 /// owns the dedup map and the ordered_keys list; both are freed by
 /// the caller. Closer-to-cursor layers should be called first; entries
-/// already in `dedup` are skipped.
+/// already in `dedup` are skipped. Returns true iff at least one
+/// prefix-matching entry was actually inserted (not deduped against
+/// a closer layer) — used by `Txn.scanPrefix` to detect whether a
+/// chain-predecessor contributed to the merged result.
 fn absorbOverlayLocked(
     allocator: std.mem.Allocator,
     ov: *Overlay,
     prefix: []const u8,
     dedup: *std.StringHashMapUnmanaged(?[]u8),
     ordered_keys: *std.ArrayListUnmanaged([]u8),
-) void {
+) bool {
     // Internal bookkeeping: panic on OOM rather than propagate. The
     // caller's `defer dedup.deinit(...)` only frees map storage, not
     // duped values — and an error path with N-1 successful dupes plus
@@ -1378,6 +1482,7 @@ fn absorbOverlayLocked(
     // problems: kvexp's recovery story is "process dies → raft
     // replays from durable watermark," so OOM in scan setup means we
     // crash hard and the host restarts.
+    var inserted_any = false;
     var it = ov.entries.iterator();
     while (it.next()) |e| {
         const k = e.key_ptr.*;
@@ -1396,7 +1501,9 @@ fn absorbOverlayLocked(
         gop.value_ptr.* = val_copy;
         ordered_keys.append(allocator, key_copy) catch
             @panic("OOM appending to ordered_keys in absorbOverlayLocked");
+        inserted_any = true;
     }
+    return inserted_any;
 }
 
 // ─── TxnPrefixCursor ────────────────────────────────────────────────
@@ -1572,6 +1679,7 @@ pub const StoreLease = struct {
             .chain_next = null,
             .overlay = Overlay.init(self.manifest.allocator),
             .open_child = null,
+            .saw_speculation = false,
         };
         if (ts.chain_tail) |tail| {
             tail.chain_next = txn;
@@ -2227,9 +2335,188 @@ test "Txn: commit must be chain head" {
 
     var t1 = try h.quickTxn(1);
     var t2 = try h.quickTxn(1);
+    // t2 has writes, so it's not eligible for the read-only fast path
+    // and must wait for chain-head ordering.
+    try t2.put("x", "y");
     try testing.expectError(error.NotChainHead, t2.commit());
     t2.rollback();
     try t1.commit();
+}
+
+test "ReadOnly: pure read-only Txn behind a pending writer takes the fast path" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    // Pre-populate a durable value so reads can hit LMDB.
+    {
+        var seed = try h.quickTxn(1);
+        try seed.put("k", "durable");
+        try seed.commit();
+        try h.manifest.flush();
+    }
+
+    var writer = try h.quickTxn(1);
+    try writer.put("other", "speculative");
+
+    // Read-only Txn opened after writer. Reads a key writer didn't
+    // touch — should resolve via main_overlay/LMDB, not predecessor.
+    var ro = try h.quickTxn(1);
+    const got = (try ro.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("durable", got);
+    try testing.expect(ro.canSkipRaftPropose());
+    // Fast-path commit succeeds even though `ro` is not the chain head.
+    try ro.commit();
+    // Writer is still committable as the (now only) chain head.
+    try writer.commit();
+}
+
+test "ReadOnly: speculation hit blocks the fast path" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var writer = try h.quickTxn(1);
+    try writer.put("k", "speculative");
+    defer writer.rollback();
+
+    var ro = try h.quickTxn(1);
+    defer ro.rollback();
+    const got = (try ro.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("speculative", got);
+    try testing.expect(!ro.canSkipRaftPropose());
+    // Slow-path commit hits NotChainHead because writer is ahead of us.
+    try testing.expectError(error.NotChainHead, ro.commit());
+}
+
+test "ReadOnly: scanPrefix with no predecessor overlap stays clean" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    {
+        var seed = try h.quickTxn(1);
+        try seed.put("a/1", "v1");
+        try seed.put("a/2", "v2");
+        try seed.commit();
+        try h.manifest.flush();
+    }
+
+    var writer = try h.quickTxn(1);
+    try writer.put("b/1", "out-of-prefix");
+
+    var ro = try h.quickTxn(1);
+    var cur = try ro.scanPrefix("a/");
+    defer cur.deinit();
+    var n: usize = 0;
+    while (try cur.next()) : (n += 1) {}
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(ro.canSkipRaftPropose());
+    try ro.commit();
+    try writer.commit();
+}
+
+test "ReadOnly: scanPrefix with predecessor overlap taints" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var writer = try h.quickTxn(1);
+    try writer.put("a/1", "speculative");
+    defer writer.rollback();
+
+    var ro = try h.quickTxn(1);
+    defer ro.rollback();
+    var cur = try ro.scanPrefix("a/");
+    defer cur.deinit();
+    while (try cur.next()) {}
+    try testing.expect(!ro.canSkipRaftPropose());
+}
+
+test "ReadOnly: speculation observed in a savepoint propagates to top-level" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var writer = try h.quickTxn(1);
+    try writer.put("k", "speculative");
+    defer writer.rollback();
+
+    var ro = try h.quickTxn(1);
+    defer ro.rollback();
+    var sp = try ro.savepoint();
+    const got = (try sp.get(testing.allocator, "k")).?;
+    testing.allocator.free(got);
+    sp.rollback();
+    // Even though the savepoint rolled back, the top-level Txn
+    // already observed speculative state and must not short-circuit.
+    try testing.expect(!ro.canSkipRaftPropose());
+}
+
+test "ReadOnly: fast-path commit detaches from chain; tail rollback skips it" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var t_writer = try h.quickTxn(1);
+    try t_writer.put("k", "from-writer");
+
+    var t_ro = try h.quickTxn(1); // read-only, in chain after writer
+    // Don't read any predecessor state — stay clean.
+    try testing.expect(t_ro.canSkipRaftPropose());
+    try t_ro.commit(); // fast-path splice-out
+
+    // Open another Txn after the fast-path commit; chain is now
+    // {t_writer, t_after}. Rollback of t_writer must cascade to
+    // t_after but not "back to" t_ro (it's already gone).
+    var t_after = try h.quickTxn(1);
+    try t_after.put("late", "x");
+
+    // Rolling back the head cascades to t_after. If t_ro were still
+    // tracked anywhere, freeing it again would double-free.
+    t_writer.rollback();
+
+    // After cascade, the chain is empty.
+    var s = try h.manifest.acquire(1);
+    defer s.release();
+    try testing.expect((try s.get(testing.allocator, "k")) == null);
+    try testing.expect((try s.get(testing.allocator, "late")) == null);
+}
+
+test "ReadOnly: canSkipRaftPropose returns false with an open savepoint" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var t = try h.quickTxn(1);
+    defer t.rollback();
+    try testing.expect(t.canSkipRaftPropose());
+    var sp = try t.savepoint();
+    defer sp.rollback();
+    // While sp is open, t's top-level commit would error
+    // (SavepointStillOpen). canSkipRaftPropose reflects that.
+    try testing.expect(!t.canSkipRaftPropose());
+}
+
+test "ReadOnly: write taints even with no speculative reads" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var t = try h.quickTxn(1);
+    defer t.rollback();
+    try t.put("k", "v");
+    try testing.expect(!t.canSkipRaftPropose());
 }
 
 test "Savepoint: commit merges into parent overlay" {
