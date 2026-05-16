@@ -669,6 +669,10 @@ pub const Manifest = struct {
             ts.main_overlay.clear();
             ts.draining_overlay.clear();
             ts.draining_active = false;
+            if (ts.parked_read_txn) |*p| {
+                p.abort();
+                ts.parked_read_txn = null;
+            }
         }
         _ = self.metrics.drop_store_total.fetchAdd(1, .monotonic);
         return true;
@@ -1076,6 +1080,13 @@ const TenantState = struct {
     /// and dispatch_lock.lock().
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
+    /// One LMDB read txn parked (mdb_txn_reset) between batches and
+    /// renewed (mdb_txn_renew) at the next beginReadView — skips the
+    /// me_maxdbs-sized mdb_txn_begin memset after the first batch.
+    /// Holds no reader slot / no snapshot while parked. Guarded by
+    /// `lock`; one TrackedTxn per tenant at a time so no concurrent use.
+    parked_read_txn: ?lmdb.Txn = null,
+
     fn retain(self: *TenantState) void {
         // Relaxed: subsequent ops on the TenantState are synchronized
         // by tenant_state.lock or dispatch_lock; the refcount itself
@@ -1091,6 +1102,16 @@ const TenantState = struct {
         // overlay during dropStore, etc.) are visible to us before
         // we tear the TenantState down at refcount == 1.
         if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+            // Abort the parked read txn before the env is closed. On the
+            // normal teardown paths (Manifest.deinit→deinitMaps,
+            // dropStore) this runs while the env is still alive. A
+            // leaked lease (refcount never reaching 1 before env.close)
+            // would strand it — the same documented "prefer the leak to
+            // a UAF" caller-bug class as a leaked TenantState.
+            if (self.parked_read_txn) |*p| {
+                p.abort();
+                self.parked_read_txn = null;
+            }
             self.main_overlay.deinit();
             self.draining_overlay.deinit();
             allocator.destroy(self);
@@ -1137,6 +1158,15 @@ pub const Txn = struct {
     /// commit/rollback even if endReadView() wasn't called.
     read_view: ?lmdb.Txn = null,
 
+    /// Batch-scoped cache of this tenant's LMDB DBI. `tenant_id` is
+    /// constant for a Txn's life and the dispatch lease blocks a
+    /// concurrent dropStore, so the DBI is stable once resolved.
+    /// Cached on the top-level Txn (savepoints resolve upward); only
+    /// a successful lookup is cached — a not-yet-created store
+    /// re-resolves next time rather than poisoning the cache with
+    /// null. Removes the per-get `lookupDbi` (dbis_lock + hashmap).
+    cached_dbi: ?lmdb.Dbi = null,
+
     /// Walk up to the top-level Txn (the chain entry). Savepoints
     /// delegate batch-scoped state (read_view, speculation) to it.
     /// Caller must hold tenant_state.lock.
@@ -1144,6 +1174,18 @@ pub const Txn = struct {
         var t: *Txn = self;
         while (t.parent) |p| t = p;
         return t;
+    }
+
+    /// Resolve this tenant's DBI, caching it on the top-level Txn so
+    /// the per-op `manifest.lookupDbi` (dbis_lock + hashmap probe)
+    /// runs once per batch instead of once per get. Caller must hold
+    /// tenant_state.lock.
+    fn dbiLocked(self: *Txn) ?lmdb.Dbi {
+        const root = self.topLevelLocked();
+        if (root.cached_dbi) |d| return d;
+        const d = self.manifest.lookupDbi(self.tenant_id) orelse return null;
+        root.cached_dbi = d;
+        return d;
     }
 
     /// Resolve the LMDB read handle for a point read. If a batch read
@@ -1255,7 +1297,7 @@ pub const Txn = struct {
             }
         }
         // LMDB (batch read view if open, else a one-shot read txn).
-        const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
+        const dbi = self.dbiLocked() orelse return null;
         var h = try self.lmdbReadLocked();
         defer h.release();
         if (try h.txn.get(dbi, key)) |bytes| {
@@ -1299,7 +1341,7 @@ pub const Txn = struct {
                 };
             }
         }
-        const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return false;
+        const dbi = self.dbiLocked() orelse return false;
         var h = try self.lmdbReadLocked();
         defer h.release();
         return (try h.txn.get(dbi, key)) != null;
@@ -1368,7 +1410,7 @@ pub const Txn = struct {
         var read_txn: lmdb.Txn = .{ .ptr = null };
         var lmdb_cur: lmdb.Cursor = .{ .ptr = null };
         var has_lmdb = false;
-        if (self.manifest.lookupDbi(self.tenant_id)) |dbi| {
+        if (self.dbiLocked()) |dbi| {
             read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
             errdefer read_txn.abort();
             lmdb_cur = try read_txn.openCursor(dbi);
@@ -1439,7 +1481,20 @@ pub const Txn = struct {
         defer self.tenant_state.lock.unlock();
         const root = self.topLevelLocked();
         if (root.read_view != null) return error.ReadViewAlreadyOpen;
-        root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+        const ts = self.tenant_state;
+        if (ts.parked_read_txn) |*p| {
+            p.renewRead() catch {
+                p.abort();
+                ts.parked_read_txn = null;
+                root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+                return;
+            };
+            root.read_view = ts.parked_read_txn; // move handle into the batch
+            ts.parked_read_txn = null;
+        } else {
+            // First batch for this tenant: pay the memset once.
+            root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+        }
     }
 
     /// Re-snapshot the read view: park the reader slot and re-acquire
@@ -1476,6 +1531,24 @@ pub const Txn = struct {
         const root = self.topLevelLocked();
         if (root.read_view) |*rv| {
             rv.abort();
+            root.read_view = null;
+        }
+    }
+
+    /// Like endReadViewLocked but parks the txn for reuse instead of
+    /// aborting it: mdb_txn_reset releases the reader lock + snapshot
+    /// but keeps the handle for a cheap renew next batch. Caller holds
+    /// tenant_state.lock. Idempotent. Used by the normal batch-lifecycle
+    /// teardown (top-level commit / rollback); tenant-death teardown
+    /// (dropStore, tail-rollback cascade) still aborts via
+    /// freeSubtreeLocked.
+    fn parkReadViewLocked(self: *Txn) void {
+        const root = self.topLevelLocked();
+        if (root.read_view) |*rv| {
+            const ts = self.tenant_state;
+            if (ts.parked_read_txn) |*old| old.abort(); // defensive; shouldn't happen
+            rv.resetRead();
+            ts.parked_read_txn = rv.*;
             root.read_view = null;
         }
     }
@@ -1556,10 +1629,10 @@ pub const Txn = struct {
                 }
             }
         }
-        // Top-level commit frees this Txn; release any batch read view
-        // it owns. (Savepoint commit leaves the top-level — and its
-        // read view — alive.)
-        if (!is_savepoint) self.endReadViewLocked();
+        // Top-level commit frees this Txn; park any batch read view it
+        // owns for reuse by the next batch on this tenant. (Savepoint
+        // commit leaves the top-level — and its read view — alive.)
+        if (!is_savepoint) self.parkReadViewLocked();
         self.overlay.deinit();
         manifest.allocator.destroy(self);
         if (is_savepoint) {
@@ -1577,8 +1650,15 @@ pub const Txn = struct {
         defer ts.lock.unlock();
         const is_savepoint = self.parent != null;
         if (self.parent == null) {
-            // Top-level: detach the tail of the chain at self, then
-            // free self + all successors.
+            // Top-level: park this Txn's own batch read view for reuse
+            // (its result didn't depend on any speculative predecessor —
+            // a tail rollback can't invalidate the durable snapshot).
+            // Park *before* the cascade so freeSubtreeLocked sees a null
+            // read_view on self and its abort block stays a pure safety
+            // net for successors / tenant-death teardown.
+            self.parkReadViewLocked();
+            // Detach the tail of the chain at self, then free self + all
+            // successors.
             if (self.chain_prev) |prev| {
                 prev.chain_next = null;
                 ts.chain_tail = prev;
