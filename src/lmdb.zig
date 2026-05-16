@@ -175,6 +175,20 @@ pub const Txn = struct {
         self.ptr = null;
     }
 
+    /// Release a read txn's snapshot but keep its reader-table slot
+    /// parked. The handle stays valid but unusable until `renewRead`.
+    /// LMDB requires `MDB_RDONLY`; calling on a write txn is undefined.
+    pub fn resetRead(self: *Txn) void {
+        if (self.ptr) |p| c.mdb_txn_reset(p);
+    }
+
+    /// Re-acquire a fresh snapshot on a reset read txn, reusing the
+    /// parked reader slot (no slot-table churn). Pairs with
+    /// `resetRead`; the txn is usable again after this returns.
+    pub fn renewRead(self: *Txn) Error!void {
+        try check(c.mdb_txn_renew(self.ptr));
+    }
+
     /// Open or create a sub-DBI within this txn. The DBI handle is
     /// stable across txns once it's been opened in any txn that
     /// committed. `name` may be empty for the main DBI.

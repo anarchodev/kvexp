@@ -112,6 +112,11 @@ pub const SpecificError = error{
     /// configured `max_overlay_bytes_per_store`. Caller should
     /// rollback + durabilize + retry, or drop the request.
     OverlayCapExceeded,
+    /// beginReadView() called while this Txn already has an open
+    /// read view.
+    ReadViewAlreadyOpen,
+    /// refreshReadView() called with no open read view.
+    NoReadView,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
@@ -473,6 +478,15 @@ pub const Manifest = struct {
     /// See `InitOptions.max_overlay_bytes_per_store`. 0 = unlimited.
     max_overlay_bytes_per_store: usize = 0,
 
+    /// Test-only seam. When set, `durabilize` invokes this once after
+    /// every tenant's `main_overlay` has been moved into its draining
+    /// slot but before the LMDB write txn commits — i.e. parked inside
+    /// the handoff window. Lets tests drive a concurrent read into the
+    /// exact instant a key is mid-flight. Always null in production
+    /// (zero cost; never written outside the test section).
+    durabilize_window_hook: ?*const fn (ctx: *anyopaque) void = null,
+    durabilize_window_hook_ctx: ?*anyopaque = null,
+
     pub fn init(
         self: *Manifest,
         allocator: std.mem.Allocator,
@@ -653,6 +667,8 @@ pub const Manifest = struct {
             ts.chain_head = null;
             ts.chain_tail = null;
             ts.main_overlay.clear();
+            ts.draining_overlay.clear();
+            ts.draining_active = false;
         }
         _ = self.metrics.drop_store_total.fetchAdd(1, .monotonic);
         return true;
@@ -709,7 +725,10 @@ pub const Manifest = struct {
         // internal bookkeeping means the process is gone, full stop.)
         const ts = self.allocator.create(TenantState) catch
             @panic("OOM allocating TenantState");
-        ts.* = .{ .main_overlay = Overlay.init(self.allocator) };
+        ts.* = .{
+            .main_overlay = Overlay.init(self.allocator),
+            .draining_overlay = Overlay.init(self.allocator),
+        };
         // refcount initialized to 1 (the map's reference); retain once
         // more for the caller.
         ts.retain();
@@ -814,41 +833,43 @@ pub const Manifest = struct {
             }
         }
 
-        // 3. Swap each tenant's main_overlay into a local buffer.
-        //    Workers committing top-level Txns during durabilize land
-        //    in a fresh main_overlay that we leave behind; their data
-        //    will be in the next durabilize.
-        var swapped_list: std.ArrayListUnmanaged(SwappedEntry) = .empty;
-        defer {
-            for (swapped_list.items) |*s| {
-                var it = s.entries.iterator();
-                while (it.next()) |e| {
-                    self.allocator.free(e.key_ptr.*);
-                    switch (e.value_ptr.*) {
-                        .value => |v| self.allocator.free(v),
-                        .tombstone => {},
-                    }
-                }
-                s.entries.deinit(self.allocator);
-            }
-            swapped_list.deinit(self.allocator);
-        }
+        // 3. Move each tenant's main_overlay into its draining slot.
+        //    A fresh empty main_overlay is left behind, so workers
+        //    committing top-level Txns during this durabilize land
+        //    there and roll into the next cycle. The drained data stays
+        //    visible to readers via the draining slot until *after* the
+        //    LMDB commit (step 6) — readers consult
+        //    main_overlay → draining_overlay → LMDB, so an in-flight
+        //    key is never momentarily absent from all three.
+        var drained: std.ArrayListUnmanaged(TenantPair) = .empty;
+        defer drained.deinit(self.allocator);
+        defer for (drained.items) |t| {
+            // Runs after the commit attempt (success or error). On
+            // success the key is now in LMDB, so dropping the draining
+            // copy is seamless; on error we've poisoned and recover
+            // via raft replay. Either way the buffers are freed here.
+            t.ts.lock.lock();
+            t.ts.draining_overlay.clear();
+            t.ts.draining_active = false;
+            t.ts.lock.unlock();
+        };
         for (tenant_pairs.items) |t| {
             t.ts.lock.lock();
-            const empty = t.ts.main_overlay.entries.count() == 0;
-            if (empty) {
+            if (t.ts.main_overlay.entries.count() == 0) {
                 t.ts.lock.unlock();
                 continue;
             }
-            const taken = t.ts.main_overlay.entries;
-            t.ts.main_overlay.entries = .empty;
-            t.ts.main_overlay.bytes = 0; // bytes lived in `entries`, now in `taken`
+            std.debug.assert(!t.ts.draining_active);
+            t.ts.main_overlay.moveInto(&t.ts.draining_overlay);
+            t.ts.draining_active = true;
             t.ts.lock.unlock();
-            swapped_list.append(self.allocator, .{
-                .id = t.id,
-                .entries = taken,
-            }) catch @panic("OOM building swapped_list in durabilize");
+            drained.append(self.allocator, t) catch
+                @panic("OOM building drained list in durabilize");
         }
+
+        // Test seam: parked in the handoff window — overlays swapped
+        // out, LMDB not yet committed.
+        if (self.durabilize_window_hook) |hook| hook(self.durabilize_window_hook_ctx.?);
 
         // 4. Apply everything in one LMDB write txn.
         var txn = try lmdb.Txn.beginWrite(&self.env);
@@ -872,9 +893,13 @@ pub const Manifest = struct {
                 @panic("OOM building new_dbis in durabilize");
         }
 
-        for (swapped_list.items) |s| {
-            const dbi = self.lookupDbiForApply(s.id, new_dbis.items) orelse continue;
-            var it = s.entries.iterator();
+        for (drained.items) |t| {
+            const dbi = self.lookupDbiForApply(t.id, new_dbis.items) orelse continue;
+            // Safe to read without ts.lock: the draining slot is filled
+            // (step 3) and cleared (deferred) only under ts.lock, both
+            // outside this read span. Concurrent reader gets are reads
+            // too — no writer touches it here.
+            var it = t.ts.draining_overlay.entries.iterator();
             while (it.next()) |e| {
                 switch (e.value_ptr.*) {
                     .value => |v| try txn.put(dbi, e.key_ptr.*, v),
@@ -931,10 +956,6 @@ pub const Manifest = struct {
     }
 
     const NewDbi = struct { id: u64, dbi: lmdb.Dbi };
-    const SwappedEntry = struct {
-        id: u64,
-        entries: std.StringHashMapUnmanaged(OverlayEntry),
-    };
 
     fn lookupDbiForApply(self: *Manifest, id: u64, new_dbis: []const NewDbi) ?lmdb.Dbi {
         for (new_dbis) |n| if (n.id == id) return n.dbi;
@@ -1033,6 +1054,17 @@ const TenantState = struct {
     /// inside kvexp's internal lock paths.
     dispatch_lock: std.Thread.Mutex = .{},
     main_overlay: Overlay,
+    /// durabilize handoff slot. `durabilize` moves `main_overlay` here
+    /// (under `lock`) *before* the LMDB commit, and clears it (under
+    /// `lock`) only *after* the commit. Reads consult
+    /// main_overlay → draining_overlay → LMDB, so a key in flight is
+    /// visible in exactly one place with no gap. Only meaningful while
+    /// `draining_active`; that flag is true strictly within a single
+    /// `durabilize` call (which holds `durabilize_lock`), so callers
+    /// serialized by `durabilize_lock` — e.g. `openSnapshot` — never
+    /// observe it set.
+    draining_overlay: Overlay,
+    draining_active: bool = false,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
 
@@ -1060,6 +1092,7 @@ const TenantState = struct {
         // we tear the TenantState down at refcount == 1.
         if (self.refcount.fetchSub(1, .acq_rel) == 1) {
             self.main_overlay.deinit();
+            self.draining_overlay.deinit();
             allocator.destroy(self);
         }
     }
@@ -1095,6 +1128,40 @@ pub const Txn = struct {
     /// requirement) and the application can respond to its client
     /// without going through raft.
     saw_speculation: bool = false,
+
+    /// Optional batch-scoped LMDB read handle. Only ever set on the
+    /// top-level Txn (parent == null); savepoints resolve to it by
+    /// walking up. When present, point reads reuse this one parked
+    /// MDB_RDONLY txn instead of begin/abort per get — read-latest,
+    /// re-snapshotted by refreshReadView(). Always torn down on
+    /// commit/rollback even if endReadView() wasn't called.
+    read_view: ?lmdb.Txn = null,
+
+    /// Walk up to the top-level Txn (the chain entry). Savepoints
+    /// delegate batch-scoped state (read_view, speculation) to it.
+    /// Caller must hold tenant_state.lock.
+    fn topLevelLocked(self: *Txn) *Txn {
+        var t: *Txn = self;
+        while (t.parent) |p| t = p;
+        return t;
+    }
+
+    /// Resolve the LMDB read handle for a point read. If a batch read
+    /// view is open, reuse it (not owned — never abort it here);
+    /// otherwise mint a one-shot read txn the caller must release.
+    /// Caller must hold tenant_state.lock.
+    const LmdbRead = struct {
+        txn: lmdb.Txn,
+        owned: bool,
+        fn release(self: *LmdbRead) void {
+            if (self.owned) self.txn.abort();
+        }
+    };
+    fn lmdbReadLocked(self: *Txn) !LmdbRead {
+        if (self.topLevelLocked().read_view) |rv|
+            return .{ .txn = rv, .owned = false };
+        return .{ .txn = try lmdb.Txn.beginRead(&self.manifest.env), .owned = true };
+    }
 
     // ── writes ──────────────────────────────────────────────────────
 
@@ -1177,11 +1244,21 @@ pub const Txn = struct {
                 .tombstone => return null,
             }
         }
-        // LMDB.
+        // draining_overlay: a durabilize is mid-handoff and this key
+        // was moved out of main_overlay but not yet in committed LMDB.
+        if (self.tenant_state.draining_active) {
+            if (self.tenant_state.draining_overlay.entries.get(key)) |entry| {
+                switch (entry) {
+                    .value => |v| return try allocator.dupe(u8, v),
+                    .tombstone => return null,
+                }
+            }
+        }
+        // LMDB (batch read view if open, else a one-shot read txn).
         const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
-        var read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
-        defer read_txn.abort();
-        if (try read_txn.get(dbi, key)) |bytes| {
+        var h = try self.lmdbReadLocked();
+        defer h.release();
+        if (try h.txn.get(dbi, key)) |bytes| {
             return try allocator.dupe(u8, bytes);
         }
         return null;
@@ -1214,10 +1291,18 @@ pub const Txn = struct {
                 .tombstone => false,
             };
         }
+        if (self.tenant_state.draining_active) {
+            if (self.tenant_state.draining_overlay.entries.get(key)) |entry| {
+                return switch (entry) {
+                    .value => true,
+                    .tombstone => false,
+                };
+            }
+        }
         const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return false;
-        var read_txn = try lmdb.Txn.beginRead(&self.manifest.env);
-        defer read_txn.abort();
-        return (try read_txn.get(dbi, key)) != null;
+        var h = try self.lmdbReadLocked();
+        defer h.release();
+        return (try h.txn.get(dbi, key)) != null;
     }
 
     pub fn scanPrefix(self: *Txn, prefix: []const u8) !TxnPrefixCursor {
@@ -1248,6 +1333,10 @@ pub const Txn = struct {
             }
         }
         _ = absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.main_overlay, prefix, &dedup, &ordered_keys);
+        // draining_overlay sits below main_overlay (already absorbed,
+        // so it wins collisions) and above LMDB.
+        if (self.tenant_state.draining_active)
+            _ = absorbOverlayLocked(self.manifest.allocator, &self.tenant_state.draining_overlay, prefix, &dedup, &ordered_keys);
 
         // Materialize sorted slice.
         var entries: std.ArrayListUnmanaged(TxnPrefixCursor.Entry) = .empty;
@@ -1330,6 +1419,67 @@ pub const Txn = struct {
         return self.overlay.entries.count() == 0 and !self.saw_speculation;
     }
 
+    // ── batch read view ────────────────────────────────────────────
+
+    /// Open a batch-scoped LMDB read handle. While open, every point
+    /// read in this Txn (and its savepoints) reuses one parked
+    /// MDB_RDONLY txn instead of opening + aborting one per `get` —
+    /// removing per-get reader-table slot churn across a request
+    /// batch. The overlay walk (own → savepoints → chain →
+    /// main_overlay → draining) is unchanged; only the durable-LMDB
+    /// tail is amortized.
+    ///
+    /// This is *read-latest*, not a snapshot: a single read view does
+    /// pin one LMDB snapshot, so call `refreshReadView()` at request
+    /// boundaries to observe state durabilized since. Recorded on the
+    /// top-level Txn; calling on a savepoint resolves upward.
+    pub fn beginReadView(self: *Txn) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        const root = self.topLevelLocked();
+        if (root.read_view != null) return error.ReadViewAlreadyOpen;
+        root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+    }
+
+    /// Re-snapshot the read view: park the reader slot and re-acquire
+    /// a fresh LMDB snapshot reusing it (no slot-table churn), so
+    /// subsequent reads see the latest durabilized state. Call between
+    /// batch requests. On renew failure the view is torn down (reads
+    /// fall back to one-shot read txns) and the error is propagated.
+    pub fn refreshReadView(self: *Txn) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        const root = self.topLevelLocked();
+        const rv = if (root.read_view) |*rv| rv else return error.NoReadView;
+        rv.resetRead();
+        rv.renewRead() catch |e| {
+            rv.abort();
+            root.read_view = null;
+            return e;
+        };
+    }
+
+    /// Close the read view, releasing its reader slot. Safe to call
+    /// when none is open. Invoked automatically on commit/rollback, so
+    /// an explicit call is optional (useful to release the slot early
+    /// while keeping the Txn open).
+    pub fn endReadView(self: *Txn) void {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        self.endReadViewLocked();
+    }
+
+    /// Caller must hold tenant_state.lock. Idempotent.
+    fn endReadViewLocked(self: *Txn) void {
+        const root = self.topLevelLocked();
+        if (root.read_view) |*rv| {
+            rv.abort();
+            root.read_view = null;
+        }
+    }
+
     // ── savepoint / commit / rollback ──────────────────────────────
 
     /// Push a new savepoint onto this Txn (or onto an existing chain
@@ -1406,6 +1556,10 @@ pub const Txn = struct {
                 }
             }
         }
+        // Top-level commit frees this Txn; release any batch read view
+        // it owns. (Savepoint commit leaves the top-level — and its
+        // read view — alive.)
+        if (!is_savepoint) self.endReadViewLocked();
         self.overlay.deinit();
         manifest.allocator.destroy(self);
         if (is_savepoint) {
@@ -1455,6 +1609,13 @@ pub const Txn = struct {
     /// already detached this Txn from the chain if needed).
     fn freeSubtreeLocked(self: *Txn) void {
         if (self.open_child) |child| child.freeSubtreeLocked();
+        // read_view is only ever set on a top-level Txn; release its
+        // reader slot before freeing (covers tail-rollback cascade and
+        // dropStore teardown). Children carry null — a no-op there.
+        if (self.read_view) |*rv| {
+            rv.abort();
+            self.read_view = null;
+        }
         self.overlay.deinit();
         self.manifest.allocator.destroy(self);
     }
@@ -1703,6 +1864,14 @@ pub const StoreLease = struct {
                 .tombstone => return null,
             }
         }
+        if (ts.draining_active) {
+            if (ts.draining_overlay.entries.get(key)) |entry| {
+                switch (entry) {
+                    .value => |v| return try allocator.dupe(u8, v),
+                    .tombstone => return null,
+                }
+            }
+        }
         const dbi = self.manifest.lookupDbi(self.tenant_id) orelse return null;
         var txn = try lmdb.Txn.beginRead(&self.manifest.env);
         defer txn.abort();
@@ -1724,19 +1893,34 @@ pub const StoreLease = struct {
             const ts = self.tenant_state;
             ts.lock.lock();
             defer ts.lock.unlock();
-            var it = ts.main_overlay.entries.iterator();
-            while (it.next()) |e| {
-                const k = e.key_ptr.*;
-                if (!std.mem.startsWith(u8, k, prefix)) continue;
-                const k_copy = self.manifest.allocator.dupe(u8, k) catch
-                    @panic("OOM duping key in StoreLease.scanPrefix");
-                const v_copy: ?[]u8 = switch (e.value_ptr.*) {
-                    .value => |v| self.manifest.allocator.dupe(u8, v) catch
-                        @panic("OOM duping value in StoreLease.scanPrefix"),
-                    .tombstone => null,
-                };
-                entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy }) catch
-                    @panic("OOM appending entry in StoreLease.scanPrefix");
+            // main_overlay first; draining_overlay (mid-handoff) below
+            // it. `seen` keeps main_overlay winning collisions and the
+            // cursor's overlay slice free of duplicate keys.
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(self.manifest.allocator);
+            const layers: []const *Overlay = if (ts.draining_active)
+                &.{ &ts.main_overlay, &ts.draining_overlay }
+            else
+                &.{&ts.main_overlay};
+            for (layers) |ov| {
+                var it = ov.entries.iterator();
+                while (it.next()) |e| {
+                    const k = e.key_ptr.*;
+                    if (!std.mem.startsWith(u8, k, prefix)) continue;
+                    const gop = seen.getOrPut(self.manifest.allocator, k) catch
+                        @panic("OOM in StoreLease.scanPrefix dedup");
+                    if (gop.found_existing) continue;
+                    const k_copy = self.manifest.allocator.dupe(u8, k) catch
+                        @panic("OOM duping key in StoreLease.scanPrefix");
+                    gop.key_ptr.* = k_copy; // own the dedup key
+                    const v_copy: ?[]u8 = switch (e.value_ptr.*) {
+                        .value => |v| self.manifest.allocator.dupe(u8, v) catch
+                            @panic("OOM duping value in StoreLease.scanPrefix"),
+                        .tombstone => null,
+                    };
+                    entries.append(self.manifest.allocator, .{ .key = k_copy, .value = v_copy }) catch
+                        @panic("OOM appending entry in StoreLease.scanPrefix");
+                }
             }
         }
         std.mem.sort(TxnPrefixCursor.Entry, entries.items, {}, TxnPrefixCursor.Entry.lessThan);
@@ -2622,6 +2806,174 @@ test "durabilize: drains main_overlay; in-flight txn stays" {
     try testing.expectEqualStrings("yes", dg);
     try testing.expect((try s.get(testing.allocator, "inflight")) == null);
 
+    t2.rollback();
+}
+
+test "durabilize: a read in the handoff window sees committed data, not null" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    // Commit "k" so it lives in main_overlay, pending durabilize.
+    var t = try h.quickTxn(1);
+    try t.put("k", "committed");
+    try t.commit();
+
+    const Ctx = struct {
+        manifest: *Manifest,
+        saw_value: ?[64]u8 = null,
+        saw_len: usize = 0,
+        saw_null: bool = false,
+
+        // Runs on the durabilize thread, parked after the overlay
+        // swap and before the LMDB commit. A fresh lease read of a
+        // key that was only in main_overlay must still resolve it.
+        fn hook(opaque_ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_ctx));
+            var lease = self.manifest.acquire(1) catch unreachable;
+            defer lease.release();
+            const v = lease.get(testing.allocator, "k") catch unreachable;
+            if (v) |bytes| {
+                defer testing.allocator.free(bytes);
+                var buf: [64]u8 = undefined;
+                @memcpy(buf[0..bytes.len], bytes);
+                self.saw_value = buf;
+                self.saw_len = bytes.len;
+            } else {
+                self.saw_null = true;
+            }
+        }
+    };
+
+    var ctx = Ctx{ .manifest = h.manifest };
+    h.manifest.durabilize_window_hook = Ctx.hook;
+    h.manifest.durabilize_window_hook_ctx = &ctx;
+    defer {
+        h.manifest.durabilize_window_hook = null;
+        h.manifest.durabilize_window_hook_ctx = null;
+    }
+
+    try h.manifest.flush(); // durabilize; hook fires mid-handoff
+
+    try testing.expect(!ctx.saw_null);
+    try testing.expect(ctx.saw_value != null);
+    try testing.expectEqualStrings("committed", ctx.saw_value.?[0..ctx.saw_len]);
+}
+
+test "ReadView: overlay, chain and LMDB all visible through the parked txn" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var seed = try h.quickTxn(1);
+    try seed.put("dur", "v0");
+    try seed.commit(); // → main_overlay
+    try h.manifest.flush(); // → LMDB
+
+    var t = try h.quickTxn(1);
+    try t.beginReadView();
+    try t.put("spec", "s1"); // own overlay
+
+    const a = (try t.get(testing.allocator, "spec")).?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("s1", a);
+
+    const b = (try t.get(testing.allocator, "dur")).?; // LMDB via parked txn
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("v0", b);
+
+    try testing.expect((try t.get(testing.allocator, "absent")) == null);
+
+    t.endReadView();
+    t.rollback();
+}
+
+test "ReadView: pinned within the view, read-latest after refreshReadView" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    // w opened first → chain head; t second → chain tail. quickTxn
+    // releases the lease but the Txns live on (speculative-apply).
+    var w = try h.quickTxn(1);
+    var t = try h.quickTxn(1);
+
+    try t.beginReadView();
+    try testing.expect((try t.get(testing.allocator, "k")) == null);
+
+    try w.put("k", "new");
+    try w.commit(); // w is chain head → drains to main_overlay
+    try h.manifest.flush(); // → LMDB k=new
+
+    // The view's snapshot predates the commit: still null.
+    try testing.expect((try t.get(testing.allocator, "k")) == null);
+
+    try t.refreshReadView();
+    const got = (try t.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("new", got);
+
+    t.rollback(); // also auto-ends the read view
+}
+
+test "ReadView: error cases and idempotent teardown" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t = try h.quickTxn(1);
+    try testing.expectError(error.NoReadView, t.refreshReadView());
+    try t.beginReadView();
+    try testing.expectError(error.ReadViewAlreadyOpen, t.beginReadView());
+    t.endReadView();
+    t.endReadView(); // idempotent
+    try t.beginReadView(); // reopen ok
+    t.rollback(); // auto-teardown
+}
+
+test "ReadView: a savepoint resolves to the top-level's view" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    var seed = try h.quickTxn(1);
+    try seed.put("d", "x");
+    try seed.commit();
+    try h.manifest.flush();
+
+    var t = try h.quickTxn(1);
+    try t.beginReadView();
+    var sp = try t.savepoint();
+    try testing.expectError(error.ReadViewAlreadyOpen, sp.beginReadView());
+
+    const got = (try sp.get(testing.allocator, "d")).?; // via top-level view
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("x", got);
+
+    sp.endReadView(); // tears down the top-level's view
+    try testing.expectError(error.NoReadView, t.refreshReadView());
+
+    sp.rollback();
+    t.rollback();
+}
+
+test "ReadView: top-level commit tears the view down (read-only fast path)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var t = try h.quickTxn(1);
+    try t.beginReadView();
+    try testing.expect((try t.get(testing.allocator, "nope")) == null);
+    try t.commit(); // read-only + speculation-free fast path; view must be aborted
+
+    // A leaked/double-freed reader slot would surface here.
+    var t2 = try h.quickTxn(1);
+    try t2.beginReadView();
+    try t2.refreshReadView();
+    t2.endReadView();
     t2.rollback();
 }
 

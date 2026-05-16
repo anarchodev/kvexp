@@ -29,6 +29,8 @@ cascades to every later open Txn for that tenant.
               │  per-tenant TenantState (in memory, lazy)        │
               │    ├─ dispatch_lock  ← held by current StoreLease│
               │    ├─ main_overlay   ← committed but not durable │
+              │    ├─ draining_overlay ← in flight to LMDB       │
+              │    │                    (only mid-durabilize)    │
               │    └─ chain of open top-level Txns               │
               │           (raft propose order)                   │
               │           each Txn has:                          │
@@ -44,16 +46,24 @@ cascades to every later open Txn for that tenant.
 
   Txn.put / .delete       →  into Txn.overlay (no I/O)
   Txn.get / .scanPrefix   →  walks savepoint stack → chain backward
-                              → main_overlay → LMDB
+                              → main_overlay → draining_overlay → LMDB
+  Txn.beginReadView       →  park one MDB_RDONLY txn for a request
+   / refreshReadView         batch (read-latest; refresh re-snapshots)
+   / endReadView             so point reads skip per-get slot churn
   Txn.commit (top-level)  →  must be chain head; merges into main_overlay
   Txn.commit (savepoint)  →  merges into parent.overlay
   Txn.rollback (top)      →  discards self + every successor in chain
   Txn.rollback (sp)       →  discards self + nested savepoints
 
-  durabilize(raft_idx)    →  one atomic LMDB write txn:
+  durabilize(raft_idx)    →  per tenant: move main_overlay →
+                              draining_overlay (locked); then one
+                              atomic LMDB write txn:
                               - apply pending createStores / dropStores
-                              - drain every tenant's main_overlay
+                              - drain every tenant's draining_overlay
                               - write raft_idx into _meta
+                             then clear draining_overlay (locked).
+                             The middle slot keeps in-flight keys
+                             visible to readers across the commit gap.
                              (open Txns are NOT touched — their writes
                               live in their own overlays, which only
                               hit main_overlay when the Txn commits)
@@ -70,6 +80,15 @@ cascades to every later open Txn for that tenant.
 - `main_overlay` only ever receives **committed** writes (via `Txn.commit`).
   Speculative state lives in open Txns and never reaches LMDB except
   through commit → main_overlay → durabilize.
+- `durabilize` hands a tenant's writes to LMDB via `draining_overlay`:
+  the data is continuously visible to concurrent readers — in
+  `main_overlay`, then `draining_overlay`, then committed LMDB — with
+  no instant where an in-flight key is absent from all three.
+- A batch read view (`Txn.beginReadView`) is **read-latest, not a
+  snapshot**: it amortizes the per-`get` `MDB_RDONLY` txn over a
+  request batch without changing the overlay walk; `refreshReadView()`
+  re-snapshots at request boundaries. Auto-released on
+  commit/rollback.
 - A `Txn` reads its own writes plus older chain entries' writes plus
   the tenant's `main_overlay` plus LMDB — never another tenant's
   speculation and never its own siblings' speculation (because there
@@ -165,6 +184,13 @@ pub fn put(self, key, value) !void
 pub fn delete(self, key) !bool
 pub fn get(self, allocator, key) !?[]u8
 pub fn scanPrefix(self, prefix) !TxnPrefixCursor
+pub fn beginReadView(self) !void   // park one MDB_RDONLY txn; point
+                                   // reads reuse it (read-latest).
+                                   // err: ReadViewAlreadyOpen
+pub fn refreshReadView(self) !void // reset+renew: re-snapshot at a
+                                   // request boundary. err: NoReadView
+pub fn endReadView(self) void      // release the slot (idempotent);
+                                   // also automatic on commit/rollback
 pub fn savepoint(self) !*Txn       // pushes onto open_child slot
 pub fn canSkipRaftPropose(self) bool  // true: empty overlay + no chain-
                                       // predecessor reads → caller can
@@ -309,6 +335,39 @@ Key invariants:
   is true, without queueing the Txn into the `pending` FIFO. Useful for
   pure reads under contention behind a slow writer; the Txn produced
   no state that anyone else depends on, so the chain is unaffected.
+
+**Read-heavy request batches: park one read txn.** When one Txn
+serves a batch of requests (savepoint per request, commit the batch at
+the end), every read that misses the overlays otherwise opens and
+aborts its own `MDB_RDONLY` txn — a reader-table slot acquire per
+`get`. Open a batch read view once and refresh it at request
+boundaries:
+
+```zig
+var txn = try lease.beginTxn();
+errdefer txn.rollback();              // also releases the read view
+try txn.beginReadView();              // one parked MDB_RDONLY txn
+
+for (batch) |request| {
+    var sp = try txn.savepoint();     // per-request rollback unit
+    handle(sp, request) catch {
+        sp.rollback();
+        continue;
+    };
+    try sp.commit();                  // fold into the batch Txn
+    try txn.refreshReadView();        // read-latest for the next request
+}
+try txn.commit();                     // batch lands in main_overlay
+```
+
+The overlay walk is unchanged — reads still see this batch's own and
+chain-predecessor speculation. The view only amortizes the durable
+LMDB tail. It is **read-latest, not a snapshot**: a single view pins
+one LMDB snapshot, so `refreshReadView()` (reset+renew, no slot churn)
+re-snapshots between requests to pick up anything `durabilize`
+committed meanwhile. Skip the refresh if a request must see a stable
+floor across its own reads. The view is force-released on
+commit/rollback, so a missed `endReadView` cannot leak a slot.
 
 ### 2. Leader switch (rollback after losing leadership)
 
