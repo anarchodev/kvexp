@@ -420,6 +420,149 @@ fn benchMultiTenantParallel(
     };
 }
 
+// ─── contended single-tenant reads (rove kvdirect shape) ───────────
+//
+// Mirrors rove's read-only kv.get path: ALL threads hit ONE tenant
+// (kvdirect is a single store), data already durable in LMDB, "request"
+// = REQ_GETS point reads. Three modes isolate where the cost is:
+//
+//  .per_get_acquire     acquire+get+release per get  — exactly rove's
+//                        no-active-txn path (kvstore.zig get()).
+//  .acquire_once        acquire once, REQ_GETS lease.get, release —
+//                        amortizes the per-tenant dispatch_lock.
+//  .read_view           acquire, beginTxn, beginReadView, REQ_GETS
+//                        txn.get, endReadView, commit — the batched
+//                        path rove's read-only route does NOT use.
+//
+// Run at 1/2/4/8 threads on the SAME tenant. If ops/sec stays flat (or
+// ops/sec/thread collapses ~1/N) as threads rise, the path is convoyed
+// on a shared lock, not CPU-bound — the thing the rove-side profile's
+// on-CPU symbol attribution hides. No per-op timer in the hot loop so
+// the loop is perf-clean; we report throughput + per-thread scaling.
+
+const ReadMode = enum { per_get_acquire, acquire_once, read_view };
+
+const REQ_GETS: usize = 200; // matches kv_read_profile.sh (200 kv.get/request)
+const READ_TENANT: u64 = 0;
+const READ_NUM_KEYS: usize = 10_000;
+
+const ReadCtx = struct {
+    manifest: *kvexp.Manifest,
+    allocator: std.mem.Allocator,
+    mode: ReadMode,
+    ops: usize,
+    seed: u64,
+    err: std.atomic.Value(usize) = .init(0),
+};
+
+fn readWorker(ctx: *ReadCtx) void {
+    readWorkerInner(ctx) catch |e| {
+        _ = ctx.err.cmpxchgStrong(0, @intFromError(e), .acq_rel, .acquire);
+    };
+}
+
+fn readWorkerInner(ctx: *ReadCtx) !void {
+    var rng = std.Random.DefaultPrng.init(ctx.seed);
+    var key_buf: [KEY_LEN]u8 = undefined;
+    const m = ctx.manifest;
+    var done: usize = 0;
+    while (done < ctx.ops) {
+        const this_req = @min(REQ_GETS, ctx.ops - done);
+        switch (ctx.mode) {
+            .per_get_acquire => {
+                var g: usize = 0;
+                while (g < this_req) : (g += 1) {
+                    const k = rng.random().uintLessThan(usize, READ_NUM_KEYS);
+                    const key = writeKey(&key_buf, k);
+                    var lease = try m.acquire(READ_TENANT);
+                    defer lease.release();
+                    if (try lease.get(ctx.allocator, key)) |v| ctx.allocator.free(v);
+                }
+            },
+            .acquire_once => {
+                var lease = try m.acquire(READ_TENANT);
+                defer lease.release();
+                var g: usize = 0;
+                while (g < this_req) : (g += 1) {
+                    const k = rng.random().uintLessThan(usize, READ_NUM_KEYS);
+                    const key = writeKey(&key_buf, k);
+                    if (try lease.get(ctx.allocator, key)) |v| ctx.allocator.free(v);
+                }
+            },
+            .read_view => {
+                var lease = try m.acquire(READ_TENANT);
+                defer lease.release();
+                var t = try lease.beginTxn();
+                try t.beginReadView();
+                var g: usize = 0;
+                while (g < this_req) : (g += 1) {
+                    const k = rng.random().uintLessThan(usize, READ_NUM_KEYS);
+                    const key = writeKey(&key_buf, k);
+                    if (try t.get(ctx.allocator, key)) |v| ctx.allocator.free(v);
+                }
+                t.endReadView();
+                try t.commit();
+            },
+        }
+        done += this_req;
+    }
+}
+
+fn benchReadContended(
+    allocator: std.mem.Allocator,
+    mode: ReadMode,
+    num_threads: usize,
+) !void {
+    const m = try freshManifest(allocator);
+    defer destroyManifest(allocator, m);
+    try m.createStore(READ_TENANT);
+    {
+        var lease = try m.acquire(READ_TENANT);
+        defer lease.release();
+        var t = try lease.beginTxn();
+        var key_buf: [KEY_LEN]u8 = undefined;
+        const value = [_]u8{42} ** VAL_SIZE;
+        var k: usize = 0;
+        while (k < READ_NUM_KEYS) : (k += 1)
+            try t.put(writeKey(&key_buf, k), &value);
+        try t.commit();
+    }
+    try m.flush(); // durable in LMDB — reads bypass main_overlay
+
+    const ops_per_thread: usize = 50_000;
+    const total_ops = ops_per_thread * num_threads;
+
+    var ctxs = try allocator.alloc(ReadCtx, num_threads);
+    defer allocator.free(ctxs);
+    const threads = try allocator.alloc(std.Thread, num_threads);
+    defer allocator.free(threads);
+
+    for (ctxs, 0..) |*c, i| c.* = .{
+        .manifest = m,
+        .allocator = allocator,
+        .mode = mode,
+        .ops = ops_per_thread,
+        .seed = 0x9E37 +% @as(u64, i),
+    };
+
+    var timer = try std.time.Timer.start();
+    const start = timer.read();
+    for (threads, 0..) |*th, i|
+        th.* = try std.Thread.spawn(.{}, readWorker, .{&ctxs[i]});
+    for (threads) |th| th.join();
+    const total = timer.read() - start;
+
+    for (ctxs) |c|
+        if (c.err.load(.acquire) != 0) return error.WorkerErrored;
+
+    const ops_sec = @as(f64, @floatFromInt(total_ops)) * 1e9 /
+        @as(f64, @floatFromInt(total));
+    std.debug.print(
+        "  {s:<18} {d:>2}t  {d:>10} ops  {d:>12.0} ops/sec  {d:>11.0} ops/sec/thread\n",
+        .{ @tagName(mode), num_threads, total_ops, ops_sec, ops_sec / @as(f64, @floatFromInt(num_threads)) },
+    );
+}
+
 // ─── main ──────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -455,6 +598,17 @@ pub fn main() !void {
         s.deinit(allocator);
     }
 
-    std.debug.print("\n", .{});
+    std.debug.print(
+        "\ncontended single-tenant reads (rove kvdirect shape, 200 gets/req)\n" ++
+            "  scaling signal: flat ops/sec or collapsing ops/sec/thread = lock convoy\n" ++
+            "==============================================================\n\n",
+        .{},
+    );
+    inline for (.{ ReadMode.per_get_acquire, ReadMode.acquire_once, ReadMode.read_view }) |mode| {
+        for ([_]usize{ 1, 2, 4, 8 }) |nt|
+            try benchReadContended(allocator, mode, nt);
+        std.debug.print("\n", .{});
+    }
+
     cleanFiles();
 }
