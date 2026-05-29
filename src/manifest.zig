@@ -2427,6 +2427,137 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     return last_applied;
 }
 
+// ─── Per-tenant migration bundle ───────────────────────────────────
+//
+// `dumpSnapshot`/`loadSnapshot` move the WHOLE database (every store)
+// — that's the checkpoint path. No-downtime tenant migration needs the
+// opposite grain: one store's committed key-space, framed as a
+// self-contained blob that can be shipped to another node and loaded
+// under the same store id. (tenant_id == store_id is stable across a
+// move, so the bundle's embedded id IS the destination id — no
+// remapping.) This is the KV-state half of the V2 control plane's
+// detach/attach handshake; the raft-group lifecycle half lives in the
+// raft engine (`destroy_group` / `clear_tombstone` / epoch fence).
+//
+// Wire format (own magic so it can't be confused with a full snapshot):
+//
+//     [magic:u32 LE = BUNDLE_MAGIC]
+//     [version:u8 = BUNDLE_VERSION]
+//     [store_id:u64 LE]
+//     [n_pairs:u64 LE]
+//     repeat n_pairs:
+//       [key_len:u16 LE][val_len:u32 LE][key bytes][val bytes]
+//
+// Lengths-first framing mirrors `dumpSnapshot`'s per-pair layout; the
+// only widening is val_len u16→u32 so a bundle can carry values up to
+// `BUNDLE_VAL_MAX` (the snapshot format's u16 caps values at 64 KiB).
+// No CRC — same stance as `dumpSnapshot`: integrity is the transport's
+// / blob store's job. `loadTenantBundle` is hardened against hostile
+// bytes the same way `loadSnapshot` is (bounded buffers + length
+// checks, never trusts a length blindly) since bundles cross nodes.
+
+pub const BUNDLE_MAGIC: u32 = 0x4D494752; // "MIGR", little-endian
+pub const BUNDLE_VERSION: u8 = 1;
+const BUNDLE_KEY_MAX: usize = 256; // matches loadSnapshot's KMAX
+const BUNDLE_VAL_MAX: usize = 1 << 20; // 1 MiB, matches loadSnapshot's VMAX
+
+/// Header fields a bundle declares up front, returned by
+/// `peekTenantBundle` so a caller can route or validate (which tenant?
+/// how big?) before committing to a full load.
+pub const TenantBundleHeader = struct {
+    store_id: u64,
+    n_pairs: u64,
+};
+
+/// Serialize a single store's committed key-space out of `snap` into
+/// `writer`, framed as a migration bundle. `snap` is a consistent read
+/// view, so the two scans (count, then emit) agree. Snapshot ownership
+/// stays with the caller. A store with no keys produces a valid empty
+/// bundle (header with n_pairs=0) — useful for migrating an empty
+/// tenant.
+pub fn dumpTenantBundle(snap: *Snapshot, store_id: u64, writer: anytype) !void {
+    try writer.writeInt(u32, BUNDLE_MAGIC, .little);
+    try writer.writeByte(BUNDLE_VERSION);
+    try writer.writeInt(u64, store_id, .little);
+
+    // First pass: count, so n_pairs lands in the header ahead of the
+    // forward-only pair stream (lets `peekTenantBundle` size the load).
+    var n_pairs: u64 = 0;
+    {
+        var cur = try snap.scanPrefix(store_id, "");
+        defer cur.deinit();
+        while (try cur.next()) n_pairs += 1;
+    }
+    try writer.writeInt(u64, n_pairs, .little);
+
+    var cur = try snap.scanPrefix(store_id, "");
+    defer cur.deinit();
+    while (try cur.next()) {
+        const k = cur.key();
+        const v = cur.value();
+        if (k.len > BUNDLE_KEY_MAX) return error.BundleKeyTooLarge;
+        if (v.len > BUNDLE_VAL_MAX) return error.BundleValueTooLarge;
+        try writer.writeInt(u16, @intCast(k.len), .little);
+        try writer.writeInt(u32, @intCast(v.len), .little);
+        try writer.writeAll(k);
+        try writer.writeAll(v);
+    }
+}
+
+/// Read just a bundle's header. The caller typically peeks on one
+/// stream to learn the store id, then loads from a fresh stream over
+/// the same bytes (the header is not re-read by `loadTenantBundle`'s
+/// reader — they are independent passes).
+pub fn peekTenantBundle(reader: anytype) !TenantBundleHeader {
+    const magic = try reader.readInt(u32, .little);
+    if (magic != BUNDLE_MAGIC) return error.InvalidBundleFormat;
+    const version = try reader.readByte();
+    if (version != BUNDLE_VERSION) return error.UnsupportedBundleVersion;
+    return .{
+        .store_id = try reader.readInt(u64, .little),
+        .n_pairs = try reader.readInt(u64, .little),
+    };
+}
+
+/// Load a migration bundle into `manifest` under the store id the
+/// bundle names, creating the store if absent, and return that id. All
+/// pairs land in one committed Txn. Hardened against malformed input
+/// (bounded buffers + length checks) because bundles arrive over the
+/// network. On any error the Txn is rolled back, leaving the store
+/// untouched.
+pub fn loadTenantBundle(manifest: *Manifest, reader: anytype) !u64 {
+    const magic = try reader.readInt(u32, .little);
+    if (magic != BUNDLE_MAGIC) return error.InvalidBundleFormat;
+    const version = try reader.readByte();
+    if (version != BUNDLE_VERSION) return error.UnsupportedBundleVersion;
+    const store_id = try reader.readInt(u64, .little);
+    const n_pairs = try reader.readInt(u64, .little);
+
+    if (!(try manifest.hasStore(store_id))) try manifest.createStore(store_id);
+    // An empty tenant: the store now exists; nothing to write.
+    if (n_pairs == 0) return store_id;
+
+    var key_buf: [BUNDLE_KEY_MAX]u8 = undefined;
+    var val_buf: [BUNDLE_VAL_MAX]u8 = undefined;
+
+    var lease = try manifest.acquire(store_id);
+    defer lease.release();
+    var txn = try lease.beginTxn();
+    errdefer txn.rollback();
+
+    var i: u64 = 0;
+    while (i < n_pairs) : (i += 1) {
+        const klen = try reader.readInt(u16, .little);
+        const vlen = try reader.readInt(u32, .little);
+        if (klen > key_buf.len or vlen > val_buf.len) return error.InvalidBundleFormat;
+        try reader.readNoEof(key_buf[0..klen]);
+        try reader.readNoEof(val_buf[0..vlen]);
+        try txn.put(key_buf[0..klen], val_buf[0..vlen]);
+    }
+    try txn.commit();
+    return store_id;
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -3209,6 +3340,112 @@ test "dumpSnapshot / loadSnapshot round-trip" {
     const ga = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(ga);
     try testing.expectEqualStrings("1", ga);
+}
+
+test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(42);
+    {
+        var t = try src.quickTxn(42);
+        try t.put("k1", "v1");
+        try t.put("k2", "v2");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 42, &writer_state);
+
+    // peek reports the header without disturbing a separate load pass.
+    var peek_state = std.io.fixedBufferStream(buf.items);
+    const hdr = try peekTenantBundle(peek_state.reader());
+    try testing.expectEqual(@as(u64, 42), hdr.store_id);
+    try testing.expectEqual(@as(u64, 2), hdr.n_pairs);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    const loaded_id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    try testing.expectEqual(@as(u64, 42), loaded_id);
+
+    var s = try dst.manifest.acquire(42);
+    defer s.release();
+    const v1 = (try s.get(testing.allocator, "k1")).?;
+    defer testing.allocator.free(v1);
+    try testing.expectEqualStrings("v1", v1);
+    const v2 = (try s.get(testing.allocator, "k2")).?;
+    defer testing.allocator.free(v2);
+    try testing.expectEqualStrings("v2", v2);
+}
+
+test "dumpTenantBundle: carries only the named tenant, not its neighbours" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(10);
+    try src.manifest.createStore(20);
+    {
+        var t = try src.quickTxn(10);
+        try t.put("mine", "yes");
+        try t.commit();
+    }
+    {
+        var t = try src.quickTxn(20);
+        try t.put("theirs", "no");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 10, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadTenantBundle(dst.manifest, reader_state.reader());
+
+    // Tenant 10's key arrived; tenant 20 was never in the bundle, so
+    // its store doesn't even exist at the destination.
+    var s = try dst.manifest.acquire(10);
+    defer s.release();
+    const mine = (try s.get(testing.allocator, "mine")).?;
+    defer testing.allocator.free(mine);
+    try testing.expectEqualStrings("yes", mine);
+    try testing.expect(!(try dst.manifest.hasStore(20)));
+}
+
+test "loadTenantBundle: an empty tenant round-trips (store created, no keys)" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(7);
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 7, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    const id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    try testing.expectEqual(@as(u64, 7), id);
+    try testing.expect(try dst.manifest.hasStore(7));
+}
+
+test "loadTenantBundle: rejects a bundle with the wrong magic" {
+    var dst = try Harness.init();
+    defer dst.deinit();
+    const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0, 0, 0, 0 };
+    var reader_state = std.io.fixedBufferStream(garbage[0..]);
+    try testing.expectError(error.InvalidBundleFormat, loadTenantBundle(dst.manifest, reader_state.reader()));
 }
 
 test "dropStore: while txns open, drops everything cleanly" {
