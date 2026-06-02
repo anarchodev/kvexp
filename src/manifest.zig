@@ -1058,6 +1058,16 @@ const TenantState = struct {
     /// inside kvexp's internal lock paths.
     dispatch_lock: std.Thread.Mutex = .{},
     main_overlay: Overlay,
+    /// Node-local monotonic write clock for this store. Bumped once per
+    /// write-incorporating top-level commit (overlay → main_overlay) —
+    /// the single funnel through which leader commit, follower apply, and
+    /// snapshot install (`loadSnapshot`) all pass. NOT advanced by
+    /// durabilize (already-counted writes moving to LMDB), savepoint
+    /// commit (not yet confirmed), or the read-only fast-path commit.
+    /// In-memory only; resets to 0 on reopen (a restart re-arms any
+    /// external watches). See `StoreLease.writeVersion` / `Txn.readVersion`
+    /// and the one-directional contract in their doc comments.
+    write_version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// durabilize handoff slot. `durabilize` moves `main_overlay` here
     /// (under `lock`) *before* the LMDB commit, and clears it (under
     /// `lock`) only *after* the commit. Reads consult
@@ -1157,6 +1167,14 @@ pub const Txn = struct {
     /// re-snapshotted by refreshReadView(). Always torn down on
     /// commit/rollback even if endReadView() wasn't called.
     read_view: ?lmdb.Txn = null,
+
+    /// The store's write clock captured when this Txn's batch read view
+    /// was (re-)established. Only meaningful on the top-level Txn and
+    /// only after `beginReadView`; savepoints resolve upward. Exposed via
+    /// `readVersion()`. Captured under tenant_state.lock so it observes a
+    /// consistent point relative to concurrent commits' write_version
+    /// bumps. See the no-lost-wake contract on `readVersion`.
+    read_version: u64 = 0,
 
     /// Batch-scoped cache of this tenant's LMDB DBI. `tenant_id` is
     /// constant for a Txn's life and the dispatch lease blocks a
@@ -1461,6 +1479,26 @@ pub const Txn = struct {
         return self.overlay.entries.count() == 0 and !self.saw_speculation;
     }
 
+    // ── write-version clock ─────────────────────────────────────────
+
+    /// The store's write-clock baseline this Txn's read view is pinned
+    /// to, captured at `beginReadView` (and re-captured at
+    /// `refreshReadView`). Valid only after a read view has been opened;
+    /// returns 0 otherwise. Savepoints resolve to the top-level Txn.
+    ///
+    /// Contract (one-directional): for any write batch `W` on this store
+    /// whose effects were NOT visible to reads under this view,
+    /// `StoreLease.writeVersion()` observed for `W` is strictly greater
+    /// than the value returned here. The converse is not guaranteed — a
+    /// visible write may also carry a greater version (a harmless
+    /// over-fire for a watch keyed on this baseline). Never the reverse:
+    /// a not-visible write with version <= this value is impossible.
+    pub fn readVersion(self: *Txn) u64 {
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        return self.topLevelLocked().read_version;
+    }
+
     // ── batch read view ────────────────────────────────────────────
 
     /// Open a batch-scoped LMDB read handle. While open, every point
@@ -1482,6 +1520,13 @@ pub const Txn = struct {
         const root = self.topLevelLocked();
         if (root.read_view != null) return error.ReadViewAlreadyOpen;
         const ts = self.tenant_state;
+        // Capture the write clock baseline for this read view. Conservative
+        // (>= the version of every write currently visible): a write with
+        // version <= this value committed before this point under ts.lock,
+        // so it is already in main_overlay / the pinned LMDB snapshot and
+        // thus visible. No not-yet-visible write can carry a version <=
+        // this baseline — the §3 no-lost-wake direction.
+        root.read_version = ts.write_version.load(.monotonic);
         if (ts.parked_read_txn) |*p| {
             p.renewRead() catch {
                 p.abort();
@@ -1514,6 +1559,12 @@ pub const Txn = struct {
             root.read_view = null;
             return e;
         };
+        // The refreshed view re-snapshots the durable tail; re-baseline the
+        // write clock so reads after the refresh carry a tighter (fewer
+        // spurious) read_version. Still conservative: any write counted at
+        // or below this value committed before this point under ts.lock and
+        // is visible to the refreshed view.
+        root.read_version = self.tenant_state.write_version.load(.monotonic);
     }
 
     /// Close the read view, releasing its reader slot. Safe to call
@@ -1620,6 +1671,12 @@ pub const Txn = struct {
             } else {
                 if (ts.chain_head != self) return error.NotChainHead;
                 Overlay.moveInto(&self.overlay, &ts.main_overlay);
+                // Advance the store's write clock: this is the one
+                // write-incorporation funnel (see TenantState.write_version).
+                // Bumped under ts.lock, which beginReadView/refreshReadView
+                // also hold when capturing read_version — that serialization
+                // is what guarantees the §3 no-lost-wake contract.
+                _ = ts.write_version.fetchAdd(1, .monotonic);
                 if (self.chain_next) |next| {
                     next.chain_prev = null;
                     ts.chain_head = next;
@@ -1929,6 +1986,19 @@ pub const StoreLease = struct {
         }
         ts.chain_tail = txn;
         return txn;
+    }
+
+    /// The store's current node-local write clock. Monotonic, advanced
+    /// once per write-incorporating commit (leader commit, follower
+    /// apply, and snapshot install all funnel through `Txn.commit`);
+    /// unaffected by durabilize, savepoint commit, and read-only
+    /// fast-path commits. Read it immediately after incorporating a
+    /// write batch and stamp it onto wake events for that batch — any
+    /// read view opened before the batch carries a strictly smaller
+    /// `Txn.readVersion()`. Lock-free atomic load (the lease pins the
+    /// TenantState, so no map lookup / dropStore race).
+    pub fn writeVersion(self: *StoreLease) u64 {
+        return self.tenant_state.write_version.load(.monotonic);
     }
 
     /// Point-read against committed state (main_overlay + LMDB). Does
@@ -3340,6 +3410,141 @@ test "dumpSnapshot / loadSnapshot round-trip" {
     const ga = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(ga);
     try testing.expectEqualStrings("1", ga);
+}
+
+// ─── write-version clock (rove watch primitive) ──────────────────────
+// Contract (write-version-request.md §3): for any read view R and write
+// batch W on the same store, if W was NOT visible to reads under R then
+// writeVersion(W) > R.readVersion(). A visible write with a greater
+// version is permitted (a harmless spurious wake); a not-visible write
+// with version <= readVersion is the forbidden lost-wake direction.
+
+test "WriteVersion: a commit bumps writeVersion strictly above an earlier readVersion (no lost wake)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Writer opens first (chain head), reader second (chain tail) so the
+    // writer's commit takes the chain-head slow path.
+    var w = try h.quickTxn(1);
+    var r = try h.quickTxn(1);
+    try r.beginReadView();
+    const base = r.readVersion();
+
+    try w.put("k", "v"); // a key not yet incorporated when r opened
+    try w.commit(); // head → main_overlay; advances the clock
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > base);
+
+    r.rollback();
+}
+
+test "WriteVersion: snapshot install (loadSnapshot) advances the clock" {
+    // In kvexp the leader-commit, follower-apply, and snapshot-install
+    // paths all funnel through Txn.commit; loadSnapshot is the distinct
+    // bulk path. A fresh store starts at 0, so any advance came from the
+    // load's per-tenant commits.
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(10);
+    {
+        var t = try src.quickTxn(10);
+        try t.put("a", "1");
+        try t.commit();
+    }
+    try src.manifest.durabilize(7);
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpSnapshot(&snap, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadSnapshot(dst.manifest, reader_state.reader());
+
+    var lease = try dst.manifest.acquire(10);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > 0);
+}
+
+test "WriteVersion: durabilize does not advance the clock" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit(); // advances
+    }
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const after_commit = lease.writeVersion();
+    try testing.expect(after_commit > 0);
+
+    // durabilize moves already-counted writes main_overlay → LMDB; not a
+    // new write, so the clock must hold steady.
+    try h.manifest.flush();
+    try testing.expectEqual(after_commit, lease.writeVersion());
+}
+
+test "WriteVersion: monotonic across commits; read-only fast-path commit does not advance" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+
+    var prev = lease.writeVersion();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var t = try lease.beginTxn();
+        try t.put("k", "v");
+        try t.commit();
+        const now = lease.writeVersion();
+        try testing.expect(now > prev); // each write-incorporating commit strictly increases
+        prev = now;
+    }
+
+    // A read-only, speculation-free Txn takes the fast path (splice-out)
+    // and must NOT advance the clock.
+    var ro = try lease.beginTxn();
+    try testing.expect(ro.canSkipRaftPropose());
+    try ro.commit();
+    try testing.expectEqual(prev, lease.writeVersion());
+}
+
+test "WriteVersion: savepoint commit does not advance; spurious (>) is permitted for a visible write" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+
+    var t = try lease.beginTxn();
+    try t.beginReadView();
+    const base = t.readVersion();
+
+    // Savepoint commit merges into the parent overlay — not yet
+    // confirmed — so the clock must not move.
+    var sp = try t.savepoint();
+    try sp.put("k", "v");
+    try sp.commit();
+    try testing.expectEqual(base, lease.writeVersion());
+
+    // Top-level commit confirms → the clock advances. The write is
+    // visible to t's own view yet now carries a version above base; §3
+    // permits this (spurious), and only the reverse would be a bug.
+    try t.commit();
+    try testing.expect(lease.writeVersion() > base);
 }
 
 test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
