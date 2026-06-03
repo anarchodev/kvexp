@@ -234,16 +234,19 @@ pub const HotShard = extern struct {
     txn_rollback: std.atomic.Value(u64) = .init(0),
     savepoint_commit: std.atomic.Value(u64) = .init(0),
     savepoint_rollback: std.atomic.Value(u64) = .init(0),
-    // Speculative-chain instrumentation. `txn_commit_speculative` counts
-    // top-level commits whose reads resolved against an uncommitted chain
-    // predecessor; `chain_depth_sum` accumulates the per-tenant chain depth
-    // sampled at each begin (divide by a begin count for a mean). The
-    // high-water gauge is unsharded — see Metrics.chain_depth_max.
+    // Speculative-chain instrumentation. `txn_begin` counts top-level Txn
+    // begins (the denominator for mean chain depth and the begin rate);
+    // `txn_commit_speculative` counts top-level commits whose reads resolved
+    // against an uncommitted chain predecessor; `chain_depth_sum`
+    // accumulates the per-tenant chain depth sampled at each begin (divide
+    // by `txn_begin` for a mean). The high-water gauge is unsharded — see
+    // Metrics.chain_depth_max.
+    txn_begin: std.atomic.Value(u64) = .init(0),
     txn_commit_speculative: std.atomic.Value(u64) = .init(0),
     chain_depth_sum: std.atomic.Value(u64) = .init(0),
     _pad: [hot_shard_padding]u8 = @splat(0),
 
-    const counter_bytes = 15 * @sizeOf(u64);
+    const counter_bytes = 16 * @sizeOf(u64);
     const total_size = std.mem.alignForward(usize, counter_bytes, std.atomic.cache_line);
     const hot_shard_padding = total_size - counter_bytes;
 };
@@ -374,7 +377,9 @@ pub const Metrics = struct {
     /// running sum and bump the (unsharded) high-water gauge. `chain_depth`
     /// is the live per-tenant depth after this begin.
     pub inline fn recordTxnBegin(self: *Metrics, chain_depth: u32) void {
-        _ = self.currentShard().chain_depth_sum.fetchAdd(chain_depth, .monotonic);
+        const s = self.currentShard();
+        _ = s.txn_begin.fetchAdd(1, .monotonic);
+        _ = s.chain_depth_sum.fetchAdd(chain_depth, .monotonic);
         var cur = self.chain_depth_max.load(.monotonic);
         while (chain_depth > cur) {
             cur = self.chain_depth_max.cmpxchgWeak(cur, chain_depth, .monotonic, .monotonic) orelse break;
@@ -401,6 +406,7 @@ pub const Metrics = struct {
         var txn_rollback_total: u64 = 0;
         var savepoint_commit_total: u64 = 0;
         var savepoint_rollback_total: u64 = 0;
+        var txn_begin_total: u64 = 0;
         var txn_commit_speculative_total: u64 = 0;
         var chain_depth_sum: u64 = 0;
         for (&self.hot_shards) |*s| {
@@ -417,6 +423,7 @@ pub const Metrics = struct {
             txn_rollback_total += s.txn_rollback.load(.monotonic);
             savepoint_commit_total += s.savepoint_commit.load(.monotonic);
             savepoint_rollback_total += s.savepoint_rollback.load(.monotonic);
+            txn_begin_total += s.txn_begin.load(.monotonic);
             txn_commit_speculative_total += s.txn_commit_speculative.load(.monotonic);
             chain_depth_sum += s.chain_depth_sum.load(.monotonic);
         }
@@ -432,6 +439,7 @@ pub const Metrics = struct {
             .txn_rollback_total = txn_rollback_total,
             .savepoint_commit_total = savepoint_commit_total,
             .savepoint_rollback_total = savepoint_rollback_total,
+            .txn_begin_total = txn_begin_total,
             .txn_commit_speculative_total = txn_commit_speculative_total,
             .chain_depth_sum = chain_depth_sum,
             .chain_depth_max = self.chain_depth_max.load(.monotonic),
@@ -469,6 +477,7 @@ pub const MetricsSnapshot = struct {
     txn_rollback_total: u64,
     savepoint_commit_total: u64,
     savepoint_rollback_total: u64,
+    txn_begin_total: u64,
     txn_commit_speculative_total: u64,
     chain_depth_sum: u64,
     chain_depth_max: u64,
@@ -4259,9 +4268,11 @@ test "ChainMetrics: chain_depth tracks begin/commit; speculation + high-water co
     try testing.expectEqual(@as(u32, 0), ts.chain_depth);
 
     const m = h.manifest.metricsSnapshot();
+    try testing.expectEqual(@as(u64, 2), m.txn_begin_total); // t1 + t2
     try testing.expectEqual(@as(u64, 1), m.txn_commit_speculative_total); // only t2
     try testing.expectEqual(@as(u64, 2), m.chain_depth_max); // peaked at 2
     try testing.expectEqual(@as(u64, 3), m.chain_depth_sum); // sampled at begin: 1 + 2
+    // mean chain depth = chain_depth_sum / txn_begin_total = 3/2.
 }
 
 test "ChainMetrics: pointer rollback cascade decrements chain_depth by all removed" {
