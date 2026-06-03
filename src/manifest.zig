@@ -112,6 +112,10 @@ pub const SpecificError = error{
     /// configured `max_overlay_bytes_per_store`. Caller should
     /// rollback + durabilize + retry, or drop the request.
     OverlayCapExceeded,
+    /// An op (read/write/commit/park) was attempted on a Txn whose chained
+    /// predecessor faulted: a rollback cascade invalidated it. The caller
+    /// must abort this Txn (`rollback`) — its speculative basis is gone.
+    TxnInvalidated,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
@@ -1013,7 +1017,7 @@ pub const Manifest = struct {
         ts.lock.lock();
         defer ts.lock.unlock();
         const txn = ts.resolveChainLocked(h.seq) orelse return .absent;
-        txn.rollbackFromLocked();
+        txn.rollbackFromLocked(true);
         return .rolled_back;
     }
 
@@ -1296,6 +1300,14 @@ pub const Txn = struct {
     /// rove supplies its raft propose seq here (globally monotonic → no
     /// reuse / no ABA). Savepoints never carry one.
     seq: ?u64 = null,
+    /// Set when a rollback cascade reached this Txn while it was still the
+    /// active writer (un-parked, `seq == null`) on another worker — i.e. a
+    /// chained predecessor faulted mid-dispatch. The cascade detaches +
+    /// marks rather than frees (freeing underneath a live handler would be
+    /// a UAF); the owning worker self-aborts on its next op / commit / park
+    /// (each returns `error.TxnInvalidated`), which frees it. Only ever set
+    /// on a top-level Txn; savepoints read it via `topLevelLocked`.
+    invalidated: bool = false,
     /// This Txn's own writes.
     overlay: Overlay,
     /// The currently-open savepoint child, if any. LIFO: at most one.
@@ -1394,6 +1406,7 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
         // Per-store memory cap. Conservative — counts main_overlay +
         // this Txn's overlay + the new bytes, no dedup credit. The
         // check has to happen *before* putLocked mutates the overlay
@@ -1413,6 +1426,7 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
         const existed = try self.keyExistsLocked(key);
         self.overlay.tombstoneLocked(key);
         self.manifest.metrics.recordDelete();
@@ -1430,9 +1444,18 @@ pub const Txn = struct {
         t.saw_speculation = true;
     }
 
+    /// Self-abort gate: errors if this Txn's top-level was invalidated by a
+    /// predecessor's rollback cascade (chained predecessor faulted while
+    /// this one was mid-dispatch). The owner must `rollback` on seeing
+    /// this. Caller holds `tenant_state.lock`.
+    fn checkNotInvalidatedLocked(self: *Txn) error{TxnInvalidated}!void {
+        if (self.topLevelLocked().invalidated) return error.TxnInvalidated;
+    }
+
     pub fn get(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
+        try self.checkNotInvalidatedLocked();
         self.manifest.metrics.recordGet();
         return self.getLocked(allocator, key);
     }
@@ -1532,6 +1555,7 @@ pub const Txn = struct {
     pub fn scanPrefix(self: *Txn, prefix: []const u8) !TxnPrefixCursor {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
+        try self.checkNotInvalidatedLocked();
 
         // Flatten the layered view into a sorted slice, with closer-
         // to-self layers winning collisions. Tombstones are preserved
@@ -1844,12 +1868,16 @@ pub const Txn = struct {
     /// caller's globally-monotonic id (rove's raft propose seq). After
     /// this, refer to the Txn only by the returned handle across workers;
     /// `Manifest.commit`/`rollbackFrom` resolve it under the tenant lock.
-    pub fn park(self: *Txn, seq: u64) TxnHandle {
+    pub fn park(self: *Txn, seq: u64) error{TxnInvalidated}!TxnHandle {
         const ts = self.tenant_state;
         ts.lock.lock();
         defer ts.lock.unlock();
         std.debug.assert(self.parent == null); // savepoints aren't parked
         std.debug.assert(self.seq == null); // no double-park
+        // Catch-all self-abort: if the predecessor faulted while this
+        // handler ran (and it issued no further ops), invalidation surfaces
+        // here at the park boundary instead of going unnoticed.
+        if (self.invalidated) return error.TxnInvalidated;
         self.seq = seq;
         return .{ .tenant = self.tenant_id, .seq = seq };
     }
@@ -1865,6 +1893,7 @@ pub const Txn = struct {
         ts.lock.lock();
         defer ts.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
         if (self.parent) |parent| {
             // Savepoint commit: merge into parent, leave the top-level (and
             // its read view) alive.
@@ -1941,15 +1970,36 @@ pub const Txn = struct {
             manifest.metrics.recordSavepointRollback();
             return;
         }
-        self.rollbackFromLocked();
+        if (self.invalidated) {
+            // Already detached from the chain by the cascade that
+            // invalidated it (it was the active tail — no successors and
+            // chain pointers nulled). Just free it; no chain surgery, which
+            // would clobber the unrelated surviving prefix.
+            self.parkReadViewLocked();
+            self.freeSubtreeLocked();
+            manifest.metrics.recordTxnRollback();
+            return;
+        }
+        self.rollbackFromLocked(false);
     }
 
     /// Top-level rollback body: detach the chain at `self` and free `self`
     /// plus every forward chain-dependent (raft tail-truncation — a
     /// successor that read this Txn's speculative overlay can never outlive
-    /// it). Caller holds tenant_state.lock and `parent == null`. Shared by
-    /// the pointer `rollback()` and the by-handle `Manifest.rollbackFrom`.
-    fn rollbackFromLocked(self: *Txn) void {
+    /// it). Caller holds tenant_state.lock and `parent == null`.
+    ///
+    /// `protect_active` gates the active-writer guard, and the gate is the
+    /// *entry point*, not Txn state: the by-handle `Manifest.rollbackFrom`
+    /// (rove's cross-worker cascade, where a successor may be live-dispatched
+    /// on another worker) passes true; the pointer `Txn.rollback`
+    /// (standalone / single-threaded / self-abort) passes false and frees
+    /// everything as before. When true, an un-parked (`seq == null`)
+    /// successor — necessarily the active tail in rove's pipeline — is
+    /// invalidated + detached rather than freed, so we never free underneath
+    /// a live handler; its owner self-aborts and frees it. When false a
+    /// `seq == null` node just means "pointer-only caller, never parked" and
+    /// is freed normally.
+    fn rollbackFromLocked(self: *Txn, protect_active: bool) void {
         const manifest = self.manifest;
         const ts = self.tenant_state;
         // Park this Txn's own batch read view for reuse (a tail rollback
@@ -1968,6 +2018,19 @@ pub const Txn = struct {
         var cur: ?*Txn = self;
         while (cur) |c| {
             const next = c.chain_next;
+            if (protect_active and c != self and c.seq == null) {
+                // Active successor: still the live writer mid-dispatch on
+                // another worker (un-parked → seq == null). Freeing it
+                // underneath that handler would be a UAF. Mark it
+                // invalidated and detach it (it's the chain tail, so there
+                // is nothing after it); its owner self-aborts on the next
+                // op / commit / park, which frees it.
+                std.debug.assert(next == null);
+                c.invalidated = true;
+                c.chain_prev = null;
+                c.chain_next = null;
+                break;
+            }
             c.freeSubtreeLocked();
             cur = next;
         }
@@ -3903,8 +3966,8 @@ test "ChainHandle: cross-worker convergent rollback (head-first)" {
     try t1.put("a", "1");
     var t2 = try h.quickTxn(1);
     try t2.put("b", "2");
-    const h1 = t1.park(1);
-    const h2 = t2.park(2);
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
 
     // Worker 1 rolls back the faulted head: cascade frees t1 AND t2.
     try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
@@ -3922,8 +3985,8 @@ test "ChainHandle: cross-worker convergent rollback (successor-first)" {
     try t1.put("a", "1");
     var t2 = try h.quickTxn(1);
     try t2.put("b", "2");
-    const h1 = t1.park(1);
-    const h2 = t2.park(2);
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
 
     // Reverse order: rolling back the successor unwinds only it (deps point
     // forward; the head never depended on its successor), leaving the head.
@@ -3943,8 +4006,8 @@ test "ChainHandle: commit not_head then resolve" {
     try t1.put("a", "1");
     var t2 = try h.quickTxn(1);
     try t2.put("b", "2");
-    const h1 = t1.park(1);
-    const h2 = t2.park(2);
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
 
     // Successor first: defined .not_head return, no error, no side effect.
     try testing.expectEqual(CommitResult.not_head, try h.manifest.commit(h2));
@@ -3973,7 +4036,7 @@ test "ChainHandle: idempotent rollback" {
 
     var t = try h.quickTxn(1);
     try t.put("a", "1");
-    const handle = t.park(7);
+    const handle = try t.park(7);
 
     try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(handle));
     try testing.expectEqual(RollbackResult.absent, h.manifest.rollbackFrom(handle));
@@ -3989,8 +4052,8 @@ test "ChainHandle: mixed — head commits, successor faults" {
     try t1.put("a", "1");
     var t2 = try h.quickTxn(1);
     try t2.put("b", "2");
-    const h1 = t1.park(1);
-    const h2 = t2.park(2);
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
 
     // Head commits; successor independently faults and unwinds only itself.
     try testing.expectEqual(CommitResult.committed, try h.manifest.commit(h1));
@@ -4015,9 +4078,90 @@ test "ChainHandle: handle to an unknown tenant / seq resolves absent" {
     try testing.expectEqual(CommitResult.absent, try h.manifest.commit(.{ .tenant = 99, .seq = 1 }));
     // Known tenant, unknown seq (nothing parked).
     var t = try h.quickTxn(1);
-    _ = t.park(5);
+    _ = try t.park(5);
     try testing.expectEqual(CommitResult.absent, try h.manifest.commit(.{ .tenant = 1, .seq = 404 }));
     t.rollback(); // clean up via the pointer path
+}
+
+test "ChainHandle: active successor is invalidated, not freed, then self-aborts" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // T1: a writer that finished its handler and parked (awaiting raft).
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    // T2: the next activation, still mid-dispatch — un-parked (seq == null),
+    // chained after T1, speculatively reading T1's uncommitted write.
+    var lease = try h.manifest.acquire(1);
+    var t2 = try lease.beginTxn();
+    {
+        const seen = (try t2.get(testing.allocator, "a")).?; // T1's speculative value
+        defer testing.allocator.free(seen);
+        try testing.expectEqualStrings("1", seen);
+    }
+    try t2.put("b", "2");
+
+    // T1 faults: rove rolls it back by handle. The cascade reaches the
+    // active T2 — it must NOT be freed underneath its live handler. It is
+    // marked invalidated and detached. (rollbackFrom takes ts.lock only,
+    // never dispatch_lock, so holding the lease here does not deadlock.)
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+
+    // T2 is still alive (not freed); every op now self-aborts.
+    try testing.expectError(error.TxnInvalidated, t2.get(testing.allocator, "a"));
+    try testing.expectError(error.TxnInvalidated, t2.put("c", "3"));
+    try testing.expectError(error.TxnInvalidated, t2.commit());
+
+    // Owner self-aborts via the pointer it still holds. No double-free
+    // (the testing allocator would catch one).
+    t2.rollback();
+    lease.release();
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: invalidation surfaces at park (catch-all)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    var lease = try h.manifest.acquire(1);
+    var t2 = try lease.beginTxn();
+    try t2.put("b", "2"); // handler did work but issues no further kv ops
+
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+
+    // Handler ran to completion and reaches park without touching kv again:
+    // the catch-all fires here so the doomed result never replicates.
+    try testing.expectError(error.TxnInvalidated, t2.park(2));
+
+    t2.rollback();
+    lease.release();
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: pointer rollback still frees un-parked successors (standalone)" {
+    // The active-writer guard is gated on the by-handle entry point, so the
+    // standalone pointer cascade is unchanged: rolling back a head frees its
+    // un-parked successors rather than marking them.
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1); // un-parked successor (seq == null)
+    try t2.put("b", "2");
+
+    t1.rollback(); // pointer path → frees t1 AND t2 (no marking)
+    try testing.expect(chainEmpty(&h, 1));
+    // No leak (testing allocator would flag t2 if it were only marked).
 }
 
 test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
