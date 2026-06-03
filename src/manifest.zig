@@ -112,11 +112,6 @@ pub const SpecificError = error{
     /// configured `max_overlay_bytes_per_store`. Caller should
     /// rollback + durabilize + retry, or drop the request.
     OverlayCapExceeded,
-    /// beginReadView() called while this Txn already has an open
-    /// read view.
-    ReadViewAlreadyOpen,
-    /// refreshReadView() called with no open read view.
-    NoReadView,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
@@ -1129,10 +1124,11 @@ const TenantState = struct {
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     /// One LMDB read txn parked (mdb_txn_reset) between batches and
-    /// renewed (mdb_txn_renew) at the next beginReadView — skips the
-    /// me_maxdbs-sized mdb_txn_begin memset after the first batch.
-    /// Holds no reader slot / no snapshot while parked. Guarded by
-    /// `lock`; one TrackedTxn per tenant at a time so no concurrent use.
+    /// renewed (mdb_txn_renew) when the next batch lazily opens its read
+    /// view (`ensureReadViewLocked`) — skips the me_maxdbs-sized
+    /// mdb_txn_begin memset after the first batch. Holds no reader slot /
+    /// no snapshot while parked. Guarded by `lock`; one active read view
+    /// per tenant at a time so no concurrent use.
     parked_read_txn: ?lmdb.Txn = null,
 
     fn retain(self: *TenantState) void {
@@ -1163,6 +1159,30 @@ const TenantState = struct {
             self.main_overlay.deinit();
             self.draining_overlay.deinit();
             allocator.destroy(self);
+        }
+    }
+
+    /// Park (or release) every open batch read view across this tenant's
+    /// chain. The first reusable handle is parked (mdb_txn_reset keeps the
+    /// handle but drops the reader slot) for a cheap renew next batch; any
+    /// extras are aborted. Caller holds `lock`. Called by
+    /// `StoreLease.release` so reader slots aren't pinned across the
+    /// post-dispatch (e.g. raft-commit) wait — a later read re-opens the
+    /// view lazily. Only top-level Txns carry a read view, and all live
+    /// top-level Txns are on the chain, so this reaches every one.
+    fn parkOpenReadViewsLocked(self: *TenantState) void {
+        var cur = self.chain_head;
+        while (cur) |t| {
+            if (t.read_view) |*rv| {
+                if (self.parked_read_txn == null) {
+                    rv.resetRead();
+                    self.parked_read_txn = rv.*;
+                } else {
+                    rv.abort();
+                }
+                t.read_view = null;
+            }
+            cur = t.chain_next;
         }
     }
 };
@@ -1198,23 +1218,26 @@ pub const Txn = struct {
     /// without going through raft.
     saw_speculation: bool = false,
 
-    /// Optional batch-scoped LMDB read handle. Only ever set on the
-    /// top-level Txn (parent == null); savepoints resolve to it by
-    /// walking up. When present, point reads reuse this one parked
-    /// MDB_RDONLY txn instead of begin/abort per get — read-latest,
-    /// re-snapshotted by refreshReadView(). Always torn down on
-    /// commit/rollback even if endReadView() wasn't called.
+    /// Automatic batch-scoped LMDB read handle. Only ever set on the
+    /// top-level Txn (parent == null); savepoints resolve to it by walking
+    /// up. Point reads reuse this one parked MDB_RDONLY txn instead of
+    /// begin/abort per get. Opened lazily on first read and auto-refreshed
+    /// on durabilize by `ensureReadViewLocked` — read-latest with read-
+    /// your-committed-writes continuity. Parked on `StoreLease.release`
+    /// (the dispatch boundary) and torn down on commit/rollback, so it
+    /// can't leak a reader slot.
     read_view: ?lmdb.Txn = null,
 
-    /// The store's *durable* write-clock watermark captured when this
-    /// Txn's batch read view was (re-)established — i.e. the version of
-    /// the LMDB snapshot the view pins, not the live write clock. Only
-    /// meaningful on the top-level Txn and only after `beginReadView`;
-    /// savepoints resolve upward. Exposed via `readVersion()`. Captured
-    /// under tenant_state.lock alongside the snapshot pin so the two are
-    /// consistent. See `TenantState.durable_write_version` for why the
-    /// durable watermark (not the live clock) is what makes the §3
-    /// no-lost-wake contract airtight against draining-eviction.
+    /// The store's *durable* write-clock watermark the read view is pinned
+    /// to — the version of the LMDB snapshot it holds, not the live write
+    /// clock. Set when the view is opened/renewed (lazily on first read,
+    /// and on each durabilize-triggered auto-renew). Only meaningful on the
+    /// top-level Txn; savepoints resolve upward. Exposed via `readVersion()`
+    /// (which falls back to the store's current durable watermark when no
+    /// view is open). Captured under tenant_state.lock alongside the
+    /// snapshot pin so the two are consistent. See
+    /// `TenantState.durable_write_version` for why the durable watermark
+    /// (not the live clock) keeps the no-lost-wake contract airtight.
     read_version: u64 = 0,
 
     /// Batch-scoped cache of this tenant's LMDB DBI. `tenant_id` is
@@ -1247,10 +1270,12 @@ pub const Txn = struct {
         return d;
     }
 
-    /// Resolve the LMDB read handle for a point read. If a batch read
-    /// view is open, reuse it (not owned — never abort it here);
-    /// otherwise mint a one-shot read txn the caller must release.
-    /// Caller must hold tenant_state.lock.
+    /// Resolve the LMDB read handle for a point read. Lazily opens (and
+    /// auto-refreshes) the batch read view via `ensureReadViewLocked`, then
+    /// reuses it (not owned — never abort it here). If opening/renewing the
+    /// view hit an LMDB error, falls back to a one-shot read txn the caller
+    /// must release, so a read never fails just because the parked handle
+    /// couldn't renew. Caller must hold tenant_state.lock.
     const LmdbRead = struct {
         txn: lmdb.Txn,
         owned: bool,
@@ -1259,6 +1284,7 @@ pub const Txn = struct {
         }
     };
     fn lmdbReadLocked(self: *Txn) !LmdbRead {
+        self.ensureReadViewLocked();
         if (self.topLevelLocked().read_view) |rv|
             return .{ .txn = rv, .owned = false };
         return .{ .txn = try lmdb.Txn.beginRead(&self.manifest.env), .owned = true };
@@ -1522,10 +1548,13 @@ pub const Txn = struct {
 
     // ── write-version clock ─────────────────────────────────────────
 
-    /// The store's durable write-clock watermark this Txn's read view is
-    /// pinned to, captured at `beginReadView` (and re-captured at
-    /// `refreshReadView`). Valid only after a read view has been opened;
-    /// returns 0 otherwise. Savepoints resolve to the top-level Txn.
+    /// The store's durable write-clock watermark this Txn's reads are
+    /// baselined to: the watermark the open read view is pinned to, or — if
+    /// no view is open yet — the store's current durable watermark (which
+    /// is exactly what the next read would pin). Always meaningful; reads
+    /// open/refresh the view automatically. Savepoints resolve to the
+    /// top-level Txn. Auto-renew advances this on each durabilize, so
+    /// reading it after your reads gives the tightest correct baseline.
     ///
     /// Contract (one-directional): for any write batch `W` on this store
     /// whose effects were NOT visible to reads under this view,
@@ -1535,90 +1564,122 @@ pub const Txn = struct {
     /// over-fire for a watch keyed on this baseline). Never the reverse:
     /// a not-visible write with version <= this value is impossible.
     ///
-    /// This holds even across the draining-eviction window — a write that
-    /// was visible via `main_overlay` at view open but later evicted by a
-    /// durabilize into a snapshot this view can't see — because the
-    /// baseline is the durable watermark: any such write was, by
-    /// definition, not-yet-durable at open and so ranks strictly above it.
+    /// Two layers make that airtight. Reads auto-refresh on durabilize, so
+    /// a write visible via `main_overlay` stays visible (from LMDB) after
+    /// it is durabilized — no eviction gap. And even if a read did observe
+    /// a stale snapshot, the baseline is the durable watermark, so any
+    /// not-yet-durable write ranks strictly above it.
     pub fn readVersion(self: *Txn) u64 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
-        return self.topLevelLocked().read_version;
+        const root = self.topLevelLocked();
+        if (root.read_view != null) return root.read_version;
+        return self.tenant_state.durable_write_version;
     }
 
-    // ── batch read view ────────────────────────────────────────────
+    // ── batch read view (automatic) ─────────────────────────────────
 
-    /// Open a batch-scoped LMDB read handle. While open, every point
-    /// read in this Txn (and its savepoints) reuses one parked
-    /// MDB_RDONLY txn instead of opening + aborting one per `get` —
-    /// removing per-get reader-table slot churn across a request
-    /// batch. The overlay walk (own → savepoints → chain →
-    /// main_overlay → draining) is unchanged; only the durable-LMDB
-    /// tail is amortized.
+    /// Ensure a batch read view is open and fresh for a point read.
     ///
-    /// This is *read-latest*, not a snapshot: a single read view does
-    /// pin one LMDB snapshot, so call `refreshReadView()` at request
-    /// boundaries to observe state durabilized since. Recorded on the
-    /// top-level Txn; calling on a savepoint resolves upward.
-    pub fn beginReadView(self: *Txn) !void {
-        try self.manifest.checkAlive();
-        self.tenant_state.lock.lock();
-        defer self.tenant_state.lock.unlock();
+    /// Read views are fully automatic: this is called from the read path
+    /// (`lmdbReadLocked`) so the application never has to open, refresh, or
+    /// close one. It (a) lazily opens the view on first use — renewing the
+    /// tenant's parked MDB_RDONLY handle if present, else paying the
+    /// one-time `begin` — and (b) auto-renews it whenever a durabilize has
+    /// advanced `durable_write_version` since the view was pinned.
+    ///
+    /// Why a durabilize is the *only* refresh trigger: durabilize is the
+    /// sole writer of the LMDB env (every `Txn.commit` lands in the live-
+    /// read `main_overlay`; only durabilize moves state into LMDB). So the
+    /// pinned snapshot can go stale for exactly one reason, and a single
+    /// `durable_write_version` compare detects it. Renewing on that event
+    /// makes a read view *read-latest with read-your-committed-writes
+    /// continuity*: a key visible via `main_overlay` before a durabilize
+    /// stays visible (now from LMDB) after it, with no eviction gap.
+    ///
+    /// `read_version` baselines to the durable watermark the pinned
+    /// snapshot reflects — conservative for the watch contract (see
+    /// `readVersion`). Caller holds tenant_state.lock. On any LMDB error
+    /// the view is left closed and the caller falls back to a one-shot txn;
+    /// reads never fail just because the parked handle couldn't renew.
+    fn ensureReadViewLocked(self: *Txn) void {
         const root = self.topLevelLocked();
-        if (root.read_view != null) return error.ReadViewAlreadyOpen;
         const ts = self.tenant_state;
-        // Capture the *durable* watermark as this view's baseline, not the
-        // live clock. The LMDB snapshot pinned just below holds exactly the
-        // writes with version <= durable_write_version; anything newer lives
-        // only in main_overlay (read live now, but a later durabilize can
-        // evict it from this stale snapshot). Pinning the baseline to the
-        // durable watermark guarantees such an evictable write is strictly
-        // above it, so its eviction can only ever produce a (permitted)
-        // spurious wake — never a lost one. See durable_write_version.
-        root.read_version = ts.durable_write_version;
+        if (root.read_view) |*rv| {
+            // Auto-renew iff a durabilize landed since we pinned. Reuse the
+            // same handle (reset+renew) — keeps the reader slot, no churn.
+            if (ts.durable_write_version > root.read_version) {
+                rv.resetRead();
+                rv.renewRead() catch {
+                    rv.abort();
+                    root.read_view = null;
+                    return;
+                };
+                root.read_version = ts.durable_write_version;
+            }
+            return;
+        }
+        // Lazy open.
         if (ts.parked_read_txn) |*p| {
             p.renewRead() catch {
                 p.abort();
                 ts.parked_read_txn = null;
-                root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+                root.read_view = lmdb.Txn.beginRead(&self.manifest.env) catch return;
+                root.read_version = ts.durable_write_version;
                 return;
             };
             root.read_view = ts.parked_read_txn; // move handle into the batch
             ts.parked_read_txn = null;
+            root.read_version = ts.durable_write_version;
         } else {
             // First batch for this tenant: pay the memset once.
-            root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+            root.read_view = lmdb.Txn.beginRead(&self.manifest.env) catch return;
+            root.read_version = ts.durable_write_version;
         }
     }
 
-    /// Re-snapshot the read view: park the reader slot and re-acquire
-    /// a fresh LMDB snapshot reusing it (no slot-table churn), so
-    /// subsequent reads see the latest durabilized state. Call between
-    /// batch requests. On renew failure the view is torn down (reads
-    /// fall back to one-shot read txns) and the error is propagated.
+    /// Optional: pre-open (and freshen) the batch read view now, instead of
+    /// letting the first `get` open it lazily. You normally don't need this
+    /// — reads open and refresh the view automatically. Useful only to
+    /// capture `readVersion()` up-front or to pay the open cost outside the
+    /// read path. Idempotent: opening an already-open view auto-renews it.
+    pub fn beginReadView(self: *Txn) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        self.ensureReadViewLocked();
+    }
+
+    /// Optional: force an immediate re-snapshot to the latest durable state
+    /// and re-baseline `readVersion()`. Reads already auto-refresh on
+    /// durabilize, so this is only needed to advance the watch baseline at
+    /// a precise point. Opens a view if none is open. On renew failure the
+    /// view is torn down (reads fall back to one-shot txns) and the error
+    /// is propagated.
     pub fn refreshReadView(self: *Txn) !void {
         try self.manifest.checkAlive();
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         const root = self.topLevelLocked();
-        const rv = if (root.read_view) |*rv| rv else return error.NoReadView;
-        rv.resetRead();
-        rv.renewRead() catch |e| {
-            rv.abort();
-            root.read_view = null;
-            return e;
-        };
-        // The refreshed view re-snapshots the durable tail; re-baseline to
-        // the (now newer) durable watermark so reads after the refresh
-        // carry a tighter read_version while preserving the eviction-safe
-        // invariant (baseline = the snapshot's durable content).
-        root.read_version = self.tenant_state.durable_write_version;
+        if (root.read_view) |*rv| {
+            rv.resetRead();
+            rv.renewRead() catch |e| {
+                rv.abort();
+                root.read_view = null;
+                return e;
+            };
+            root.read_version = self.tenant_state.durable_write_version;
+        } else {
+            self.ensureReadViewLocked();
+        }
     }
 
-    /// Close the read view, releasing its reader slot. Safe to call
-    /// when none is open. Invoked automatically on commit/rollback, so
-    /// an explicit call is optional (useful to release the slot early
-    /// while keeping the Txn open).
+    /// Optional: release the read view's reader slot now, while keeping the
+    /// Txn open. Reads re-open it lazily afterwards. Read views are also
+    /// parked automatically on `StoreLease.release` (the dispatch boundary)
+    /// and on commit/rollback, so an explicit call is rarely needed — it's
+    /// here for unusual flows that hold a Txn readable across a long wait
+    /// and want the slot freed sooner. Safe to call when none is open.
     pub fn endReadView(self: *Txn) void {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
@@ -2170,6 +2231,16 @@ pub const StoreLease = struct {
     pub fn release(self: *StoreLease) void {
         const ts = self.tenant_state;
         const manifest = self.manifest;
+        // Park any open read views before yielding dispatch, so reader slots
+        // aren't held across the post-dispatch wait (e.g. while a Txn awaits
+        // raft commit). Done under ts.lock while dispatch_lock is still held
+        // — no concurrent lease holder exists, so an incoming holder's
+        // freshly-opened view can't be clobbered. Reads re-open lazily.
+        {
+            ts.lock.lock();
+            defer ts.lock.unlock();
+            ts.parkOpenReadViewsLocked();
+        }
         ts.dispatch_lock.unlock();
         manifest.metrics.recordRelease();
         // Drop the reference we took in acquire / tryAcquire. If this
@@ -3218,7 +3289,7 @@ test "ReadView: overlay, chain and LMDB all visible through the parked txn" {
     t.rollback();
 }
 
-test "ReadView: pinned within the view, read-latest after refreshReadView" {
+test "ReadView: auto-refreshes on durabilize (read-latest, no manual refresh)" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
@@ -3234,12 +3305,10 @@ test "ReadView: pinned within the view, read-latest after refreshReadView" {
 
     try w.put("k", "new");
     try w.commit(); // w is chain head → drains to main_overlay
-    try h.manifest.flush(); // → LMDB k=new
+    try h.manifest.flush(); // → LMDB k=new; bumps durable_write_version
 
-    // The view's snapshot predates the commit: still null.
-    try testing.expect((try t.get(testing.allocator, "k")) == null);
-
-    try t.refreshReadView();
+    // No manual refresh: the next read auto-renews the view (a durabilize
+    // landed since it was pinned) and sees the latest durable state.
     const got = (try t.get(testing.allocator, "k")).?;
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("new", got);
@@ -3247,15 +3316,47 @@ test "ReadView: pinned within the view, read-latest after refreshReadView" {
     t.rollback(); // also auto-ends the read view
 }
 
-test "ReadView: error cases and idempotent teardown" {
+test "ReadView: auto-parks on lease release (reader slot freed for the wait)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var lease = try h.manifest.acquire(1);
+    const t = try lease.beginTxn();
+    // A read lazily opens the view — no explicit beginReadView.
+    try testing.expect((try t.get(testing.allocator, "absent")) == null);
+    try testing.expect(t.read_view != null);
+
+    // Releasing the lease parks the view: the reader slot is handed back to
+    // the tenant's parked handle, and the Txn keeps living (speculative
+    // apply) without pinning a slot across the post-dispatch wait.
+    lease.release();
+    try testing.expect(t.read_view == null);
+    try testing.expect(t.tenant_state.parked_read_txn != null);
+
+    // The Txn is still usable: a later read re-opens the view lazily.
+    var lease2 = try h.manifest.acquire(1);
+    defer lease2.release();
+    try testing.expect((try t.get(testing.allocator, "absent")) == null);
+    try testing.expect(t.read_view != null);
+
+    t.rollback();
+}
+
+test "ReadView: begin/refresh/end are optional and idempotent" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
 
     var t = try h.quickTxn(1);
-    try testing.expectError(error.NoReadView, t.refreshReadView());
+    // Reads work with no explicit begin — the view opens lazily.
+    try testing.expect((try t.get(testing.allocator, "nope")) == null);
+    // refresh with no view open is fine (it opens one); begin is
+    // idempotent (opening an already-open view just renews it).
+    try t.refreshReadView();
     try t.beginReadView();
-    try testing.expectError(error.ReadViewAlreadyOpen, t.beginReadView());
+    try t.beginReadView();
     t.endReadView();
     t.endReadView(); // idempotent
     try t.beginReadView(); // reopen ok
@@ -3274,14 +3375,17 @@ test "ReadView: a savepoint resolves to the top-level's view" {
     var t = try h.quickTxn(1);
     try t.beginReadView();
     var sp = try t.savepoint();
-    try testing.expectError(error.ReadViewAlreadyOpen, sp.beginReadView());
+    // The savepoint resolves to the top-level's view; begin on it just
+    // renews that same view (no separate per-savepoint view).
+    try sp.beginReadView();
 
     const got = (try sp.get(testing.allocator, "d")).?; // via top-level view
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("x", got);
 
     sp.endReadView(); // tears down the top-level's view
-    try testing.expectError(error.NoReadView, t.refreshReadView());
+    // A later read through the savepoint just re-opens it lazily — no error.
+    try testing.expect((try sp.get(testing.allocator, "absent")) == null);
 
     sp.rollback();
     t.rollback();
@@ -3489,7 +3593,7 @@ test "WriteVersion: a commit bumps writeVersion strictly above an earlier readVe
     r.rollback();
 }
 
-test "WriteVersion: draining-eviction window is covered — an evicted write outranks the view that lost it" {
+test "WriteVersion: read continuity across durabilize + watch baseline below the write" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
@@ -3506,32 +3610,38 @@ test "WriteVersion: draining-eviction window is covered — an evicted write out
     // W commits into main_overlay but is NOT yet durabilized.
     var w = try h.quickTxn(1);
     try w.put("k", "v");
-    try w.commit(); // write clock advances; k lives only in main_overlay
+    try w.commit(); // write clock → 2; k lives only in main_overlay
 
     // A read view opened now pins an LMDB snapshot that lacks k. Its
     // readVersion is the durable watermark (1 — the seed flush), strictly
-    // below k's (live) write version of 2. That gap is the whole fix.
+    // below k's write version of 2.
     var r = try h.quickTxn(1);
     try r.beginReadView();
     const rv = r.readVersion();
     try testing.expectEqual(@as(u64, 1), rv);
 
-    // k is visible right now via the live main_overlay walk.
+    // k is visible now via the live main_overlay walk.
     {
         const got = (try r.get(testing.allocator, "k")).?;
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("v", got);
     }
 
-    // durabilize evicts k from main_overlay into LMDB. r's snapshot
-    // predates that commit, so r can no longer see k: the eviction window.
+    // durabilize evicts k from main_overlay into LMDB. The view's pinned
+    // snapshot predates that commit — but the next read auto-renews (a
+    // durabilize landed since it was pinned), so k stays visible:
+    // read-your-committed-writes continuity, no eviction gap.
     try h.manifest.flush();
-    try testing.expect((try r.get(testing.allocator, "k")) == null);
+    {
+        const got = (try r.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("v", got);
+    }
 
-    // Contract holds anyway: k's write version strictly exceeds the
-    // baseline r captured, so a watch armed on r's view still fires for k.
-    // (With a live-clock baseline rv would have been 1 == writeVersion and
-    // this would be a lost wake — this assertion is the regression guard.)
+    // Belt-and-suspenders for the watch contract: k's write version
+    // strictly exceeds the baseline r captured, so even had the read gone
+    // stale, a watch armed on r's view would still fire for k (never a
+    // lost wake). With a live-clock baseline rv would equal writeVersion.
     var lease = try h.manifest.acquire(1);
     defer lease.release();
     try testing.expect(lease.writeVersion() > rv);
