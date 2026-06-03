@@ -234,9 +234,16 @@ pub const HotShard = extern struct {
     txn_rollback: std.atomic.Value(u64) = .init(0),
     savepoint_commit: std.atomic.Value(u64) = .init(0),
     savepoint_rollback: std.atomic.Value(u64) = .init(0),
+    // Speculative-chain instrumentation. `txn_commit_speculative` counts
+    // top-level commits whose reads resolved against an uncommitted chain
+    // predecessor; `chain_depth_sum` accumulates the per-tenant chain depth
+    // sampled at each begin (divide by a begin count for a mean). The
+    // high-water gauge is unsharded — see Metrics.chain_depth_max.
+    txn_commit_speculative: std.atomic.Value(u64) = .init(0),
+    chain_depth_sum: std.atomic.Value(u64) = .init(0),
     _pad: [hot_shard_padding]u8 = @splat(0),
 
-    const counter_bytes = 13 * @sizeOf(u64);
+    const counter_bytes = 15 * @sizeOf(u64);
     const total_size = std.mem.alignForward(usize, counter_bytes, std.atomic.cache_line);
     const hot_shard_padding = total_size - counter_bytes;
 };
@@ -294,6 +301,12 @@ pub const Metrics = struct {
     snapshot_open_total: std.atomic.Value(u64) = .init(0),
     snapshot_close_total: std.atomic.Value(u64) = .init(0),
     poison_total: std.atomic.Value(u64) = .init(0),
+
+    // Speculative-chain high-water mark: the deepest per-tenant chain ever
+    // observed at a begin. Unsharded (a single CAS-maintained gauge) —
+    // begins are far rarer than point ops, so contention is negligible and
+    // a true max across threads is simpler than reconciling per-shard maxes.
+    chain_depth_max: std.atomic.Value(u64) = .init(0),
 
     // Duration distributions. durabilize is the main one (one fsync
     // boundary per checkpoint); snapshot_open captures every
@@ -357,6 +370,23 @@ pub const Metrics = struct {
         _ = self.currentShard().savepoint_rollback.fetchAdd(1, .monotonic);
     }
 
+    /// Sample the chain depth at a top-level begin: add it to the (sharded)
+    /// running sum and bump the (unsharded) high-water gauge. `chain_depth`
+    /// is the live per-tenant depth after this begin.
+    pub inline fn recordTxnBegin(self: *Metrics, chain_depth: u32) void {
+        _ = self.currentShard().chain_depth_sum.fetchAdd(chain_depth, .monotonic);
+        var cur = self.chain_depth_max.load(.monotonic);
+        while (chain_depth > cur) {
+            cur = self.chain_depth_max.cmpxchgWeak(cur, chain_depth, .monotonic, .monotonic) orelse break;
+        }
+    }
+
+    /// A top-level commit whose reads resolved against an uncommitted chain
+    /// predecessor (consumed speculation).
+    pub inline fn recordTxnCommitSpeculative(self: *Metrics) void {
+        _ = self.currentShard().txn_commit_speculative.fetchAdd(1, .monotonic);
+    }
+
     fn snapshot(self: *const Metrics) MetricsSnapshot {
         var put_total: u64 = 0;
         var bytes_put_total: u64 = 0;
@@ -371,6 +401,8 @@ pub const Metrics = struct {
         var txn_rollback_total: u64 = 0;
         var savepoint_commit_total: u64 = 0;
         var savepoint_rollback_total: u64 = 0;
+        var txn_commit_speculative_total: u64 = 0;
+        var chain_depth_sum: u64 = 0;
         for (&self.hot_shards) |*s| {
             put_total += s.put.load(.monotonic);
             bytes_put_total += s.bytes_put.load(.monotonic);
@@ -385,6 +417,8 @@ pub const Metrics = struct {
             txn_rollback_total += s.txn_rollback.load(.monotonic);
             savepoint_commit_total += s.savepoint_commit.load(.monotonic);
             savepoint_rollback_total += s.savepoint_rollback.load(.monotonic);
+            txn_commit_speculative_total += s.txn_commit_speculative.load(.monotonic);
+            chain_depth_sum += s.chain_depth_sum.load(.monotonic);
         }
         const open = self.snapshot_open_total.load(.monotonic);
         const closed = self.snapshot_close_total.load(.monotonic);
@@ -398,6 +432,9 @@ pub const Metrics = struct {
             .txn_rollback_total = txn_rollback_total,
             .savepoint_commit_total = savepoint_commit_total,
             .savepoint_rollback_total = savepoint_rollback_total,
+            .txn_commit_speculative_total = txn_commit_speculative_total,
+            .chain_depth_sum = chain_depth_sum,
+            .chain_depth_max = self.chain_depth_max.load(.monotonic),
             .put_total = put_total,
             .delete_total = delete_total,
             .get_total = get_total,
@@ -432,6 +469,9 @@ pub const MetricsSnapshot = struct {
     txn_rollback_total: u64,
     savepoint_commit_total: u64,
     savepoint_rollback_total: u64,
+    txn_commit_speculative_total: u64,
+    chain_depth_sum: u64,
+    chain_depth_max: u64,
     put_total: u64,
     delete_total: u64,
     get_total: u64,
@@ -665,6 +705,7 @@ pub const Manifest = struct {
             }
             ts.chain_head = null;
             ts.chain_tail = null;
+            ts.chain_depth = 0;
             ts.main_overlay.clear();
             ts.draining_overlay.clear();
             ts.draining_active = false;
@@ -1167,6 +1208,10 @@ const TenantState = struct {
     draining_active: bool = false,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
+    /// Live count of top-level Txns in this tenant's chain. Maintained
+    /// under `lock` (begin +1, top-level commit -1, rollback cascade -=
+    /// removed, teardown = 0) and sampled into the chain-depth metrics.
+    chain_depth: u32 = 0,
 
     /// Refcount = (1 if still in Manifest.tenants) + (1 per outstanding
     /// StoreLease). dropStore removes the map entry and drops the
@@ -1950,10 +1995,16 @@ pub const Txn = struct {
                 ts.chain_tail = null;
             }
         }
+        // This top-level Txn leaves the chain (fast-path splice or slow-path
+        // head advance, both above). Account for it before freeing self.
+        std.debug.assert(ts.chain_depth > 0);
+        ts.chain_depth -= 1;
+        const consumed_speculation = self.saw_speculation;
         self.parkReadViewLocked();
         self.overlay.deinit();
         manifest.allocator.destroy(self);
         manifest.metrics.recordTxnCommit();
+        if (consumed_speculation) manifest.metrics.recordTxnCommitSpeculative();
         return .committed;
     }
 
@@ -2016,6 +2067,7 @@ pub const Txn = struct {
             ts.chain_tail = null;
         }
         var cur: ?*Txn = self;
+        var removed: u32 = 0;
         while (cur) |c| {
             const next = c.chain_next;
             if (protect_active and c != self and c.seq == null) {
@@ -2029,11 +2081,21 @@ pub const Txn = struct {
                 c.invalidated = true;
                 c.chain_prev = null;
                 c.chain_next = null;
+                removed += 1; // detached from the chain, even though not freed
                 break;
             }
             c.freeSubtreeLocked();
+            removed += 1;
             cur = next;
         }
+        // Decrement by everything removed from the chain — freed successors
+        // AND the invalidated-detached active tail. The tail has left the
+        // chain even though its memory outlives this call (its owner frees
+        // it via the invalidated branch of rollback(), which does not touch
+        // chain_depth again). Counting only freed nodes would drift the
+        // gauge up by one on every active-tail invalidation.
+        std.debug.assert(ts.chain_depth >= removed);
+        ts.chain_depth -= removed;
         manifest.metrics.recordTxnRollback();
     }
 
@@ -2281,6 +2343,8 @@ pub const StoreLease = struct {
             ts.chain_head = txn;
         }
         ts.chain_tail = txn;
+        ts.chain_depth += 1;
+        self.manifest.metrics.recordTxnBegin(ts.chain_depth);
         return txn;
     }
 
@@ -4162,6 +4226,92 @@ test "ChainHandle: pointer rollback still frees un-parked successors (standalone
     t1.rollback(); // pointer path → frees t1 AND t2 (no marking)
     try testing.expect(chainEmpty(&h, 1));
     // No leak (testing allocator would flag t2 if it were only marked).
+}
+
+// ─── speculative-chain-depth metrics ─────────────────────────────────
+
+test "ChainMetrics: chain_depth tracks begin/commit; speculation + high-water counted" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const ts = lease.tenant_state;
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    var t1 = try lease.beginTxn();
+    try testing.expectEqual(@as(u32, 1), ts.chain_depth);
+    var t2 = try lease.beginTxn();
+    try testing.expectEqual(@as(u32, 2), ts.chain_depth);
+
+    // t2 speculatively reads t1's uncommitted write.
+    try t1.put("k", "v");
+    {
+        const seen = (try t2.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(seen);
+        try testing.expectEqualStrings("v", seen);
+    }
+
+    try t1.commit(); // head, writer, read nothing speculative → not speculative
+    try testing.expectEqual(@as(u32, 1), ts.chain_depth);
+    try t2.commit(); // now head; consumed t1's speculation
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    const m = h.manifest.metricsSnapshot();
+    try testing.expectEqual(@as(u64, 1), m.txn_commit_speculative_total); // only t2
+    try testing.expectEqual(@as(u64, 2), m.chain_depth_max); // peaked at 2
+    try testing.expectEqual(@as(u64, 3), m.chain_depth_sum); // sampled at begin: 1 + 2
+}
+
+test "ChainMetrics: pointer rollback cascade decrements chain_depth by all removed" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const ts = lease.tenant_state;
+
+    var t1 = try lease.beginTxn();
+    _ = try lease.beginTxn(); // t2
+    _ = try lease.beginTxn(); // t3
+    try testing.expectEqual(@as(u32, 3), ts.chain_depth);
+
+    t1.rollback(); // cascade frees t1 + t2 + t3
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+}
+
+test "ChainMetrics: invalidated-detached active tail counts as removed (Branch-2 reconciliation)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // T1 parked (awaiting raft).
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    // T2 active (un-parked), chained after T1.
+    var lease = try h.manifest.acquire(1);
+    const ts = lease.tenant_state;
+    var t2 = try lease.beginTxn();
+    try t2.put("b", "2");
+    try testing.expectEqual(@as(u32, 2), ts.chain_depth);
+
+    // T1 faults: by-handle cascade frees T1 and invalidates+detaches T2.
+    // Depth must drop to 0 — counting BOTH the freed node and the
+    // detached-but-not-freed tail (the §3 reconciliation; counting only
+    // freed nodes would leave it at 1).
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    // T2 self-aborts: it was already removed from the chain, so depth
+    // stays 0 (not decremented twice).
+    t2.rollback();
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    lease.release();
 }
 
 test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
