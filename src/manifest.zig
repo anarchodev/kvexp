@@ -823,6 +823,10 @@ pub const Manifest = struct {
 
         // 2. Enumerate every tenant.
         const TenantPair = struct { id: u64, ts: *TenantState };
+        // Drained tenants also carry the write-clock value captured at the
+        // main_overlay → draining move, so we can publish it as the durable
+        // watermark after the LMDB commit lands (see durable_write_version).
+        const DrainedTenant = struct { id: u64, ts: *TenantState, version: u64 };
         var tenant_pairs: std.ArrayListUnmanaged(TenantPair) = .empty;
         defer tenant_pairs.deinit(self.allocator);
         {
@@ -845,7 +849,7 @@ pub const Manifest = struct {
         //    LMDB commit (step 6) — readers consult
         //    main_overlay → draining_overlay → LMDB, so an in-flight
         //    key is never momentarily absent from all three.
-        var drained: std.ArrayListUnmanaged(TenantPair) = .empty;
+        var drained: std.ArrayListUnmanaged(DrainedTenant) = .empty;
         defer drained.deinit(self.allocator);
         defer for (drained.items) |t| {
             // Runs after the commit attempt (success or error). On
@@ -864,10 +868,15 @@ pub const Manifest = struct {
                 continue;
             }
             std.debug.assert(!t.ts.draining_active);
+            // Capture the clock under the same lock as the move: every
+            // write now in draining has version <= this; writes that land
+            // in the fresh main_overlay during this durabilize get a
+            // higher version and are NOT covered by this watermark.
+            const captured = t.ts.write_version.load(.monotonic);
             t.ts.main_overlay.moveInto(&t.ts.draining_overlay);
             t.ts.draining_active = true;
             t.ts.lock.unlock();
-            drained.append(self.allocator, t) catch
+            drained.append(self.allocator, .{ .id = t.id, .ts = t.ts, .version = captured }) catch
                 @panic("OOM building drained list in durabilize");
         }
 
@@ -919,6 +928,21 @@ pub const Manifest = struct {
         }
 
         try txn.commit();
+
+        // Publish the durable watermark: the commit has landed, so for
+        // each drained tenant every write with version <= captured is now
+        // in LMDB. Read views opened from here on capture this as their
+        // readVersion; any write still in (the fresh) main_overlay carries
+        // a higher version and so stays strictly above that baseline —
+        // closing the draining-eviction window. Done before the deferred
+        // draining clear, so the data remains visible (via draining) the
+        // whole time. Success path only: a failed commit poisoned above
+        // and must not advance the watermark.
+        for (drained.items) |t| {
+            t.ts.lock.lock();
+            t.ts.durable_write_version = t.version;
+            t.ts.lock.unlock();
+        }
 
         // 5. Bookkeeping.
         {
@@ -1068,6 +1092,20 @@ const TenantState = struct {
     /// external watches). See `StoreLease.writeVersion` / `Txn.readVersion`
     /// and the one-directional contract in their doc comments.
     write_version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// The write-clock value as of the most recently *durabilized* (LMDB-
+    /// committed) batch for this store: every write with version <= this
+    /// is in LMDB and therefore present in any read-view snapshot pinned
+    /// after that durabilize returned. `Txn.readVersion` returns this —
+    /// not the live `write_version` — so that a write still living only
+    /// in `main_overlay` at read-view open (which a later durabilize can
+    /// evict from that view's now-stale LMDB snapshot) always carries a
+    /// version strictly greater than the captured baseline. That closes
+    /// the "draining-eviction window" in the §3 contract: an evicted,
+    /// no-longer-visible write can never have version <= readVersion.
+    /// Trade-off: a lower baseline means writes committed-but-not-yet-
+    /// checkpointed at view open all fire as (permitted) spurious wakes —
+    /// bounded by the checkpoint window. Guarded by `lock`.
+    durable_write_version: u64 = 0,
     /// durabilize handoff slot. `durabilize` moves `main_overlay` here
     /// (under `lock`) *before* the LMDB commit, and clears it (under
     /// `lock`) only *after* the commit. Reads consult
@@ -1168,12 +1206,15 @@ pub const Txn = struct {
     /// commit/rollback even if endReadView() wasn't called.
     read_view: ?lmdb.Txn = null,
 
-    /// The store's write clock captured when this Txn's batch read view
-    /// was (re-)established. Only meaningful on the top-level Txn and
-    /// only after `beginReadView`; savepoints resolve upward. Exposed via
-    /// `readVersion()`. Captured under tenant_state.lock so it observes a
-    /// consistent point relative to concurrent commits' write_version
-    /// bumps. See the no-lost-wake contract on `readVersion`.
+    /// The store's *durable* write-clock watermark captured when this
+    /// Txn's batch read view was (re-)established — i.e. the version of
+    /// the LMDB snapshot the view pins, not the live write clock. Only
+    /// meaningful on the top-level Txn and only after `beginReadView`;
+    /// savepoints resolve upward. Exposed via `readVersion()`. Captured
+    /// under tenant_state.lock alongside the snapshot pin so the two are
+    /// consistent. See `TenantState.durable_write_version` for why the
+    /// durable watermark (not the live clock) is what makes the §3
+    /// no-lost-wake contract airtight against draining-eviction.
     read_version: u64 = 0,
 
     /// Batch-scoped cache of this tenant's LMDB DBI. `tenant_id` is
@@ -1481,8 +1522,8 @@ pub const Txn = struct {
 
     // ── write-version clock ─────────────────────────────────────────
 
-    /// The store's write-clock baseline this Txn's read view is pinned
-    /// to, captured at `beginReadView` (and re-captured at
+    /// The store's durable write-clock watermark this Txn's read view is
+    /// pinned to, captured at `beginReadView` (and re-captured at
     /// `refreshReadView`). Valid only after a read view has been opened;
     /// returns 0 otherwise. Savepoints resolve to the top-level Txn.
     ///
@@ -1493,6 +1534,12 @@ pub const Txn = struct {
     /// visible write may also carry a greater version (a harmless
     /// over-fire for a watch keyed on this baseline). Never the reverse:
     /// a not-visible write with version <= this value is impossible.
+    ///
+    /// This holds even across the draining-eviction window — a write that
+    /// was visible via `main_overlay` at view open but later evicted by a
+    /// durabilize into a snapshot this view can't see — because the
+    /// baseline is the durable watermark: any such write was, by
+    /// definition, not-yet-durable at open and so ranks strictly above it.
     pub fn readVersion(self: *Txn) u64 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
@@ -1520,13 +1567,15 @@ pub const Txn = struct {
         const root = self.topLevelLocked();
         if (root.read_view != null) return error.ReadViewAlreadyOpen;
         const ts = self.tenant_state;
-        // Capture the write clock baseline for this read view. Conservative
-        // (>= the version of every write currently visible): a write with
-        // version <= this value committed before this point under ts.lock,
-        // so it is already in main_overlay / the pinned LMDB snapshot and
-        // thus visible. No not-yet-visible write can carry a version <=
-        // this baseline — the §3 no-lost-wake direction.
-        root.read_version = ts.write_version.load(.monotonic);
+        // Capture the *durable* watermark as this view's baseline, not the
+        // live clock. The LMDB snapshot pinned just below holds exactly the
+        // writes with version <= durable_write_version; anything newer lives
+        // only in main_overlay (read live now, but a later durabilize can
+        // evict it from this stale snapshot). Pinning the baseline to the
+        // durable watermark guarantees such an evictable write is strictly
+        // above it, so its eviction can only ever produce a (permitted)
+        // spurious wake — never a lost one. See durable_write_version.
+        root.read_version = ts.durable_write_version;
         if (ts.parked_read_txn) |*p| {
             p.renewRead() catch {
                 p.abort();
@@ -1559,12 +1608,11 @@ pub const Txn = struct {
             root.read_view = null;
             return e;
         };
-        // The refreshed view re-snapshots the durable tail; re-baseline the
-        // write clock so reads after the refresh carry a tighter (fewer
-        // spurious) read_version. Still conservative: any write counted at
-        // or below this value committed before this point under ts.lock and
-        // is visible to the refreshed view.
-        root.read_version = self.tenant_state.write_version.load(.monotonic);
+        // The refreshed view re-snapshots the durable tail; re-baseline to
+        // the (now newer) durable watermark so reads after the refresh
+        // carry a tighter read_version while preserving the eviction-safe
+        // invariant (baseline = the snapshot's durable content).
+        root.read_version = self.tenant_state.durable_write_version;
     }
 
     /// Close the read view, releasing its reader slot. Safe to call
@@ -3437,6 +3485,56 @@ test "WriteVersion: a commit bumps writeVersion strictly above an earlier readVe
     var lease = try h.manifest.acquire(1);
     defer lease.release();
     try testing.expect(lease.writeVersion() > base);
+
+    r.rollback();
+}
+
+test "WriteVersion: draining-eviction window is covered — an evicted write outranks the view that lost it" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Seed + flush so the store's LMDB sub-DBI exists durably (it is
+    // created lazily at first durabilize) and the watermark is non-zero.
+    {
+        var seed = try h.quickTxn(1);
+        try seed.put("seed", "s");
+        try seed.commit();
+    }
+    try h.manifest.flush(); // durable_write_version → 1, DBI created
+
+    // W commits into main_overlay but is NOT yet durabilized.
+    var w = try h.quickTxn(1);
+    try w.put("k", "v");
+    try w.commit(); // write clock advances; k lives only in main_overlay
+
+    // A read view opened now pins an LMDB snapshot that lacks k. Its
+    // readVersion is the durable watermark (1 — the seed flush), strictly
+    // below k's (live) write version of 2. That gap is the whole fix.
+    var r = try h.quickTxn(1);
+    try r.beginReadView();
+    const rv = r.readVersion();
+    try testing.expectEqual(@as(u64, 1), rv);
+
+    // k is visible right now via the live main_overlay walk.
+    {
+        const got = (try r.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("v", got);
+    }
+
+    // durabilize evicts k from main_overlay into LMDB. r's snapshot
+    // predates that commit, so r can no longer see k: the eviction window.
+    try h.manifest.flush();
+    try testing.expect((try r.get(testing.allocator, "k")) == null);
+
+    // Contract holds anyway: k's write version strictly exceeds the
+    // baseline r captured, so a watch armed on r's view still fires for k.
+    // (With a live-clock baseline rv would have been 1 == writeVersion and
+    // this would be a lost wake — this assertion is the regression guard.)
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > rv);
 
     r.rollback();
 }
