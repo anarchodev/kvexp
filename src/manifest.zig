@@ -1475,6 +1475,35 @@ pub const Txn = struct {
         self.manifest.metrics.recordPut(key.len + value.len);
     }
 
+    /// Like `put`, but a no-op when `key` already resolves to a live
+    /// value anywhere in this Txn's visible view (own overlay → chain
+    /// predecessors → main_overlay → draining → LMDB). Returns true if
+    /// the value was written, false if an existing value was preserved.
+    /// A tombstone counts as absent, so a previously-deleted key is
+    /// (re)written. Backpressure (`OverlayCapExceeded`) is only checked
+    /// on the write path — a skipped put never trips the cap.
+    ///
+    /// Used by `loadTenantBundle` in `.skip_existing` mode for no-pause
+    /// tenant migration: the destination may take live writes during
+    /// the transfer, and those must win over the older bundle snapshot.
+    pub fn putIfAbsent(self: *Txn, key: []const u8, value: []const u8) !bool {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
+        if (try self.keyExistsLocked(key)) return false;
+        const cap = self.manifest.max_overlay_bytes_per_store;
+        if (cap != 0) {
+            const projected = self.tenant_state.main_overlay.bytes +
+                self.overlay.bytes + key.len + value.len;
+            if (projected > cap) return error.OverlayCapExceeded;
+        }
+        self.overlay.putLocked(key, value);
+        self.manifest.metrics.recordPut(key.len + value.len);
+        return true;
+    }
+
     pub fn delete(self: *Txn, key: []const u8) !bool {
         try self.manifest.checkAlive();
         self.tenant_state.lock.lock();
@@ -2968,13 +2997,27 @@ pub fn peekTenantBundle(reader: anytype) !TenantBundleHeader {
     };
 }
 
+pub const LoadBundleOptions = struct {
+    /// When true, a key that already resolves to a live value in the
+    /// destination store is preserved and the bundle's value for it is
+    /// dropped, rather than overwriting. This enables no-pause tenant
+    /// migration: the destination can accept live writes while the
+    /// bundle streams in, and those writes win over the older snapshot
+    /// the bundle was dumped from. With the default (false) the bundle
+    /// overwrites unconditionally, matching the previous behaviour.
+    skip_existing: bool = false,
+};
+
 /// Load a migration bundle into `manifest` under the store id the
 /// bundle names, creating the store if absent, and return that id. All
 /// pairs land in one committed Txn. Hardened against malformed input
 /// (bounded buffers + length checks) because bundles arrive over the
 /// network. On any error the Txn is rolled back, leaving the store
 /// untouched.
-pub fn loadTenantBundle(manifest: *Manifest, reader: anytype) !u64 {
+///
+/// `options.skip_existing` controls collision handling — see
+/// `LoadBundleOptions`.
+pub fn loadTenantBundle(manifest: *Manifest, reader: anytype, options: LoadBundleOptions) !u64 {
     const magic = try reader.readInt(u32, .little);
     if (magic != BUNDLE_MAGIC) return error.InvalidBundleFormat;
     const version = try reader.readByte();
@@ -3001,7 +3044,11 @@ pub fn loadTenantBundle(manifest: *Manifest, reader: anytype) !u64 {
         if (klen > key_buf.len or vlen > val_buf.len) return error.InvalidBundleFormat;
         try reader.readNoEof(key_buf[0..klen]);
         try reader.readNoEof(val_buf[0..vlen]);
-        try txn.put(key_buf[0..klen], val_buf[0..vlen]);
+        if (options.skip_existing) {
+            _ = try txn.putIfAbsent(key_buf[0..klen], val_buf[0..vlen]);
+        } else {
+            try txn.put(key_buf[0..klen], val_buf[0..vlen]);
+        }
     }
     try txn.commit();
     return store_id;
@@ -4352,7 +4399,7 @@ test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
     var dst = try Harness.init();
     defer dst.deinit();
     var reader_state = std.io.fixedBufferStream(buf.items);
-    const loaded_id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    const loaded_id = try loadTenantBundle(dst.manifest, reader_state.reader(), .{});
     try testing.expectEqual(@as(u64, 42), loaded_id);
 
     var s = try dst.manifest.acquire(42);
@@ -4363,6 +4410,94 @@ test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
     const v2 = (try s.get(testing.allocator, "k2")).?;
     defer testing.allocator.free(v2);
     try testing.expectEqualStrings("v2", v2);
+}
+
+test "loadTenantBundle: skip_existing preserves live destination writes" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(42);
+    {
+        var t = try src.quickTxn(42);
+        try t.put("shared", "from_bundle");
+        try t.put("only_bundle", "v");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 42, &writer_state);
+
+    // Destination already holds a live write for "shared" (e.g. a
+    // no-pause migration kept taking traffic) plus its own key.
+    var dst = try Harness.init();
+    defer dst.deinit();
+    try dst.manifest.createStore(42);
+    {
+        var t = try dst.quickTxn(42);
+        try t.put("shared", "live_write");
+        try t.put("only_dst", "keep");
+        try t.commit();
+    }
+
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadTenantBundle(dst.manifest, reader_state.reader(), .{ .skip_existing = true });
+
+    var s = try dst.manifest.acquire(42);
+    defer s.release();
+    // The live write wins over the bundle's older value.
+    const shared = (try s.get(testing.allocator, "shared")).?;
+    defer testing.allocator.free(shared);
+    try testing.expectEqualStrings("live_write", shared);
+    // Bundle-only keys still land.
+    const only_bundle = (try s.get(testing.allocator, "only_bundle")).?;
+    defer testing.allocator.free(only_bundle);
+    try testing.expectEqualStrings("v", only_bundle);
+    // Destination-only keys are untouched.
+    const only_dst = (try s.get(testing.allocator, "only_dst")).?;
+    defer testing.allocator.free(only_dst);
+    try testing.expectEqualStrings("keep", only_dst);
+}
+
+test "loadTenantBundle: skip_existing treats a tombstoned key as absent" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(5);
+    {
+        var t = try src.quickTxn(5);
+        try t.put("k", "from_bundle");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 5, &writer_state);
+
+    // Destination once held "k" but deleted it: a tombstone, not a
+    // live value, so skip_existing must (re)write the bundle's value.
+    var dst = try Harness.init();
+    defer dst.deinit();
+    try dst.manifest.createStore(5);
+    {
+        var t = try dst.quickTxn(5);
+        try t.put("k", "old");
+        _ = try t.delete("k");
+        try t.commit();
+    }
+
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadTenantBundle(dst.manifest, reader_state.reader(), .{ .skip_existing = true });
+
+    var s = try dst.manifest.acquire(5);
+    defer s.release();
+    const k = (try s.get(testing.allocator, "k")).?;
+    defer testing.allocator.free(k);
+    try testing.expectEqualStrings("from_bundle", k);
 }
 
 test "dumpTenantBundle: carries only the named tenant, not its neighbours" {
@@ -4391,7 +4526,7 @@ test "dumpTenantBundle: carries only the named tenant, not its neighbours" {
     var dst = try Harness.init();
     defer dst.deinit();
     var reader_state = std.io.fixedBufferStream(buf.items);
-    _ = try loadTenantBundle(dst.manifest, reader_state.reader());
+    _ = try loadTenantBundle(dst.manifest, reader_state.reader(), .{});
 
     // Tenant 10's key arrived; tenant 20 was never in the bundle, so
     // its store doesn't even exist at the destination.
@@ -4418,7 +4553,7 @@ test "loadTenantBundle: an empty tenant round-trips (store created, no keys)" {
     var dst = try Harness.init();
     defer dst.deinit();
     var reader_state = std.io.fixedBufferStream(buf.items);
-    const id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    const id = try loadTenantBundle(dst.manifest, reader_state.reader(), .{});
     try testing.expectEqual(@as(u64, 7), id);
     try testing.expect(try dst.manifest.hasStore(7));
 }
@@ -4428,7 +4563,7 @@ test "loadTenantBundle: rejects a bundle with the wrong magic" {
     defer dst.deinit();
     const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0, 0, 0, 0 };
     var reader_state = std.io.fixedBufferStream(garbage[0..]);
-    try testing.expectError(error.InvalidBundleFormat, loadTenantBundle(dst.manifest, reader_state.reader()));
+    try testing.expectError(error.InvalidBundleFormat, loadTenantBundle(dst.manifest, reader_state.reader(), .{}));
 }
 
 test "dropStore: while txns open, drops everything cleanly" {

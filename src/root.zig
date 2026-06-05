@@ -30,6 +30,7 @@ pub const SNAPSHOT_VERSION = manifest.SNAPSHOT_VERSION;
 // blob (the KV-state half of the V2 control plane's detach/attach).
 pub const dumpTenantBundle = manifest.dumpTenantBundle;
 pub const loadTenantBundle = manifest.loadTenantBundle;
+pub const LoadBundleOptions = manifest.LoadBundleOptions;
 pub const peekTenantBundle = manifest.peekTenantBundle;
 pub const TenantBundleHeader = manifest.TenantBundleHeader;
 pub const BUNDLE_MAGIC = manifest.BUNDLE_MAGIC;
