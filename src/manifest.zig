@@ -2404,6 +2404,48 @@ pub const StoreLease = struct {
         return self.tenant_state.write_version.load(.monotonic);
     }
 
+    /// Chain-BYPASSING authoritative put — the replicated-apply seam.
+    ///
+    /// A consensus follower applying a committed entry is not a
+    /// speculative client write: the data is already the cluster's
+    /// truth, so it must never sequence behind (or fail on) the
+    /// tenant's open speculative txn chain. `Txn.commit`'s chain-head
+    /// requirement made a follower-apply taken through a one-shot txn
+    /// return `NotChainHead` whenever a local read batch had a txn
+    /// open/parked for the tenant — and retrying deadlocks, because a
+    /// parked predecessor only resolves through the very apply loop
+    /// that is stuck behind it. This writes straight into
+    /// `main_overlay` under `ts.lock` and bumps the write clock —
+    /// exactly `commitTopLevelLocked`'s slow-path incorporation funnel,
+    /// minus the chain.
+    ///
+    /// Interaction with open chained txns: an applied key becomes
+    /// visible to their main_overlay fallthrough reads, like any
+    /// predecessor commit; a later chained COMMIT writing the same key
+    /// overwrites the applied value — which is why this is only sound
+    /// where local speculative WRITES cannot commit (a follower's
+    /// proposes fault, so its write txns always roll back; the
+    /// consensus leader skips apply entirely). Caller holds the
+    /// dispatch lease.
+    pub fn applyPut(self: *StoreLease, key: []const u8, value: []const u8) !void {
+        try self.manifest.checkAlive();
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        ts.main_overlay.putLocked(key, value);
+        _ = ts.write_version.fetchAdd(1, .monotonic);
+    }
+
+    /// Chain-bypassing authoritative delete — see `applyPut`.
+    pub fn applyDelete(self: *StoreLease, key: []const u8) !void {
+        try self.manifest.checkAlive();
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        ts.main_overlay.tombstoneLocked(key);
+        _ = ts.write_version.fetchAdd(1, .monotonic);
+    }
+
     /// Point-read against committed state (main_overlay + LMDB). Does
     /// NOT see this lease's in-flight Txns.
     pub fn get(self: *StoreLease, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -5939,4 +5981,38 @@ test "Snap property: workers + concurrent snapper + crash recovers state" {
             return e;
         };
     }
+}
+
+test "StoreLease.applyPut/applyDelete bypass the txn chain (replicated-apply seam)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(7);
+    try h.manifest.flush();
+
+    var lease = try h.manifest.acquire(7);
+    defer lease.release();
+
+    // An open chained txn WITH a write (slow-path: would block one-shot
+    // commits with NotChainHead).
+    var t = try lease.beginTxn();
+    try t.put("spec", "speculative");
+
+    // The apply writes land despite the open chain…
+    try lease.applyPut("applied", "v1");
+    try lease.applyPut("gone", "x");
+    try lease.applyDelete("gone");
+
+    // …and are committed-state visible (lease.get reads main_overlay).
+    const got = try lease.get(testing.allocator, "applied");
+    defer if (got) |g| testing.allocator.free(g);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings("v1", got.?);
+    const gone = try lease.get(testing.allocator, "gone");
+    try testing.expect(gone == null);
+
+    // The chained txn is untouched: still head, commits cleanly.
+    try t.commit();
+    const spec = try lease.get(testing.allocator, "spec");
+    defer if (spec) |sv| testing.allocator.free(sv);
+    try testing.expectEqualStrings("speculative", spec.?);
 }
