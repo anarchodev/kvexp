@@ -574,7 +574,6 @@ pub const Manifest = struct {
             self.meta_dbi = try txn.openDbi(META_DBI_NAME, false);
 
             var cur = try txn.openCursor(self.stores_dbi);
-            defer cur.close();
             var pair = try cur.first();
             while (pair) |p| : (pair = try cur.next()) {
                 const id = decodeStoreIdKey(p.key);
@@ -584,6 +583,12 @@ pub const Manifest = struct {
                 self.dbis.put(self.allocator, id, dbi) catch
                     @panic("OOM populating dbis map at init");
             }
+            // LMDB frees a write-txn's cursors on commit/abort. Close BEFORE
+            // commit — a `defer cur.close()` runs after commit and double-frees
+            // the cursor, corrupting the heap (the corruption surfaces far away,
+            // e.g. as a GPF in an unrelated allocation). The errdefer-abort path
+            // frees the cursor too, so it needs no explicit close.
+            cur.close();
             try txn.commit();
         }
     }
